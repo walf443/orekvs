@@ -7,12 +7,22 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{GetRequest, GetResponse, SetRequest, SetResponse};
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use crate::engine::{Engine, memory::MemoryEngine, log::LogEngine};
 
-#[derive(Debug, Default)]
+// --- gRPC Service ---
+
 pub struct MyKeyValue {
-    db: Arc<Mutex<HashMap<String, String>>>,
+    engine: Box<dyn Engine>,
+}
+
+impl MyKeyValue {
+    pub fn new(engine_type: EngineType) -> Self {
+        let engine: Box<dyn Engine> = match engine_type {
+            EngineType::Memory => Box::new(MemoryEngine::new()),
+            EngineType::Log => Box::new(LogEngine::new()),
+        };
+        MyKeyValue { engine }
+    }
 }
 
 #[tonic::async_trait]
@@ -22,9 +32,7 @@ impl KeyValue for MyKeyValue {
         request: Request<SetRequest>,
     ) -> Result<Response<SetResponse>, Status> {
         let req = request.into_inner();
-        let mut db = self.db.lock().unwrap();
-        db.insert(req.key, req.value);
-
+        self.engine.set(req.key, req.value)?;
         Ok(Response::new(SetResponse { success: true }))
     }
 
@@ -33,19 +41,19 @@ impl KeyValue for MyKeyValue {
         request: Request<GetRequest>,
     ) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        let db = self.db.lock().unwrap();
-
-        match db.get(&req.key) {
-            Some(value) => Ok(Response::new(GetResponse {
-                value: value.clone(),
-            })),
-            None => Err(Status::not_found("Key not found")),
-        }
+        let value = self.engine.get(req.key)?;
+        Ok(Response::new(GetResponse { value }))
     }
 }
 
-pub async fn run_server(addr: std::net::SocketAddr) {
-    let key_value = MyKeyValue::default();
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum EngineType {
+    Memory,
+    Log,
+}
+
+pub async fn run_server(addr: std::net::SocketAddr, engine_type: EngineType) {
+    let key_value = MyKeyValue::new(engine_type);
 
     println!("Server listening on {}", addr);
 

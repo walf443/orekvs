@@ -1,3 +1,4 @@
+mod engine;
 mod server;
 
 use clap::{Parser, Subcommand};
@@ -5,6 +6,7 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use server::kv::key_value_client::KeyValueClient;
 use server::kv::{GetRequest, SetRequest};
+use server::EngineType;
 
 #[derive(Parser)]
 #[command(name = "orelsm")]
@@ -20,6 +22,10 @@ enum Commands {
     Server {
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: String,
+        
+        /// Storage engine to use
+        #[arg(long, value_enum, default_value_t = EngineType::Memory)]
+        engine: EngineType,
     },
     /// Test commands
     Test {
@@ -56,9 +62,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Server { addr } => {
+        Commands::Server { addr, engine } => {
             let addr = addr.parse()?;
-            server::run_server(addr).await;
+            server::run_server(addr, engine.clone()).await;
             Ok(())
         }
         Commands::Test { command } => match command {
