@@ -103,9 +103,7 @@ async fn run_test_set(count: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating and setting {} random key-value pairs...", count);
 
     for i in 0..count {
-        let key: String = (0..10)
-            .map(|_| rng.sample(Alphanumeric) as char)
-            .collect();
+        let key: String = rng.gen_range(1..=100).to_string();
         let value: String = (0..20)
             .map(|_| rng.sample(Alphanumeric) as char)
             .collect();
@@ -137,9 +135,7 @@ async fn run_test_get(count: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("Generating and getting {} random keys...", count);
 
     for i in 0..count {
-        let key: String = (0..10)
-            .map(|_| rng.sample(Alphanumeric) as char)
-            .collect();
+        let key: String = rng.gen_range(1..=100).to_string();
 
         let request = tonic::Request::new(GetRequest {
             key: key.clone(),
