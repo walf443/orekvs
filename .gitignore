@@ -1,2 +1,3 @@
 *.log
 target/
+kv_store.data
