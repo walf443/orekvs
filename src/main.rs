@@ -17,11 +17,28 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the key-value store server
-    Server,
+    Server {
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        addr: String,
+    },
     /// Test commands
     Test {
         #[command(subcommand)]
         command: TestCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TestCommands {
+    /// Set multiple random key-value pairs
+    RandomSet {
+        /// Number of key-value pairs to generate and set
+        count: usize,
+    },
+    /// Get multiple random keys
+    RandomGet {
+        /// Number of keys to generate and get
+        count: usize,
     },
     /// Set a key-value pair
     Set {
@@ -34,62 +51,49 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum TestCommands {
-    /// Set multiple random key-value pairs
-    Set {
-        /// Number of key-value pairs to generate and set
-        count: usize,
-    },
-    /// Get multiple random keys
-    Get {
-        /// Number of keys to generate and get
-        count: usize,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Server => {
-            server::run_server().await;
+        Commands::Server { addr } => {
+            let addr = addr.parse()?;
+            server::run_server(addr).await;
             Ok(())
         }
         Commands::Test { command } => match command {
-            TestCommands::Set { count } => {
+            TestCommands::RandomSet { count } => {
                 run_test_set(*count).await
             }
-            TestCommands::Get { count } => {
+            TestCommands::RandomGet { count } => {
                 run_test_get(*count).await
             }
-        },
-        Commands::Set { key, value } => {
-            let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
-            let request = tonic::Request::new(SetRequest {
-                key: key.clone(),
-                value: value.clone(),
-            });
-            let response = client.set(request).await?;
-            println!("RESPONSE={:?}", response);
-            Ok(())
-        }
-        Commands::Get { key } => {
-            let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
-            let request = tonic::Request::new(GetRequest {
-                key: key.clone(),
-            });
-            match client.get(request).await {
-                Ok(response) => {
-                    println!("{}", response.into_inner().value);
-                },
-                Err(e) => {
-                    println!("Error: {}", e);
-                }
+            TestCommands::Set { key, value } => {
+                let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
+                let request = tonic::Request::new(SetRequest {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+                let response = client.set(request).await?;
+                println!("RESPONSE={:?}", response);
+                Ok(())
             }
-            Ok(())
-        }
+            TestCommands::Get { key } => {
+                let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
+                let request = tonic::Request::new(GetRequest {
+                    key: key.clone(),
+                });
+                match client.get(request).await {
+                    Ok(response) => {
+                        println!("{}", response.into_inner().value);
+                    },
+                    Err(e) => {
+                        println!("Error: {}", e);
+                    }
+                }
+                Ok(())
+            }
+        },
     }
 }
 

@@ -44,8 +44,7 @@ impl KeyValue for MyKeyValue {
     }
 }
 
-pub async fn run_server() {
-    let addr = "0.0.0.0:50051".parse().unwrap();
+pub async fn run_server(addr: std::net::SocketAddr) {
     let key_value = MyKeyValue::default();
 
     println!("Server listening on {}", addr);
