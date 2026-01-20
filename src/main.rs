@@ -3,7 +3,8 @@ mod server;
 use clap::{Parser, Subcommand};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
-use server::SetRequest;
+use server::kv::key_value_client::KeyValueClient;
+use server::kv::{GetRequest, SetRequest};
 
 #[derive(Parser)]
 #[command(name = "orelsm")]
@@ -48,55 +49,53 @@ enum TestCommands {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
         Commands::Server => {
             server::run_server().await;
+            Ok(())
         }
         Commands::Test { command } => match command {
             TestCommands::Set { count } => {
-                run_test_set(*count).await;
+                run_test_set(*count).await
             }
             TestCommands::Get { count } => {
-                run_test_get(*count).await;
+                run_test_get(*count).await
             }
         },
         Commands::Set { key, value } => {
-            let client = reqwest::Client::new();
-            let res = client
-                .post("http://localhost:3000/set")
-                .json(&SetRequest {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .send()
-                .await;
-
-            match res {
-                Ok(r) if r.status().is_success() => println!("OK"),
-                Ok(r) => println!("Error: {}", r.status()),
-                Err(e) => println!("Request failed: {}", e),
-            }
+            let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
+            let request = tonic::Request::new(SetRequest {
+                key: key.clone(),
+                value: value.clone(),
+            });
+            let response = client.set(request).await?;
+            println!("RESPONSE={:?}", response);
+            Ok(())
         }
         Commands::Get { key } => {
-            let res = reqwest::get(format!("http://localhost:3000/get/{}", key)).await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    let body: server::GetResponse = r.json().await.unwrap();
-                    println!("{}", body.value);
+            let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
+            let request = tonic::Request::new(GetRequest {
+                key: key.clone(),
+            });
+            match client.get(request).await {
+                Ok(response) => {
+                    println!("{}", response.into_inner().value);
+                },
+                Err(e) => {
+                    println!("Error: {}", e);
                 }
-                Ok(r) => println!("Error: {}", r.status()),
-                Err(e) => println!("Request failed: {}", e),
             }
+            Ok(())
         }
     }
 }
 
-async fn run_test_set(count: usize) {
+async fn run_test_set(count: usize) -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = thread_rng();
-    let client = reqwest::Client::new();
+    let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
     println!("Generating and setting {} random key-value pairs...", count);
 
     for i in 0..count {
@@ -107,16 +106,12 @@ async fn run_test_set(count: usize) {
             .map(|_| rng.sample(Alphanumeric) as char)
             .collect();
 
-        let res = client
-            .post("http://localhost:3000/set")
-            .json(&SetRequest {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .send()
-            .await;
+        let request = tonic::Request::new(SetRequest {
+            key: key.clone(),
+            value: value.clone(),
+        });
 
-        if let Err(e) = res {
+        if let Err(e) = client.set(request).await {
             println!("Failed to set key {}: {}", key, e);
             continue;
         }
@@ -129,10 +124,12 @@ async fn run_test_set(count: usize) {
     }
 
     println!("Successfully processed {} random key-value pairs.", count);
+    Ok(())
 }
 
-async fn run_test_get(count: usize) {
+async fn run_test_get(count: usize) -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = thread_rng();
+    let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
     println!("Generating and getting {} random keys...", count);
 
     for i in 0..count {
@@ -140,12 +137,14 @@ async fn run_test_get(count: usize) {
             .map(|_| rng.sample(Alphanumeric) as char)
             .collect();
 
-        let res = reqwest::get(format!("http://localhost:3000/get/{}", key)).await;
+        let request = tonic::Request::new(GetRequest {
+            key: key.clone(),
+        });
 
-        match res {
-            Ok(r) => {
-                if count <= 10 || i < 5 || i >= count - 5 {
-                    println!("[{}/{}] Get key: {} -> Status: {}", i + 1, count, key, r.status());
+        match client.get(request).await {
+            Ok(_) => {
+                 if count <= 10 || i < 5 || i >= count - 5 {
+                    println!("[{}/{}] Get key: {} -> Status: OK", i + 1, count, key);
                 } else if i == 5 {
                     println!("...");
                 }
@@ -155,4 +154,5 @@ async fn run_test_get(count: usize) {
     }
 
     println!("Successfully processed {} random get operations.", count);
+    Ok(())
 }

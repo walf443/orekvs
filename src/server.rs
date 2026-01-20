@@ -1,63 +1,58 @@
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    routing::{get, post},
-    Json, Router,
-};
-use serde::{Deserialize, Serialize};
+use tonic::{transport::Server, Request, Response, Status};
+
+pub mod kv {
+    tonic::include_proto!("kv");
+}
+
+use kv::key_value_server::{KeyValue, KeyValueServer};
+use kv::{GetRequest, GetResponse, SetRequest, SetResponse};
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone)]
-struct AppState {
+#[derive(Debug, Default)]
+pub struct MyKeyValue {
     db: Arc<Mutex<HashMap<String, String>>>,
 }
 
-#[derive(Deserialize, Serialize)]
-pub struct SetRequest {
-    pub key: String,
-    pub value: String,
-}
+#[tonic::async_trait]
+impl KeyValue for MyKeyValue {
+    async fn set(
+        &self,
+        request: Request<SetRequest>,
+    ) -> Result<Response<SetResponse>, Status> {
+        let req = request.into_inner();
+        let mut db = self.db.lock().unwrap();
+        db.insert(req.key, req.value);
 
-#[derive(Serialize, Deserialize)]
-pub struct GetResponse {
-    pub value: String,
+        Ok(Response::new(SetResponse { success: true }))
+    }
+
+    async fn get(
+        &self,
+        request: Request<GetRequest>,
+    ) -> Result<Response<GetResponse>, Status> {
+        let req = request.into_inner();
+        let db = self.db.lock().unwrap();
+
+        match db.get(&req.key) {
+            Some(value) => Ok(Response::new(GetResponse {
+                value: value.clone(),
+            })),
+            None => Err(Status::not_found("Key not found")),
+        }
+    }
 }
 
 pub async fn run_server() {
-    let state = AppState {
-        db: Arc::new(Mutex::new(HashMap::new())),
-    };
+    let addr = "0.0.0.0:50051".parse().unwrap();
+    let key_value = MyKeyValue::default();
 
-    let app = Router::new()
-        .route("/set", post(set_handler))
-        .route("/get/:key", get(get_handler))
-        .with_state(state);
+    println!("Server listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("Server listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
-}
-
-async fn set_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<SetRequest>,
-) -> StatusCode {
-    let mut db = state.db.lock().unwrap();
-    db.insert(payload.key, payload.value);
-    StatusCode::OK
-}
-
-async fn get_handler(
-    Path(key): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<GetResponse>, StatusCode> {
-    let db = state.db.lock().unwrap();
-    if let Some(value) = db.get(&key) {
-        Ok(Json(GetResponse {
-            value: value.clone(),
-        }))
-    } else {
-        Err(StatusCode::NOT_FOUND)
-    }
+    Server::builder()
+        .add_service(KeyValueServer::new(key_value))
+        .serve(addr)
+        .await
+        .unwrap();
 }
