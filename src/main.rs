@@ -7,6 +7,8 @@ use rand::{thread_rng, Rng};
 use server::kv::key_value_client::KeyValueClient;
 use server::kv::{GetRequest, SetRequest};
 use server::EngineType;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[derive(Parser)]
 #[command(name = "orelsm")]
@@ -40,11 +42,17 @@ enum TestCommands {
     RandomSet {
         /// Number of key-value pairs to generate and set
         count: usize,
+        /// Concurrency level
+        #[arg(short, long, default_value_t = 1)]
+        parallel: usize,
     },
     /// Get multiple random keys
     RandomGet {
         /// Number of keys to generate and get
         count: usize,
+        /// Concurrency level
+        #[arg(short, long, default_value_t = 1)]
+        parallel: usize,
     },
     /// Set a key-value pair
     Set {
@@ -68,11 +76,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Commands::Test { command } => match command {
-            TestCommands::RandomSet { count } => {
-                run_test_set(*count).await
+            TestCommands::RandomSet { count, parallel } => {
+                run_test_set(*count, *parallel).await
             }
-            TestCommands::RandomGet { count } => {
-                run_test_get(*count).await
+            TestCommands::RandomGet { count, parallel } => {
+                run_test_get(*count, *parallel).await
             }
             TestCommands::Set { key, value } => {
                 let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
@@ -103,60 +111,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_test_set(count: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rng = thread_rng();
-    let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
-    println!("Generating and setting {} random key-value pairs...", count);
+async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Generating and setting {} random key-value pairs with parallelism {}...", count, parallel);
+    
+    let semaphore = Arc::new(Semaphore::new(parallel));
+    let mut handles = Vec::with_capacity(count);
 
     for i in 0..count {
-        let key: String = rng.gen_range(1..=100).to_string();
-        let value: String = (0..20)
-            .map(|_| rng.sample(Alphanumeric) as char)
-            .collect();
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let handle = tokio::spawn(async move {
+            let mut client = match KeyValueClient::connect("http://127.0.0.1:50051").await {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("Failed to connect: {}", e);
+                    return;
+                }
+            };
 
-        let request = tonic::Request::new(SetRequest {
-            key: key.clone(),
-            value: value.clone(),
+            let (key, value) = {
+                let mut rng = thread_rng();
+                let key = rng.gen_range(1..=100).to_string();
+                let value: String = (0..20)
+                    .map(|_| rng.sample(Alphanumeric) as char)
+                    .collect();
+                (key, value)
+            };
+
+            let request = tonic::Request::new(SetRequest {
+                key: key.clone(),
+                value: value.clone(),
+            });
+
+            if let Err(e) = client.set(request).await {
+                println!("Failed to set key {}: {}", key, e);
+            } else if count <= 10 || i < 5 || i >= count - 5 {
+                println!("[{}/{}] Setting {} = {}", i + 1, count, key, value);
+            } else if i == 5 {
+                println!("...");
+            }
+            drop(permit);
         });
+        handles.push(handle);
+    }
 
-        if let Err(e) = client.set(request).await {
-            println!("Failed to set key {}: {}", key, e);
-            continue;
-        }
-
-        if count <= 10 || i < 5 || i >= count - 5 {
-            println!("[{}/{}] Setting {} = {}", i + 1, count, key, value);
-        } else if i == 5 {
-            println!("...");
-        }
+    for handle in handles {
+        let _ = handle.await;
     }
 
     println!("Successfully processed {} random key-value pairs.", count);
     Ok(())
 }
 
-async fn run_test_get(count: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rng = thread_rng();
-    let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
-    println!("Generating and getting {} random keys...", count);
+async fn run_test_get(count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Generating and getting {} random keys with parallelism {}...", count, parallel);
+
+    let semaphore = Arc::new(Semaphore::new(parallel));
+    let mut handles = Vec::with_capacity(count);
 
     for i in 0..count {
-        let key: String = rng.gen_range(1..=100).to_string();
-
-        let request = tonic::Request::new(GetRequest {
-            key: key.clone(),
-        });
-
-        match client.get(request).await {
-            Ok(_) => {
-                 if count <= 10 || i < 5 || i >= count - 5 {
-                    println!("[{}/{}] Get key: {} -> Status: OK", i + 1, count, key);
-                } else if i == 5 {
-                    println!("...");
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let handle = tokio::spawn(async move {
+            let mut client = match KeyValueClient::connect("http://127.0.0.1:50051").await {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("Failed to connect: {}", e);
+                    return;
                 }
+            };
+
+            let key = {
+                let mut rng = thread_rng();
+                rng.gen_range(1..=100).to_string()
+            };
+
+            let request = tonic::Request::new(GetRequest {
+                key: key.clone(),
+            });
+
+            match client.get(request).await {
+                Ok(_) => {
+                     if count <= 10 || i < 5 || i >= count - 5 {
+                        println!("[{}/{}] Get key: {} -> Status: OK", i + 1, count, key);
+                    } else if i == 5 {
+                        println!("...");
+                    }
+                }
+                Err(e) => println!("Request failed for key {}: {}", key, e),
             }
-            Err(e) => println!("Request failed for key {}: {}", key, e),
-        }
+            drop(permit);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let _ = handle.await;
     }
 
     println!("Successfully processed {} random get operations.", count);
