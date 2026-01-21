@@ -340,18 +340,62 @@ mod tests {
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
-    #[test]
-    fn test_set_within_threshold_succeeds() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let file_path = temp_file.path().to_str().unwrap().to_string();
-
-        // 閾値を100バイトに設定
-        let engine = LogEngine::new(file_path, 100);
-
-        let result = engine.set("key".to_string(), "value".to_string());
-        assert!(result.is_ok());
-
-        let value = engine.get("key".to_string()).unwrap();
-        assert_eq!(value, "value");
+        #[test]
+        fn test_set_within_threshold_succeeds() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_path = temp_file.path().to_str().unwrap().to_string();
+            
+            // 閾値を100バイトに設定
+            let engine = LogEngine::new(file_path, 100);
+            
+            let result = engine.set("key".to_string(), "value".to_string());
+            assert!(result.is_ok());
+            
+            let value = engine.get("key".to_string()).unwrap();
+            assert_eq!(value, "value");
+        }
+    
+        #[test]
+        #[should_panic(expected = "Invalid magic bytes")]
+        fn test_new_with_invalid_magic_bytes_panics() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_path = temp_file.path().to_str().unwrap().to_string();
+            
+            {
+                let mut f = File::create(&file_path).unwrap();
+                f.write_all(b"WRONG!").unwrap(); // 6 bytes wrong magic
+                f.write_all(&1u32.to_le_bytes()).unwrap(); // version
+            }
+            
+            LogEngine::new(file_path, 1024);
+        }
+    
+        #[test]
+        #[should_panic(expected = "Incompatible data version")]
+        fn test_new_with_invalid_version_panics() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_path = temp_file.path().to_str().unwrap().to_string();
+            
+            {
+                let mut f = File::create(&file_path).unwrap();
+                f.write_all(MAGIC_BYTES).unwrap();
+                f.write_all(&999u32.to_le_bytes()).unwrap(); // Wrong version
+            }
+            
+            LogEngine::new(file_path, 1024);
+        }
+    
+        #[test]
+        #[should_panic(expected = "Data file is too small")]
+        fn test_new_with_too_small_file_panics() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let file_path = temp_file.path().to_str().unwrap().to_string();
+            
+            {
+                let mut f = File::create(&file_path).unwrap();
+                f.write_all(b"TOO_SMALL").unwrap(); // 9 bytes (Header is 10)
+            }
+            
+            LogEngine::new(file_path, 1024);
+        }
     }
-}
