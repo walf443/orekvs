@@ -1,6 +1,7 @@
 use tonic::Status;
 
 pub mod log;
+pub mod lsm_tree;
 pub mod memory;
 
 pub trait Engine: Send + Sync + 'static {

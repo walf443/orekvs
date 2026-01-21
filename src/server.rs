@@ -7,7 +7,7 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{DeleteRequest, DeleteResponse, GetRequest, GetResponse, SetRequest, SetResponse};
 
-use crate::engine::{memory::MemoryEngine, log::LogEngine, Engine};
+use crate::engine::{log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine, Engine};
 
 // --- gRPC Service ---
 
@@ -20,6 +20,7 @@ impl MyKeyValue {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
             EngineType::Log => Box::new(LogEngine::new(data_file, log_engine_compaction_threshold)),
+            EngineType::LsmTree => Box::new(LsmTreeEngine::new(data_file, log_engine_compaction_threshold)),
         };
         MyKeyValue { engine }
     }
@@ -50,6 +51,7 @@ impl KeyValue for MyKeyValue {
 pub enum EngineType {
     Memory,
     Log,
+    LsmTree,
 }
 
 pub async fn run_server(
