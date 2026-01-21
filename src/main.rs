@@ -3,10 +3,10 @@ mod server;
 
 use clap::{Parser, Subcommand};
 use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::{Rng, thread_rng};
+use server::EngineType;
 use server::kv::key_value_client::KeyValueClient;
 use server::kv::{GetRequest, SetRequest};
-use server::EngineType;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -24,10 +24,14 @@ enum Commands {
     Server {
         #[arg(long, default_value = "127.0.0.1:50051")]
         addr: String,
-        
+
         /// Storage engine to use
         #[arg(long, value_enum, default_value_t = EngineType::Memory)]
         engine: EngineType,
+
+        /// Compaction threshold in bytes for Log engine
+        #[arg(long, default_value_t = 1024)]
+        log_engine_compaction_threshold: u64,
     },
     /// Test commands
     Test {
@@ -55,14 +59,9 @@ enum TestCommands {
         parallel: usize,
     },
     /// Set a key-value pair
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
     /// Get the value of a key
-    Get {
-        key: String,
-    },
+    Get { key: String },
 }
 
 #[tokio::main]
@@ -70,18 +69,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Server { addr, engine } => {
+        Commands::Server {
+            addr,
+            engine,
+            log_engine_compaction_threshold,
+        } => {
             let addr = addr.parse()?;
-            server::run_server(addr, engine.clone()).await;
+            server::run_server(addr, engine.clone(), *log_engine_compaction_threshold).await;
             Ok(())
         }
         Commands::Test { command } => match command {
-            TestCommands::RandomSet { count, parallel } => {
-                run_test_set(*count, *parallel).await
-            }
-            TestCommands::RandomGet { count, parallel } => {
-                run_test_get(*count, *parallel).await
-            }
+            TestCommands::RandomSet { count, parallel } => run_test_set(*count, *parallel).await,
+            TestCommands::RandomGet { count, parallel } => run_test_get(*count, *parallel).await,
             TestCommands::Set { key, value } => {
                 let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
                 let request = tonic::Request::new(SetRequest {
@@ -94,13 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             TestCommands::Get { key } => {
                 let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
-                let request = tonic::Request::new(GetRequest {
-                    key: key.clone(),
-                });
+                let request = tonic::Request::new(GetRequest { key: key.clone() });
                 match client.get(request).await {
                     Ok(response) => {
                         println!("{}", response.into_inner().value);
-                    },
+                    }
                     Err(e) => {
                         println!("Error: {}", e);
                     }
@@ -112,8 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Generating and setting {} random key-value pairs with parallelism {}...", count, parallel);
-    
+    println!(
+        "Generating and setting {} random key-value pairs with parallelism {}...",
+        count, parallel
+    );
+
     let semaphore = Arc::new(Semaphore::new(parallel));
     let mut handles = Vec::with_capacity(count);
 
@@ -131,9 +131,7 @@ async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::
             let (key, value) = {
                 let mut rng = thread_rng();
                 let key = rng.gen_range(1..=100).to_string();
-                let value: String = (0..20)
-                    .map(|_| rng.sample(Alphanumeric) as char)
-                    .collect();
+                let value: String = (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
                 (key, value)
             };
 
@@ -163,7 +161,10 @@ async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::
 }
 
 async fn run_test_get(count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Generating and getting {} random keys with parallelism {}...", count, parallel);
+    println!(
+        "Generating and getting {} random keys with parallelism {}...",
+        count, parallel
+    );
 
     let semaphore = Arc::new(Semaphore::new(parallel));
     let mut handles = Vec::with_capacity(count);
@@ -184,13 +185,11 @@ async fn run_test_get(count: usize, parallel: usize) -> Result<(), Box<dyn std::
                 rng.gen_range(1..=100).to_string()
             };
 
-            let request = tonic::Request::new(GetRequest {
-                key: key.clone(),
-            });
+            let request = tonic::Request::new(GetRequest { key: key.clone() });
 
             match client.get(request).await {
                 Ok(_) => {
-                     if count <= 10 || i < 5 || i >= count - 5 {
+                    if count <= 10 || i < 5 || i >= count - 5 {
                         println!("[{}/{}] Get key: {} -> Status: OK", i + 1, count, key);
                     } else if i == 5 {
                         println!("...");

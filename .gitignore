@@ -1,3 +1,4 @@
 *.log
 target/
 kv_store.data
+server.pid

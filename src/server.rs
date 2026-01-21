@@ -1,4 +1,4 @@
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 pub mod kv {
     tonic::include_proto!("kv");
@@ -7,7 +7,7 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{GetRequest, GetResponse, SetRequest, SetResponse};
 
-use crate::engine::{Engine, memory::MemoryEngine, log::LogEngine};
+use crate::engine::{Engine, log::LogEngine, memory::MemoryEngine};
 
 // --- gRPC Service ---
 
@@ -16,10 +16,10 @@ pub struct MyKeyValue {
 }
 
 impl MyKeyValue {
-    pub fn new(engine_type: EngineType) -> Self {
+    pub fn new(engine_type: EngineType, log_engine_compaction_threshold: u64) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
-            EngineType::Log => Box::new(LogEngine::new()),
+            EngineType::Log => Box::new(LogEngine::new(log_engine_compaction_threshold)),
         };
         MyKeyValue { engine }
     }
@@ -27,19 +27,13 @@ impl MyKeyValue {
 
 #[tonic::async_trait]
 impl KeyValue for MyKeyValue {
-    async fn set(
-        &self,
-        request: Request<SetRequest>,
-    ) -> Result<Response<SetResponse>, Status> {
+    async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
         let req = request.into_inner();
         self.engine.set(req.key, req.value)?;
         Ok(Response::new(SetResponse { success: true }))
     }
 
-    async fn get(
-        &self,
-        request: Request<GetRequest>,
-    ) -> Result<Response<GetResponse>, Status> {
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
         let value = self.engine.get(req.key)?;
         Ok(Response::new(GetResponse { value }))
@@ -52,8 +46,12 @@ pub enum EngineType {
     Log,
 }
 
-pub async fn run_server(addr: std::net::SocketAddr, engine_type: EngineType) {
-    let key_value = MyKeyValue::new(engine_type);
+pub async fn run_server(
+    addr: std::net::SocketAddr,
+    engine_type: EngineType,
+    log_engine_compaction_threshold: u64,
+) {
+    let key_value = MyKeyValue::new(engine_type, log_engine_compaction_threshold);
 
     println!("Server listening on {}", addr);
 
