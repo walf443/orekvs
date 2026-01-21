@@ -82,7 +82,8 @@ enum TestCommands {
     },
 }
 
-#[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match &cli.command {
@@ -145,22 +146,15 @@ async fn run_test_set(addr: String, count: usize, parallel: usize) -> Result<(),
         count, parallel, addr
     );
 
+    let client = KeyValueClient::connect(addr).await?;
     let semaphore = Arc::new(Semaphore::new(parallel));
     let mut handles = Vec::with_capacity(count);
     let start_time = Instant::now();
 
     for i in 0..count {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let addr_clone = addr.clone();
+        let mut client_clone = client.clone();
         let handle = tokio::spawn(async move {
-            let mut client = match KeyValueClient::connect(addr_clone).await {
-                Ok(c) => c,
-                Err(e) => {
-                    println!("Failed to connect: {}", e);
-                    return None;
-                }
-            };
-
             let (key, value) = {
                 let mut rng = thread_rng();
                 let key = rng.gen_range(1..=100).to_string();
@@ -174,7 +168,7 @@ async fn run_test_set(addr: String, count: usize, parallel: usize) -> Result<(),
             });
 
             let req_start = Instant::now();
-            let res = client.set(request).await;
+            let res = client_clone.set(request).await;
             let duration = req_start.elapsed();
 
             let result = if let Err(e) = res {
@@ -224,22 +218,15 @@ async fn run_test_get(addr: String, count: usize, parallel: usize) -> Result<(),
         count, parallel, addr
     );
 
+    let client = KeyValueClient::connect(addr).await?;
     let semaphore = Arc::new(Semaphore::new(parallel));
     let mut handles = Vec::with_capacity(count);
     let start_time = Instant::now();
 
     for i in 0..count {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let addr_clone = addr.clone();
+        let mut client_clone = client.clone();
         let handle = tokio::spawn(async move {
-            let mut client = match KeyValueClient::connect(addr_clone).await {
-                Ok(c) => c,
-                Err(e) => {
-                    println!("Failed to connect: {}", e);
-                    return None;
-                }
-            };
-
             let key = {
                 let mut rng = thread_rng();
                 rng.gen_range(1..=100).to_string()
@@ -248,7 +235,7 @@ async fn run_test_get(addr: String, count: usize, parallel: usize) -> Result<(),
             let request = tonic::Request::new(GetRequest { key: key.clone() });
 
             let req_start = Instant::now();
-            let res = client.get(request).await;
+            let res = client_clone.get(request).await;
             let duration = req_start.elapsed();
 
             let result = match res {
