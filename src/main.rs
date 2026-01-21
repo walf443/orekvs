@@ -30,9 +30,9 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EngineType::Memory)]
         engine: EngineType,
 
-        /// Data file path for Log engine
-        #[arg(long, default_value = "kv_store.data")]
-        data_file: String,
+        /// Data directory for storage engines
+        #[arg(long, default_value = "kv_data")]
+        data_dir: String,
 
         /// Compaction threshold in bytes for Log engine
         #[arg(long, default_value_t = 1024)]
@@ -68,18 +68,11 @@ enum TestCommands {
         parallel: usize,
     },
     /// Set a key-value pair
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
     /// Get the value of a key
-    Get {
-        key: String,
-    },
+    Get { key: String },
     /// Delete a key
-    Delete {
-        key: String,
-    },
+    Delete { key: String },
 }
 
 #[tokio::main]
@@ -90,22 +83,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Server {
             addr,
             engine,
-            data_file,
+            data_dir,
             log_engine_compaction_threshold,
         } => {
             let addr = addr.parse()?;
             server::run_server(
                 addr,
                 engine.clone(),
-                data_file.clone(),
+                data_dir.clone(),
                 *log_engine_compaction_threshold,
             )
             .await;
             Ok(())
         }
         Commands::Test { addr, command } => match command {
-            TestCommands::RandomSet { count, parallel } => run_test_set(addr.clone(), *count, *parallel).await,
-            TestCommands::RandomGet { count, parallel } => run_test_get(addr.clone(), *count, *parallel).await,
+            TestCommands::RandomSet { count, parallel } => {
+                run_test_set(addr.clone(), *count, *parallel).await
+            }
+            TestCommands::RandomGet { count, parallel } => {
+                run_test_get(addr.clone(), *count, *parallel).await
+            }
             TestCommands::Set { key, value } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(SetRequest {
@@ -140,7 +137,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn run_test_set(addr: String, count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_test_set(
+    addr: String,
+    count: usize,
+    parallel: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Generating and setting {} random key-value pairs with parallelism {} to {}...",
         count, parallel, addr
@@ -197,22 +198,30 @@ async fn run_test_set(addr: String, count: usize, parallel: usize) -> Result<(),
 
     let total_elapsed = start_time.elapsed();
     let success_count = successful_durations.len();
-    
+
     println!("\nSummary:");
     println!("Total count: {}", count);
     println!("Success count: {}", success_count);
     println!("Total elapsed time: {:?}", total_elapsed);
-    
+
     if success_count > 0 {
-        let avg_duration: std::time::Duration = successful_durations.iter().sum::<std::time::Duration>() / success_count as u32;
+        let avg_duration: std::time::Duration =
+            successful_durations.iter().sum::<std::time::Duration>() / success_count as u32;
         println!("Average request time (success only): {:?}", avg_duration);
-        println!("Throughput: {:.2} req/sec", success_count as f64 / total_elapsed.as_secs_f64());
+        println!(
+            "Throughput: {:.2} req/sec",
+            success_count as f64 / total_elapsed.as_secs_f64()
+        );
     }
 
     Ok(())
 }
 
-async fn run_test_get(addr: String, count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_test_get(
+    addr: String,
+    count: usize,
+    parallel: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Generating and getting {} random keys with parallelism {} from {}...",
         count, parallel, addr
@@ -274,9 +283,13 @@ async fn run_test_get(addr: String, count: usize, parallel: usize) -> Result<(),
     println!("Total elapsed time: {:?}", total_elapsed);
 
     if success_count > 0 {
-        let avg_duration: std::time::Duration = successful_durations.iter().sum::<std::time::Duration>() / success_count as u32;
+        let avg_duration: std::time::Duration =
+            successful_durations.iter().sum::<std::time::Duration>() / success_count as u32;
         println!("Average request time (success only): {:?}", avg_duration);
-        println!("Throughput: {:.2} req/sec", success_count as f64 / total_elapsed.as_secs_f64());
+        println!(
+            "Throughput: {:.2} req/sec",
+            success_count as f64 / total_elapsed.as_secs_f64()
+        );
     }
 
     Ok(())

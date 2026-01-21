@@ -1,58 +1,266 @@
 use super::Engine;
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
-#[derive(Debug)]
+const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
+const DATA_VERSION: u32 = 1;
+
+// Type alias to reduce complexity warnings
+type MemTable = BTreeMap<String, Option<String>>;
+
+#[derive(Debug, Clone)]
 pub struct LsmTreeEngine {
     // Current in-memory write buffer
-    memtable: Arc<Mutex<BTreeMap<String, Option<String>>>>,
-    // Path where SSTables will be stored
-    _data_dir: String,
-    // Maximum size of MemTable before flushing to SSTable (currently placeholder)
-    _memtable_threshold: u64,
+    active_memtable: Arc<Mutex<MemTable>>,
+    // MemTables currently being flushed to disk
+    immutable_memtables: Arc<Mutex<Vec<Arc<MemTable>>>>,
+    // List of SSTable file paths on disk (newest first)
+    sstables: Arc<Mutex<Vec<PathBuf>>>,
+    // Base directory for SSTables
+    data_dir: PathBuf,
+    // Threshold for MemTable size in bytes
+    memtable_threshold: u64,
+    // Approximate size of current active MemTable
+    current_mem_size: Arc<AtomicU64>,
+    // Counter for next SSTable file ID
+    next_sst_id: Arc<AtomicU64>,
 }
 
 impl LsmTreeEngine {
-    pub fn new(data_dir: String, memtable_threshold: u64) -> Self {
-        LsmTreeEngine {
-            memtable: Arc::new(Mutex::new(BTreeMap::new())),
-            _data_dir: data_dir,
-            _memtable_threshold: memtable_threshold,
+    pub fn new(data_dir_str: String, memtable_threshold: u64) -> Self {
+        let data_dir = PathBuf::from(&data_dir_str);
+
+        if !data_dir.exists() {
+            fs::create_dir_all(&data_dir).expect("Failed to create data directory");
         }
+
+        let mut sst_files = Vec::new();
+        let mut max_id = 0;
+
+        if let Ok(entries) = fs::read_dir(&data_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                #[allow(clippy::collapsible_if)]
+                if let Some(filename) = p.file_name().and_then(|n| n.to_str()) {
+                    if filename.starts_with("sst_") && filename.ends_with(".data") {
+                        if let Ok(id) = filename[4..filename.len() - 5].parse::<u64>() {
+                            if id >= max_id {
+                                max_id = id + 1;
+                            }
+                            sst_files.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        sst_files.sort_by(|a, b| b.cmp(a));
+
+        LsmTreeEngine {
+            active_memtable: Arc::new(Mutex::new(BTreeMap::new())),
+            immutable_memtables: Arc::new(Mutex::new(Vec::new())),
+            sstables: Arc::new(Mutex::new(sst_files)),
+            data_dir,
+            memtable_threshold,
+            current_mem_size: Arc::new(AtomicU64::new(0)),
+            next_sst_id: Arc::new(AtomicU64::new(max_id)),
+        }
+    }
+
+    fn estimate_entry_size(key: &str, value: &Option<String>) -> u64 {
+        let vlen = value.as_ref().map_or(0, |v| v.len() as u64);
+        8 + 8 + 8 + key.len() as u64 + vlen
+    }
+
+    fn check_flush(&self) {
+        let size = self.current_mem_size.load(Ordering::SeqCst);
+        if size >= self.memtable_threshold {
+            let mut active = self.active_memtable.lock().unwrap();
+            if self.current_mem_size.load(Ordering::SeqCst) >= self.memtable_threshold {
+                let immutable = Arc::new(std::mem::take(&mut *active));
+                self.current_mem_size.store(0, Ordering::SeqCst);
+
+                let mut immutables = self.immutable_memtables.lock().unwrap();
+                immutables.push(immutable.clone());
+
+                let engine_clone = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = engine_clone.flush_memtable(immutable).await {
+                        eprintln!("Failed to flush memtable: {}", e);
+                    }
+                });
+            }
+        }
+    }
+
+    async fn flush_memtable(&self, memtable: Arc<MemTable>) -> Result<(), Status> {
+        let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let sst_path = self.data_dir.join(format!("sst_{:05}.data", sst_id));
+
+        println!("Flushing MemTable to {:?}...", sst_path);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&sst_path)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        file.write_all(MAGIC_BYTES)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        file.write_all(&DATA_VERSION.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        for (key, value_opt) in memtable.iter() {
+            let key_bytes = key.as_bytes();
+            let key_len = key_bytes.len() as u64;
+            let (val_len, val_bytes) = match value_opt {
+                Some(v) => (v.len() as u64, v.as_bytes()),
+                None => (u64::MAX, &[] as &[u8]),
+            };
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            file.write_all(&timestamp.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            file.write_all(&key_len.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            file.write_all(&val_len.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            file.write_all(key_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            if val_len != u64::MAX {
+                file.write_all(val_bytes)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+        }
+        file.flush().map_err(|e| Status::internal(e.to_string()))?;
+
+        {
+            let mut sstables = self.sstables.lock().unwrap();
+            sstables.insert(0, sst_path);
+        }
+
+        {
+            let mut immutables = self.immutable_memtables.lock().unwrap();
+            immutables.retain(|m| !Arc::ptr_eq(m, &memtable));
+        }
+
+        println!("Flush finished.");
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn search_in_sstable(&self, path: &Path, key: &str) -> Result<Option<String>, Status> {
+        let mut file = File::open(path).map_err(|e| Status::internal(e.to_string()))?;
+        file.seek(SeekFrom::Start(10))
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        loop {
+            let mut ts_bytes = [0u8; 8];
+            if file.read_exact(&mut ts_bytes).is_err() {
+                break;
+            }
+
+            let mut klen_bytes = [0u8; 8];
+            file.read_exact(&mut klen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let mut vlen_bytes = [0u8; 8];
+            file.read_exact(&mut vlen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let key_len = u64::from_le_bytes(klen_bytes);
+            let val_len = u64::from_le_bytes(vlen_bytes);
+
+            let mut key_buf = vec![0u8; key_len as usize];
+            file.read_exact(&mut key_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let current_key = String::from_utf8_lossy(&key_buf);
+
+            if current_key == key {
+                if val_len == u64::MAX {
+                    return Ok(None);
+                }
+                let mut val_buf = vec![0u8; val_len as usize];
+                file.read_exact(&mut val_buf)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                return Ok(Some(String::from_utf8_lossy(&val_buf).to_string()));
+            }
+
+            if val_len != u64::MAX {
+                file.seek(SeekFrom::Current(val_len as i64))
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+        }
+        Err(Status::not_found("Key not found in SSTable"))
     }
 }
 
 impl Engine for LsmTreeEngine {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
-        let mut memtable = self.memtable.lock().unwrap();
-        memtable.insert(key, Some(value));
-        
-        // TODO: Check memtable size and flush to SSTable if it exceeds threshold
-        
+        let entry_size = Self::estimate_entry_size(&key, &Some(value.clone()));
+        {
+            let mut memtable = self.active_memtable.lock().unwrap();
+            memtable.insert(key, Some(value));
+        }
+        self.current_mem_size.fetch_add(entry_size, Ordering::SeqCst);
+        self.check_flush();
         Ok(())
     }
 
     fn get(&self, key: String) -> Result<String, Status> {
-        let memtable = self.memtable.lock().unwrap();
-        
-        match memtable.get(&key) {
-            Some(Some(value)) => Ok(value.clone()),
-            Some(None) => Err(Status::not_found("Key has been deleted")),
-            None => {
-                // TODO: Search in SSTables on disk
-                Err(Status::not_found("Key not found"))
+        {
+            let memtable = self.active_memtable.lock().unwrap();
+            if let Some(val_opt) = memtable.get(&key) {
+                return val_opt
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| Status::not_found("Key deleted"));
             }
         }
+        {
+            let immutables = self.immutable_memtables.lock().unwrap();
+            for mem in immutables.iter().rev() {
+                if let Some(val_opt) = mem.get(&key) {
+                    return val_opt
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| Status::not_found("Key deleted"));
+                }
+            }
+        }
+        let sst_paths = {
+            let sstables = self.sstables.lock().unwrap();
+            sstables.clone()
+        };
+        for path in sst_paths {
+            match self.search_in_sstable(&path, &key) {
+                Ok(Some(v)) => return Ok(v),
+                Ok(None) => return Err(Status::not_found("Key deleted")),
+                Err(e) if e.code() == tonic::Code::NotFound => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Status::not_found("Key not found"))
     }
 
     fn delete(&self, key: String) -> Result<(), Status> {
-        let mut memtable = self.memtable.lock().unwrap();
-        // Insert a tombstone (None)
-        memtable.insert(key, None);
-        
-        // TODO: Check memtable size and flush if needed
-        
+        let entry_size = Self::estimate_entry_size(&key, &None);
+        {
+            let mut memtable = self.active_memtable.lock().unwrap();
+            memtable.insert(key, None);
+        }
+        self.current_mem_size.fetch_add(entry_size, Ordering::SeqCst);
+        self.check_flush();
         Ok(())
     }
 }
@@ -62,28 +270,43 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_lsm_basic_operations() {
+    #[tokio::test]
+    async fn test_lsm_flush_and_get() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
-        let engine = LsmTreeEngine::new(data_dir, 1024);
+        let engine = LsmTreeEngine::new(data_dir, 50);
 
-        // Set and Get
         engine.set("k1".to_string(), "v1".to_string()).unwrap();
+        engine.set("k2".to_string(), "v2".to_string()).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
         assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+        assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+    }
 
-        // Update
-        engine.set("k1".to_string(), "v2".to_string()).unwrap();
-        assert_eq!(engine.get("k1".to_string()).unwrap(), "v2");
+    #[tokio::test]
+    async fn test_lsm_recovery() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
 
-        // Delete
-        engine.delete("k1".to_string()).unwrap();
-        let res = engine.get("k1".to_string());
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err().code(), tonic::Code::NotFound);
+        {
+            let engine = LsmTreeEngine::new(data_dir.clone(), 50);
+            engine.set("k1".to_string(), "v1".to_string()).unwrap();
+            engine.set("k2".to_string(), "v2".to_string()).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
 
-        // Get non-existent
-        let res = engine.get("k2".to_string());
-        assert!(res.is_err());
+        {
+            let engine = LsmTreeEngine::new(data_dir.clone(), 50);
+            assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+            assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+
+            engine.set("k3".to_string(), "v3".to_string()).unwrap();
+            engine.set("k4".to_string(), "v4".to_string()).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+            assert_eq!(engine.get("k3".to_string()).unwrap(), "v3");
+        }
     }
 }
