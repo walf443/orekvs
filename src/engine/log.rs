@@ -32,8 +32,8 @@ impl LogEngine {
 
         let mut file = OpenOptions::new()
             .read(true)
-            .write(true)
             .create(true)
+            .append(true)
             .open(&file_path)
             .expect("Failed to open data file");
 
@@ -173,14 +173,21 @@ impl LogEngine {
 
         println!("Compacting log file (size: {} bytes)...", file_size);
 
-        let new_file_path = format!("{}.tmp", self.file_path);
+                let new_file_path = format!("{}.tmp", self.file_path);
 
-        let mut new_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&new_file_path)
-            .map_err(|e| Status::internal(e.to_string()))?;
+                let mut new_file = OpenOptions::new()
+
+                    .read(true)
+
+                    .write(true)
+
+                    .create(true)
+
+                    .truncate(true)
+
+                    .open(&new_file_path)
+
+                    .map_err(|e| Status::internal(e.to_string()))?;
 
         // Write header
 
@@ -341,6 +348,7 @@ impl Engine for LogEngine {
                 > self.compaction_threshold
         };
 
+        #[allow(clippy::collapsible_if)]
         if should_compact {
             if let Err(e) = self.compact() {
                 eprintln!("Compaction failed: {}", e);
