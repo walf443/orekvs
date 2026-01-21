@@ -2,3 +2,4 @@
 target/
 kv_store.data
 server.pid
+sst_*.data
