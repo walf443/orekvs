@@ -592,6 +592,7 @@ dependencies = [
  "clap",
  "prost",
  "rand",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-build",

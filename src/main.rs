@@ -29,6 +29,10 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EngineType::Memory)]
         engine: EngineType,
 
+        /// Data file path for Log engine
+        #[arg(long, default_value = "kv_store.data")]
+        data_file: String,
+
         /// Compaction threshold in bytes for Log engine
         #[arg(long, default_value_t = 1024)]
         log_engine_compaction_threshold: u64,
@@ -72,10 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Server {
             addr,
             engine,
+            data_file,
             log_engine_compaction_threshold,
         } => {
             let addr = addr.parse()?;
-            server::run_server(addr, engine.clone(), *log_engine_compaction_threshold).await;
+            server::run_server(
+                addr,
+                engine.clone(),
+                data_file.clone(),
+                *log_engine_compaction_threshold,
+            )
+            .await;
             Ok(())
         }
         Commands::Test { command } => match command {

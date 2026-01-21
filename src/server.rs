@@ -16,10 +16,14 @@ pub struct MyKeyValue {
 }
 
 impl MyKeyValue {
-    pub fn new(engine_type: EngineType, log_engine_compaction_threshold: u64) -> Self {
+    pub fn new(
+        engine_type: EngineType,
+        data_file: String,
+        log_engine_compaction_threshold: u64,
+    ) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
-            EngineType::Log => Box::new(LogEngine::new(log_engine_compaction_threshold)),
+            EngineType::Log => Box::new(LogEngine::new(data_file, log_engine_compaction_threshold)),
         };
         MyKeyValue { engine }
     }
@@ -49,9 +53,10 @@ pub enum EngineType {
 pub async fn run_server(
     addr: std::net::SocketAddr,
     engine_type: EngineType,
+    data_file: String,
     log_engine_compaction_threshold: u64,
 ) {
-    let key_value = MyKeyValue::new(engine_type, log_engine_compaction_threshold);
+    let key_value = MyKeyValue::new(engine_type, data_file, log_engine_compaction_threshold);
 
     println!("Server listening on {}", addr);
 
