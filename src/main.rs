@@ -6,7 +6,7 @@ use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use server::EngineType;
 use server::kv::key_value_client::KeyValueClient;
-use server::kv::{GetRequest, SetRequest};
+use server::kv::{DeleteRequest, GetRequest, SetRequest};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -39,6 +39,10 @@ enum Commands {
     },
     /// Test commands
     Test {
+        /// Server address to connect to
+        #[arg(long, default_value = "http://127.0.0.1:50051")]
+        addr: String,
+
         #[command(subcommand)]
         command: TestCommands,
     },
@@ -63,9 +67,18 @@ enum TestCommands {
         parallel: usize,
     },
     /// Set a key-value pair
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+    },
     /// Get the value of a key
-    Get { key: String },
+    Get {
+        key: String,
+    },
+    /// Delete a key
+    Delete {
+        key: String,
+    },
 }
 
 #[tokio::main]
@@ -89,11 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
             Ok(())
         }
-        Commands::Test { command } => match command {
-            TestCommands::RandomSet { count, parallel } => run_test_set(*count, *parallel).await,
-            TestCommands::RandomGet { count, parallel } => run_test_get(*count, *parallel).await,
+        Commands::Test { addr, command } => match command {
+            TestCommands::RandomSet { count, parallel } => run_test_set(addr.clone(), *count, *parallel).await,
+            TestCommands::RandomGet { count, parallel } => run_test_get(addr.clone(), *count, *parallel).await,
             TestCommands::Set { key, value } => {
-                let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
+                let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(SetRequest {
                     key: key.clone(),
                     value: value.clone(),
@@ -103,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(())
             }
             TestCommands::Get { key } => {
-                let mut client = KeyValueClient::connect("http://127.0.0.1:50051").await?;
+                let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(GetRequest { key: key.clone() });
                 match client.get(request).await {
                     Ok(response) => {
@@ -115,14 +128,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(())
             }
+            TestCommands::Delete { key } => {
+                let mut client = KeyValueClient::connect(addr.clone()).await?;
+                let request = tonic::Request::new(DeleteRequest { key: key.clone() });
+                let response = client.delete(request).await?;
+                println!("RESPONSE={:?}", response);
+                Ok(())
+            }
         },
     }
 }
 
-async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_test_set(addr: String, count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Generating and setting {} random key-value pairs with parallelism {}...",
-        count, parallel
+        "Generating and setting {} random key-value pairs with parallelism {} to {}...",
+        count, parallel, addr
     );
 
     let semaphore = Arc::new(Semaphore::new(parallel));
@@ -130,8 +150,9 @@ async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::
 
     for i in 0..count {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let addr_clone = addr.clone();
         let handle = tokio::spawn(async move {
-            let mut client = match KeyValueClient::connect("http://127.0.0.1:50051").await {
+            let mut client = match KeyValueClient::connect(addr_clone).await {
                 Ok(c) => c,
                 Err(e) => {
                     println!("Failed to connect: {}", e);
@@ -171,10 +192,10 @@ async fn run_test_set(count: usize, parallel: usize) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-async fn run_test_get(count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_test_get(addr: String, count: usize, parallel: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Generating and getting {} random keys with parallelism {}...",
-        count, parallel
+        "Generating and getting {} random keys with parallelism {} from {}...",
+        count, parallel, addr
     );
 
     let semaphore = Arc::new(Semaphore::new(parallel));
@@ -182,8 +203,9 @@ async fn run_test_get(count: usize, parallel: usize) -> Result<(), Box<dyn std::
 
     for i in 0..count {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let addr_clone = addr.clone();
         let handle = tokio::spawn(async move {
-            let mut client = match KeyValueClient::connect("http://127.0.0.1:50051").await {
+            let mut client = match KeyValueClient::connect(addr_clone).await {
                 Ok(c) => c,
                 Err(e) => {
                     println!("Failed to connect: {}", e);

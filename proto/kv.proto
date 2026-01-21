@@ -5,6 +5,7 @@ package kv;
 service KeyValue {
   rpc Set (SetRequest) returns (SetResponse);
   rpc Get (GetRequest) returns (GetResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
 }
 
 message SetRequest {
@@ -22,4 +23,12 @@ message GetRequest {
 
 message GetResponse {
   string value = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
 }

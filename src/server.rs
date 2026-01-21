@@ -5,9 +5,9 @@ pub mod kv {
 }
 
 use kv::key_value_server::{KeyValue, KeyValueServer};
-use kv::{GetRequest, GetResponse, SetRequest, SetResponse};
+use kv::{DeleteRequest, DeleteResponse, GetRequest, GetResponse, SetRequest, SetResponse};
 
-use crate::engine::{Engine, log::LogEngine, memory::MemoryEngine};
+use crate::engine::{memory::MemoryEngine, log::LogEngine, Engine};
 
 // --- gRPC Service ---
 
@@ -16,11 +16,7 @@ pub struct MyKeyValue {
 }
 
 impl MyKeyValue {
-    pub fn new(
-        engine_type: EngineType,
-        data_file: String,
-        log_engine_compaction_threshold: u64,
-    ) -> Self {
+    pub fn new(engine_type: EngineType, data_file: String, log_engine_compaction_threshold: u64) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
             EngineType::Log => Box::new(LogEngine::new(data_file, log_engine_compaction_threshold)),
@@ -41,6 +37,12 @@ impl KeyValue for MyKeyValue {
         let req = request.into_inner();
         let value = self.engine.get(req.key)?;
         Ok(Response::new(GetResponse { value }))
+    }
+
+    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
+        let req = request.into_inner();
+        self.engine.delete(req.key)?;
+        Ok(Response::new(DeleteResponse { success: true }))
     }
 }
 

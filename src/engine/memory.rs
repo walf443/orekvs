@@ -28,4 +28,12 @@ impl Engine for MemoryEngine {
             None => Err(Status::not_found("Key not found")),
         }
     }
+
+    fn delete(&self, key: String) -> Result<(), Status> {
+        let mut db = self.db.lock().unwrap();
+        match db.remove(&key) {
+            Some(_) => Ok(()),
+            None => Err(Status::not_found("Key not found")),
+        }
+    }
 }
