@@ -1,8 +1,9 @@
+mod memtable;
 mod sstable;
 mod wal;
-mod memtable;
 
 use super::Engine;
+use memtable::{MemTable, MemTableState};
 use sstable::TimestampedEntry;
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,22 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tonic::Status;
 use wal::WalWriter;
-use memtable::MemTable;
 
 #[derive(Debug)]
 pub struct LsmTreeEngine {
-    // Current in-memory write buffer
-    active_memtable: Arc<Mutex<MemTable>>,
-    // MemTables currently being flushed to disk
-    immutable_memtables: Arc<Mutex<Vec<Arc<MemTable>>>>,
+    // MemTable management state
+    mem_state: MemTableState,
     // List of SSTable file paths on disk (newest first)
     sstables: Arc<Mutex<Vec<PathBuf>>>,
     // Base directory for SSTables
     data_dir: PathBuf,
-    // Threshold for MemTable size in bytes
-    memtable_threshold: u64,
-    // Approximate size of current active MemTable
-    current_mem_size: Arc<AtomicU64>,
     // Counter for next SSTable file ID
     next_sst_id: Arc<AtomicU64>,
     // Threshold for triggering compaction (number of SSTables)
@@ -40,12 +34,9 @@ pub struct LsmTreeEngine {
 impl Clone for LsmTreeEngine {
     fn clone(&self) -> Self {
         LsmTreeEngine {
-            active_memtable: Arc::clone(&self.active_memtable),
-            immutable_memtables: Arc::clone(&self.immutable_memtables),
+            mem_state: self.mem_state.clone(),
             sstables: Arc::clone(&self.sstables),
             data_dir: self.data_dir.clone(),
-            memtable_threshold: self.memtable_threshold,
-            current_mem_size: Arc::clone(&self.current_mem_size),
             next_sst_id: Arc::clone(&self.next_sst_id),
             compaction_threshold: self.compaction_threshold,
             compaction_in_progress: Arc::clone(&self.compaction_in_progress),
@@ -115,9 +106,9 @@ impl LsmTreeEngine {
                 match WalWriter::read_entries(wal_path) {
                     Ok(entries) => {
                         for (key, value) in entries {
-                            let entry_size = Self::estimate_entry_size(&key, &value);
+                            let entry_size = memtable::estimate_entry_size(&key, &value);
                             if let Some(old_value) = recovered_memtable.get(&key) {
-                                let old_size = Self::estimate_entry_size(&key, old_value);
+                                let old_size = memtable::estimate_entry_size(&key, old_value);
                                 if entry_size > old_size {
                                     recovered_size += entry_size - old_size;
                                 } else {
@@ -153,13 +144,12 @@ impl LsmTreeEngine {
                 .expect("Failed to write recovered entries to WAL");
         }
 
+        let mem_state = MemTableState::new(memtable_threshold, recovered_memtable, recovered_size);
+
         LsmTreeEngine {
-            active_memtable: Arc::new(Mutex::new(recovered_memtable)),
-            immutable_memtables: Arc::new(Mutex::new(Vec::new())),
+            mem_state,
             sstables: Arc::new(Mutex::new(sst_files)),
             data_dir,
-            memtable_threshold,
-            current_mem_size: Arc::new(AtomicU64::new(recovered_size)),
             next_sst_id: Arc::new(AtomicU64::new(max_sst_id)),
             compaction_threshold,
             compaction_in_progress: Arc::new(Mutex::new(false)),
@@ -167,29 +157,14 @@ impl LsmTreeEngine {
         }
     }
 
-    fn estimate_entry_size(key: &str, value: &Option<String>) -> u64 {
-        let vlen = value.as_ref().map_or(0, |v| v.len() as u64);
-        8 + 8 + 8 + key.len() as u64 + vlen
-    }
-
     fn check_flush(&self) {
-        let size = self.current_mem_size.load(Ordering::SeqCst);
-        if size >= self.memtable_threshold {
-            let mut active = self.active_memtable.lock().unwrap();
-            if self.current_mem_size.load(Ordering::SeqCst) >= self.memtable_threshold {
-                let immutable = Arc::new(std::mem::take(&mut *active));
-                self.current_mem_size.store(0, Ordering::SeqCst);
-
-                let mut immutables = self.immutable_memtables.lock().unwrap();
-                immutables.push(immutable.clone());
-
-                let engine_clone = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = engine_clone.flush_memtable(immutable).await {
-                        eprintln!("Failed to flush memtable: {}", e);
-                    }
-                });
-            }
+        if let Some(immutable) = self.mem_state.check_flush_threshold() {
+            let engine_clone = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = engine_clone.flush_memtable(immutable).await {
+                    eprintln!("Failed to flush memtable: {}", e);
+                }
+            });
         }
     }
 
@@ -208,10 +183,7 @@ impl LsmTreeEngine {
             sstables.insert(0, sst_path);
         }
 
-        {
-            let mut immutables = self.immutable_memtables.lock().unwrap();
-            immutables.retain(|m| !Arc::ptr_eq(m, &memtable));
-        }
+        self.mem_state.remove_immutable(&memtable);
 
         // Rotate WAL: create a new WAL file (old WAL preserved for replication)
         if let Err(e) = self.wal.rotate() {
@@ -342,49 +314,19 @@ impl Engine for LsmTreeEngine {
         self.wal.append(&key, &new_val_opt)?;
 
         // 2. Then update MemTable
-        let entry_size = Self::estimate_entry_size(&key, &new_val_opt);
-        {
-            let mut memtable = self.active_memtable.lock().unwrap();
-            if let Some(old_val_opt) = memtable.get(&key) {
-                let old_size = Self::estimate_entry_size(&key, old_val_opt);
-                if entry_size > old_size {
-                    self.current_mem_size
-                        .fetch_add(entry_size - old_size, Ordering::SeqCst);
-                } else {
-                    self.current_mem_size
-                        .fetch_sub(old_size - entry_size, Ordering::SeqCst);
-                }
-            } else {
-                self.current_mem_size
-                    .fetch_add(entry_size, Ordering::SeqCst);
-            }
-            memtable.insert(key, new_val_opt);
-        }
+        self.mem_state.insert(key, new_val_opt);
         self.check_flush();
         Ok(())
     }
 
     fn get(&self, key: String) -> Result<String, Status> {
-        {
-            let memtable = self.active_memtable.lock().unwrap();
-            if let Some(val_opt) = memtable.get(&key) {
-                return val_opt
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| Status::not_found("Key deleted"));
-            }
+        if let Some(val_opt) = self.mem_state.get(&key) {
+            return val_opt
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| Status::not_found("Key deleted"));
         }
-        {
-            let immutables = self.immutable_memtables.lock().unwrap();
-            for mem in immutables.iter().rev() {
-                if let Some(val_opt) = mem.get(&key) {
-                    return val_opt
-                        .as_ref()
-                        .cloned()
-                        .ok_or_else(|| Status::not_found("Key deleted"));
-                }
-            }
-        }
+        
         let sst_paths = {
             let sstables = self.sstables.lock().unwrap();
             sstables.clone()
@@ -405,24 +347,7 @@ impl Engine for LsmTreeEngine {
         self.wal.append(&key, &None)?;
 
         // 2. Then update MemTable
-        let entry_size = Self::estimate_entry_size(&key, &None);
-        {
-            let mut memtable = self.active_memtable.lock().unwrap();
-            if let Some(old_val_opt) = memtable.get(&key) {
-                let old_size = Self::estimate_entry_size(&key, old_val_opt);
-                if entry_size > old_size {
-                    self.current_mem_size
-                        .fetch_add(entry_size - old_size, Ordering::SeqCst);
-                } else {
-                    self.current_mem_size
-                        .fetch_sub(old_size - entry_size, Ordering::SeqCst);
-                }
-            } else {
-                self.current_mem_size
-                    .fetch_add(entry_size, Ordering::SeqCst);
-            }
-            memtable.insert(key, None);
-        }
+        self.mem_state.insert(key, None);
         self.check_flush();
         Ok(())
     }
