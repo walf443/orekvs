@@ -24,6 +24,8 @@ pub struct LogEngine {
     log_capacity_bytes: u64,
     // Flag to check if compaction is running
     is_compacting: Arc<AtomicBool>,
+    // Handle to the compaction task for graceful shutdown
+    compaction_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LogEngine {
@@ -32,6 +34,23 @@ impl LogEngine {
         if !dir_path.exists() {
             fs::create_dir_all(&dir_path).expect("Failed to create data directory");
         }
+
+        // Clean up orphaned .tmp files from interrupted compaction
+        if let Ok(entries) = fs::read_dir(&dir_path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(filename) = p.file_name().and_then(|n| n.to_str())
+                    && filename.ends_with(".tmp")
+                {
+                    if let Err(e) = fs::remove_file(&p) {
+                        eprintln!("Warning: Failed to remove orphaned tmp file {:?}: {}", p, e);
+                    } else {
+                        println!("Cleaned up orphaned tmp file: {:?}", p);
+                    }
+                }
+            }
+        }
+
         let file_path = dir_path
             .join("log_engine.data")
             .to_str()
@@ -53,7 +72,7 @@ impl LogEngine {
                 .expect("Failed to write magic bytes");
             file.write_all(&DATA_VERSION.to_le_bytes())
                 .expect("Failed to write version");
-            file.flush().expect("Failed to flush header");
+            file.sync_all().expect("Failed to sync header");
         } else {
             // Existing file: verify header
             if file_size < HEADER_SIZE {
@@ -137,7 +156,23 @@ impl LogEngine {
             file_path,
             log_capacity_bytes,
             is_compacting: Arc::new(AtomicBool::new(false)),
+            compaction_handle: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Gracefully shutdown the engine, waiting for any running compaction to complete
+    pub async fn shutdown(&self) {
+        println!("Shutting down LogEngine...");
+        let handle = {
+            let mut guard = self.compaction_handle.lock().unwrap();
+            guard.take()
+        };
+        if let Some(handle) = handle
+            && let Err(e) = handle.await
+        {
+            eprintln!("Error waiting for compaction to complete: {}", e);
+        }
+        println!("LogEngine shutdown complete.");
     }
 
     #[allow(clippy::result_large_err)]
@@ -254,7 +289,7 @@ impl LogEngine {
             new_index.insert(key.clone(), (value_offset, length));
         }
 
-        if let Err(e) = new_file.flush() {
+        if let Err(e) = new_file.sync_all() {
             self.is_compacting.store(false, Ordering::SeqCst);
             return Err(Status::internal(e.to_string()));
         }
@@ -321,7 +356,7 @@ impl Engine for LogEngine {
                 .write_all(val_bytes)
                 .map_err(|e| Status::internal(e.to_string()))?;
             writer
-                .flush()
+                .sync_all()
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             // Calculate where the value starts:
@@ -346,11 +381,12 @@ impl Engine for LogEngine {
                 .is_ok()
             {
                 let engine_clone = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(e) = engine_clone.compact() {
                         eprintln!("Compaction failed: {}", e);
                     }
                 });
+                *self.compaction_handle.lock().unwrap() = Some(handle);
             }
         }
 
@@ -418,7 +454,7 @@ impl Engine for LogEngine {
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             writer
-                .flush()
+                .sync_all()
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             let mut index = self.index.lock().unwrap();
@@ -439,11 +475,12 @@ impl Engine for LogEngine {
                 .is_ok()
             {
                 let engine_clone = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(e) = engine_clone.compact() {
                         eprintln!("Compaction failed: {}", e);
                     }
                 });
+                *self.compaction_handle.lock().unwrap() = Some(handle);
             }
         }
 

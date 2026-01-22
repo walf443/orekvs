@@ -37,6 +37,27 @@ impl LsmEngineHolder {
     }
 }
 
+/// Wrapper to hold Log engine reference for graceful shutdown
+struct LogEngineHolder {
+    engine: Option<Arc<LogEngine>>,
+}
+
+impl LogEngineHolder {
+    fn new() -> Self {
+        LogEngineHolder { engine: None }
+    }
+
+    fn set(&mut self, engine: Arc<LogEngine>) {
+        self.engine = Some(engine);
+    }
+
+    async fn shutdown(&self) {
+        if let Some(ref engine) = self.engine {
+            engine.shutdown().await;
+        }
+    }
+}
+
 impl MyKeyValue {
     fn new(
         engine_type: EngineType,
@@ -45,10 +66,15 @@ impl MyKeyValue {
         lsm_memtable_capacity_bytes: u64,
         lsm_compaction_trigger_file_count: usize,
         lsm_holder: &mut LsmEngineHolder,
+        log_holder: &mut LogEngineHolder,
     ) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
-            EngineType::Log => Box::new(LogEngine::new(data_dir, log_capacity_bytes)),
+            EngineType::Log => {
+                let log_engine = Arc::new(LogEngine::new(data_dir, log_capacity_bytes));
+                log_holder.set(Arc::clone(&log_engine));
+                Box::new(LogEngineWrapper(log_engine))
+            }
             EngineType::LsmTree => {
                 let lsm_engine = Arc::new(LsmTreeEngine::new(
                     data_dir,
@@ -60,6 +86,23 @@ impl MyKeyValue {
             }
         };
         MyKeyValue { engine }
+    }
+}
+
+/// Wrapper to implement Engine for Arc<LogEngine>
+struct LogEngineWrapper(Arc<LogEngine>);
+
+impl Engine for LogEngineWrapper {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.0.set(key, value)
+    }
+
+    fn get(&self, key: String) -> Result<String, Status> {
+        self.0.get(key)
+    }
+
+    fn delete(&self, key: String) -> Result<(), Status> {
+        self.0.delete(key)
     }
 }
 
@@ -120,6 +163,7 @@ pub async fn run_server(
     lsm_compaction_trigger_file_count: usize,
 ) {
     let mut lsm_holder = LsmEngineHolder::new();
+    let mut log_holder = LogEngineHolder::new();
 
     let key_value = MyKeyValue::new(
         engine_type,
@@ -128,6 +172,7 @@ pub async fn run_server(
         lsm_memtable_capacity_bytes,
         lsm_compaction_trigger_file_count,
         &mut lsm_holder,
+        &mut log_holder,
     );
 
     println!("Server listening on {}", addr);
@@ -167,8 +212,9 @@ pub async fn run_server(
         eprintln!("Server error: {}", e);
     }
 
-    // Gracefully shutdown the LSM engine (flush pending WAL writes)
+    // Gracefully shutdown the engines (flush pending writes)
     lsm_holder.shutdown().await;
+    log_holder.shutdown().await;
 
     println!("Server stopped.");
 }
