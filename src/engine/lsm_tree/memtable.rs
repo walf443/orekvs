@@ -183,7 +183,10 @@ mod tests {
         assert!(state.needs_flush().is_none());
 
         // This should trigger flush
-        state.insert("k2".to_string(), Some("very_long_value_to_trigger_flush".to_string()));
+        state.insert(
+            "k2".to_string(),
+            Some("very_long_value_to_trigger_flush".to_string()),
+        );
         let immutable = state.needs_flush();
         assert!(immutable.is_some());
 

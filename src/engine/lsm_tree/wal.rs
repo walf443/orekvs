@@ -4,7 +4,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
 use super::memtable::MemTable;
@@ -257,6 +258,282 @@ impl WalWriter {
         } else {
             None
         }
+    }
+}
+
+/// Write request for group commit
+struct WriteRequest {
+    key: String,
+    value: Option<String>,
+    response: oneshot::Sender<Result<(), Status>>,
+}
+
+/// Inner state for WAL file operations
+#[derive(Debug)]
+struct WalWriterInner {
+    writer: File,
+    path: PathBuf,
+}
+
+/// Group commit WAL writer that batches multiple writes before sync
+#[derive(Debug)]
+pub struct GroupCommitWalWriter {
+    /// Channel to send write requests to background flusher
+    request_tx: mpsc::Sender<WriteRequest>,
+    /// Current WAL ID
+    current_id: Arc<AtomicU64>,
+    /// Data directory
+    data_dir: PathBuf,
+    /// Inner state shared with background task
+    inner: Arc<Mutex<WalWriterInner>>,
+    /// Batch interval in microseconds
+    batch_interval_micros: u64,
+}
+
+impl Clone for GroupCommitWalWriter {
+    fn clone(&self) -> Self {
+        GroupCommitWalWriter {
+            request_tx: self.request_tx.clone(),
+            current_id: Arc::clone(&self.current_id),
+            data_dir: self.data_dir.clone(),
+            inner: Arc::clone(&self.inner),
+            batch_interval_micros: self.batch_interval_micros,
+        }
+    }
+}
+
+impl GroupCommitWalWriter {
+    /// Create a new group commit WAL writer
+    #[allow(clippy::result_large_err)]
+    pub fn new(data_dir: &Path, wal_id: u64, batch_interval_micros: u64) -> Result<Self, Status> {
+        let (file, path) = Self::create_wal_file(data_dir, wal_id)?;
+
+        let inner = Arc::new(Mutex::new(WalWriterInner { writer: file, path }));
+
+        let (tx, rx) = mpsc::channel::<WriteRequest>(1024);
+
+        // Start background flusher
+        let inner_clone = Arc::clone(&inner);
+        tokio::spawn(async move {
+            Self::background_flusher(rx, inner_clone, batch_interval_micros).await;
+        });
+
+        Ok(GroupCommitWalWriter {
+            request_tx: tx,
+            current_id: Arc::new(AtomicU64::new(wal_id)),
+            data_dir: data_dir.to_path_buf(),
+            inner,
+            batch_interval_micros,
+        })
+    }
+
+    /// Get current WAL ID
+    pub fn current_id(&self) -> u64 {
+        self.current_id.load(Ordering::SeqCst)
+    }
+
+    /// Create a new WAL file and return the file handle
+    #[allow(clippy::result_large_err)]
+    fn create_wal_file(data_dir: &Path, wal_id: u64) -> Result<(File, PathBuf), Status> {
+        let wal_path = data_dir.join(format!("wal_{:05}.log", wal_id));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&wal_path)
+            .map_err(|e| Status::internal(format!("Failed to create WAL: {}", e)))?;
+
+        // Write header
+        file.write_all(WAL_MAGIC_BYTES)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        file.write_all(&WAL_VERSION.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok((file, wal_path))
+    }
+
+    /// Background task that batches writes and flushes periodically
+    async fn background_flusher(
+        mut rx: mpsc::Receiver<WriteRequest>,
+        inner: Arc<Mutex<WalWriterInner>>,
+        batch_interval_micros: u64,
+    ) {
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        loop {
+            // Wait for a request with timeout
+            match tokio::time::timeout(Duration::from_micros(batch_interval_micros), rx.recv())
+                .await
+            {
+                Ok(Some(req)) => {
+                    pending.push(req);
+                    // Collect any additional pending requests
+                    while let Ok(req) = rx.try_recv() {
+                        pending.push(req);
+                    }
+                }
+                Ok(None) => {
+                    // Channel closed, flush remaining and exit
+                    if !pending.is_empty() {
+                        Self::flush_and_notify(&inner, &mut pending);
+                    }
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - flush if we have pending writes
+                }
+            }
+
+            if !pending.is_empty() {
+                Self::flush_and_notify(&inner, &mut pending);
+            }
+        }
+    }
+
+    /// Flush pending writes and notify all waiting requests
+    fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<WriteRequest>) {
+        let result = Self::flush_batch(inner, pending);
+        for req in pending.drain(..) {
+            let _ = req.response.send(result.clone());
+        }
+    }
+
+    /// Write all pending entries to WAL and sync once
+    #[allow(clippy::result_large_err)]
+    fn flush_batch(
+        inner: &Arc<Mutex<WalWriterInner>>,
+        requests: &[WriteRequest],
+    ) -> Result<(), Status> {
+        let mut guard = inner.lock().unwrap();
+
+        for req in requests {
+            Self::write_entry_to_file(&mut guard.writer, &req.key, &req.value)?;
+        }
+
+        // Single sync_all for all entries
+        guard
+            .writer
+            .sync_all()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Write a single entry to the file (without sync)
+    #[allow(clippy::result_large_err)]
+    fn write_entry_to_file(
+        writer: &mut File,
+        key: &str,
+        value: &Option<String>,
+    ) -> Result<(), Status> {
+        let key_bytes = key.as_bytes();
+        let key_len = key_bytes.len() as u64;
+        let (val_len, val_bytes): (u64, &[u8]) = match value {
+            Some(v) => (v.len() as u64, v.as_bytes()),
+            None => (u64::MAX, &[]), // Tombstone
+        };
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        writer
+            .write_all(&timestamp.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&key_len.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&val_len.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(key_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if val_len != u64::MAX {
+            writer
+                .write_all(val_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Append an entry to the WAL asynchronously (group commit)
+    pub async fn append_async(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
+        let (tx, rx) = oneshot::channel();
+
+        let request = WriteRequest {
+            key: key.to_string(),
+            value: value.clone(),
+            response: tx,
+        };
+
+        self.request_tx
+            .send(request)
+            .await
+            .map_err(|_| Status::internal("WAL writer channel closed"))?;
+
+        rx.await
+            .map_err(|_| Status::internal("WAL response channel closed"))?
+    }
+
+    /// Write multiple entries to the WAL (used for recovery re-write)
+    #[allow(clippy::result_large_err)]
+    pub fn write_entries(&self, entries: &MemTable) -> Result<(), Status> {
+        let mut guard = self.inner.lock().unwrap();
+
+        for (key, value) in entries {
+            Self::write_entry_to_file(&mut guard.writer, key, value)?;
+        }
+
+        guard
+            .writer
+            .sync_all()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Rotate WAL: create a new WAL file (old WAL is preserved for replication)
+    #[allow(clippy::result_large_err)]
+    pub fn rotate(&self) -> Result<u64, Status> {
+        let new_wal_id = self.current_id.load(Ordering::SeqCst) + 1;
+        let (new_file, new_path) = Self::create_wal_file(&self.data_dir, new_wal_id)?;
+
+        // Swap WAL file
+        {
+            let mut guard = self.inner.lock().unwrap();
+
+            // Ensure old WAL is synced
+            guard
+                .writer
+                .sync_all()
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            guard.writer = new_file;
+            guard.path = new_path.clone();
+        }
+
+        self.current_id.store(new_wal_id, Ordering::SeqCst);
+
+        println!("WAL rotated to {:?}", new_path);
+
+        Ok(new_wal_id)
+    }
+
+    /// Read all entries from a WAL file (same as WalWriter)
+    #[allow(clippy::result_large_err)]
+    pub fn read_entries(path: &Path) -> Result<MemTable, Status> {
+        WalWriter::read_entries(path)
+    }
+
+    /// Parse WAL filename and return WAL ID (same as WalWriter)
+    pub fn parse_wal_filename(filename: &str) -> Option<u64> {
+        WalWriter::parse_wal_filename(filename)
     }
 }
 

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tonic::Status;
-use wal::WalWriter;
+use wal::GroupCommitWalWriter;
 
 #[derive(Debug)]
 pub struct LsmTreeEngine {
@@ -27,8 +27,8 @@ pub struct LsmTreeEngine {
     compaction_trigger_file_count: usize,
     // Flag to prevent concurrent compaction
     compaction_in_progress: Arc<Mutex<bool>>,
-    // WAL writer
-    wal: WalWriter,
+    // WAL writer with group commit support
+    wal: GroupCommitWalWriter,
 }
 
 impl Clone for LsmTreeEngine {
@@ -45,11 +45,28 @@ impl Clone for LsmTreeEngine {
     }
 }
 
+/// Default batch interval for WAL group commit (100 microseconds)
+pub const DEFAULT_WAL_BATCH_INTERVAL_MICROS: u64 = 100;
+
 impl LsmTreeEngine {
     pub fn new(
         data_dir_str: String,
         memtable_capacity_bytes: u64,
         compaction_trigger_file_count: usize,
+    ) -> Self {
+        Self::new_with_wal_config(
+            data_dir_str,
+            memtable_capacity_bytes,
+            compaction_trigger_file_count,
+            DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+        )
+    }
+
+    pub fn new_with_wal_config(
+        data_dir_str: String,
+        memtable_capacity_bytes: u64,
+        compaction_trigger_file_count: usize,
+        wal_batch_interval_micros: u64,
     ) -> Self {
         let data_dir = PathBuf::from(&data_dir_str);
 
@@ -79,7 +96,7 @@ impl LsmTreeEngine {
                             max_wal_id_in_sst = wal_id;
                         }
                         sst_files.push(p);
-                    } else if let Some(id) = WalWriter::parse_wal_filename(filename) {
+                    } else if let Some(id) = GroupCommitWalWriter::parse_wal_filename(filename) {
                         // WAL files: wal_{id}.log
                         if id >= max_wal_id {
                             max_wal_id = id + 1;
@@ -107,7 +124,7 @@ impl LsmTreeEngine {
             // If no SSTables have WAL ID info, recover all WAL files
             let should_recover = !has_sstables_with_wal_id || *wal_id > max_wal_id_in_sst;
             if should_recover {
-                match WalWriter::read_entries(wal_path) {
+                match GroupCommitWalWriter::read_entries(wal_path) {
                     Ok(entries) => {
                         for (key, value) in entries {
                             let entry_size = memtable::estimate_entry_size(&key, &value);
@@ -139,8 +156,9 @@ impl LsmTreeEngine {
         // Determine next WAL ID
         let next_wal_id = if max_wal_id > 0 { max_wal_id } else { 0 };
 
-        // Create new WAL file
-        let wal = WalWriter::new(&data_dir, next_wal_id).expect("Failed to create initial WAL");
+        // Create new WAL file with group commit
+        let wal = GroupCommitWalWriter::new(&data_dir, next_wal_id, wal_batch_interval_micros)
+            .expect("Failed to create initial WAL");
 
         // Re-write recovered entries to new WAL for safety
         if !recovered_memtable.is_empty() {
@@ -317,7 +335,13 @@ impl Engine for LsmTreeEngine {
         let new_val_opt = Some(value);
 
         // 1. Write to WAL FIRST (before MemTable) for durability
-        self.wal.append(&key, &new_val_opt)?;
+        // Use block_in_place to allow blocking within async context (e.g., tokio runtime)
+        let wal = self.wal.clone();
+        let key_clone = key.clone();
+        let val_clone = new_val_opt.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(wal.append_async(&key_clone, &val_clone))
+        })?;
 
         // 2. Then update MemTable
         self.mem_state.insert(key, new_val_opt);
@@ -350,7 +374,12 @@ impl Engine for LsmTreeEngine {
 
     fn delete(&self, key: String) -> Result<(), Status> {
         // 1. Write tombstone to WAL FIRST
-        self.wal.append(&key, &None)?;
+        // Use block_in_place to allow blocking within async context
+        let wal = self.wal.clone();
+        let key_clone = key.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(wal.append_async(&key_clone, &None))
+        })?;
 
         // 2. Then update MemTable
         self.mem_state.insert(key, None);
@@ -364,7 +393,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_lsm_flush_and_get() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -378,7 +407,7 @@ mod tests {
         assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_lsm_recovery() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -404,7 +433,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_lsm_overwrite_size_tracking() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -428,7 +457,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_compaction_merges_sstables() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -454,7 +483,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_compaction_removes_deleted_keys() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -492,7 +521,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_compaction_deletes_old_files() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -532,7 +561,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_wal_recovery_basic() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -553,7 +582,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_wal_recovery_with_delete() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -576,7 +605,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_wal_preserved_after_flush() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -616,7 +645,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_lsm_versioning_across_sstables() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -638,13 +667,18 @@ mod tests {
 
         // Force flush v3 to SSTable 3
         engine.trigger_flush_if_needed(); // This won't work easily because of capacity check, but another set will
-        engine.set("other".to_string(), "large_value_to_force_flush".to_string()).unwrap();
+        engine
+            .set(
+                "other".to_string(),
+                "large_value_to_force_flush".to_string(),
+            )
+            .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         assert_eq!(engine.get("key".to_string()).unwrap(), "v3");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_lsm_recovery_merges_wal_and_sst() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -654,12 +688,15 @@ mod tests {
             // k1 goes to SSTable
             engine.set("k1".to_string(), "v1".to_string()).unwrap();
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            
+
             // k2 stays in WAL/MemTable
             engine.set("k2".to_string(), "v2".to_string()).unwrap();
-            
+
             // k1 updated in WAL/MemTable
             engine.set("k1".to_string(), "v1_new".to_string()).unwrap();
+
+            // Wait for WAL group commit to flush before engine drop
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
 
         {
@@ -669,7 +706,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_lsm_delete_after_flush() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
@@ -678,7 +715,7 @@ mod tests {
         // Flush k1 to SSTable
         engine.set("k1".to_string(), "v1".to_string()).unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        
+
         assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
 
         // Delete k1 (tombstone in MemTable)
@@ -686,7 +723,9 @@ mod tests {
         assert!(engine.get("k1".to_string()).is_err());
 
         // Flush tombstone
-        engine.set("k2".to_string(), "trigger_flush".repeat(10)).unwrap();
+        engine
+            .set("k2".to_string(), "trigger_flush".repeat(10))
+            .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Still should not find k1 (SSTable has v1, but newer SSTable has tombstone)

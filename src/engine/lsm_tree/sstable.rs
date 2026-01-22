@@ -639,8 +639,14 @@ mod tests {
 
         create_from_memtable(&sst_path, &memtable).unwrap();
 
-        assert_eq!(search_key(&sst_path, "key1").unwrap(), Some("value1".to_string()));
-        assert_eq!(search_key(&sst_path, "key2").unwrap(), Some("value2".to_string()));
+        assert_eq!(
+            search_key(&sst_path, "key1").unwrap(),
+            Some("value1".to_string())
+        );
+        assert_eq!(
+            search_key(&sst_path, "key2").unwrap(),
+            Some("value2".to_string())
+        );
         assert_eq!(search_key(&sst_path, "key3").unwrap(), None); // Should return None for tombstone
         assert!(search_key(&sst_path, "nonexistent").is_err());
     }
@@ -730,7 +736,12 @@ mod tests {
 
         let result = search_key(&sst_path, "any");
         assert!(result.is_err());
-        assert!(result.unwrap_err().message().contains("Unsupported SSTable version"));
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("Unsupported SSTable version")
+        );
     }
 
     #[test]
@@ -746,8 +757,14 @@ mod tests {
 
         create_from_memtable(&sst_path, &memtable).unwrap();
 
-        assert_eq!(search_key(&sst_path, &large_key).unwrap(), Some(large_value));
-        assert_eq!(search_key(&sst_path, "short").unwrap(), Some("value".to_string()));
+        assert_eq!(
+            search_key(&sst_path, &large_key).unwrap(),
+            Some(large_value)
+        );
+        assert_eq!(
+            search_key(&sst_path, "short").unwrap(),
+            Some("value".to_string())
+        );
     }
 
     #[test]
@@ -770,7 +787,12 @@ mod tests {
 
         let result = search_key(&sst_path, "key1");
         assert!(result.is_err());
-        assert!(result.unwrap_err().message().contains("decompression error"));
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("decompression error")
+        );
     }
 
     #[test]
@@ -787,7 +809,7 @@ mod tests {
         let len = data.len();
         if len > 8 {
             // Change the index offset to something invalid
-            data[len - 4] ^= 0xFF; 
+            data[len - 4] ^= 0xFF;
         }
         std::fs::write(&sst_path, data).unwrap();
 
