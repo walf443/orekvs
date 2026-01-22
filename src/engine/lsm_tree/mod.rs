@@ -23,7 +23,7 @@ pub struct LsmTreeEngine {
     data_dir: PathBuf,
     // Counter for next SSTable file ID
     next_sst_id: Arc<AtomicU64>,
-    // Threshold for triggering compaction (number of SSTables)
+    // Trigger count for compaction (number of SSTables)
     compaction_trigger_file_count: usize,
     // Flag to prevent concurrent compaction
     compaction_in_progress: Arc<Mutex<bool>>,
@@ -148,7 +148,8 @@ impl LsmTreeEngine {
                 .expect("Failed to write recovered entries to WAL");
         }
 
-        let mem_state = MemTableState::new(memtable_capacity_bytes, recovered_memtable, recovered_size);
+        let mem_state =
+            MemTableState::new(memtable_capacity_bytes, recovered_memtable, recovered_size);
 
         LsmTreeEngine {
             mem_state,
@@ -161,8 +162,9 @@ impl LsmTreeEngine {
         }
     }
 
-    fn check_flush(&self) {
-        if let Some(immutable) = self.mem_state.check_flush_threshold() {
+    // Check if MemTable needs to be flushed and trigger if necessary
+    fn trigger_flush_if_needed(&self) {
+        if let Some(immutable) = self.mem_state.needs_flush() {
             let engine_clone = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = engine_clone.flush_memtable(immutable).await {
@@ -319,7 +321,7 @@ impl Engine for LsmTreeEngine {
 
         // 2. Then update MemTable
         self.mem_state.insert(key, new_val_opt);
-        self.check_flush();
+        self.trigger_flush_if_needed();
         Ok(())
     }
 
@@ -330,7 +332,7 @@ impl Engine for LsmTreeEngine {
                 .cloned()
                 .ok_or_else(|| Status::not_found("Key deleted"));
         }
-        
+
         let sst_paths = {
             let sstables = self.sstables.lock().unwrap();
             sstables.clone()
@@ -352,7 +354,7 @@ impl Engine for LsmTreeEngine {
 
         // 2. Then update MemTable
         self.mem_state.insert(key, None);
-        self.check_flush();
+        self.trigger_flush_if_needed();
         Ok(())
     }
 }
@@ -406,7 +408,7 @@ mod tests {
     async fn test_lsm_overwrite_size_tracking() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
-        // 閾値を100バイトに設定
+        // Set capacity to 100 bytes
         let engine = LsmTreeEngine::new(data_dir, 100, 4);
 
         // 同じキーを何度も更新しても、メモリ上のサイズは増えないはず
@@ -430,7 +432,7 @@ mod tests {
     async fn test_compaction_merges_sstables() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
-        // Low threshold to trigger multiple flushes
+        // Low capacity to trigger multiple flushes
         let engine = LsmTreeEngine::new(data_dir.clone(), 30, 2);
 
         // Write data in batches to create multiple SSTables
@@ -535,7 +537,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
 
-        // Write some data without flushing (high threshold)
+        // Write some data without flushing (high capacity)
         {
             let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 4);
             engine.set("k1".to_string(), "v1".to_string()).unwrap();
@@ -579,7 +581,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
 
-        // Write data and trigger flush (low threshold)
+        // Write data and trigger flush (low capacity)
         {
             let engine = LsmTreeEngine::new(data_dir.clone(), 30, 4);
             engine.set("k1".to_string(), "v1".to_string()).unwrap();

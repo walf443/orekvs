@@ -20,14 +20,14 @@ pub struct LogEngine {
     writer: Arc<Mutex<File>>,
     // Path to the data file
     file_path: String,
-    // Threshold for compaction in bytes
-    compaction_threshold: u64,
+    // Max size for log file in bytes
+    log_capacity_bytes: u64,
     // Flag to check if compaction is running
     is_compacting: Arc<AtomicBool>,
 }
 
 impl LogEngine {
-    pub fn new(data_dir: String, compaction_threshold: u64) -> Self {
+    pub fn new(data_dir: String, log_capacity_bytes: u64) -> Self {
         let dir_path = PathBuf::from(&data_dir);
         if !dir_path.exists() {
             fs::create_dir_all(&dir_path).expect("Failed to create data directory");
@@ -135,7 +135,7 @@ impl LogEngine {
             index: Arc::new(Mutex::new(index_map)),
             writer: Arc::new(Mutex::new(file)),
             file_path,
-            compaction_threshold,
+            log_capacity_bytes,
             is_compacting: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -170,7 +170,7 @@ impl LogEngine {
             }
         };
 
-        if file_size <= self.compaction_threshold {
+        if file_size <= self.log_capacity_bytes {
             self.is_compacting.store(false, Ordering::SeqCst);
             return Ok(());
         }
@@ -283,10 +283,10 @@ impl Engine for LogEngine {
 
         // Entry size = timestamp(8) + key_len_size(8) + val_len_size(8) + key + value
         let entry_size = 8 + 8 + 8 + key_len + val_len;
-        if entry_size > self.compaction_threshold {
+        if entry_size > self.log_capacity_bytes {
             return Err(Status::invalid_argument(format!(
-                "Data size ({} bytes) exceeds the compaction threshold ({} bytes)",
-                entry_size, self.compaction_threshold
+                "Data size ({} bytes) exceeds the log capacity ({} bytes)",
+                entry_size, self.log_capacity_bytes
             )));
         }
 
@@ -331,12 +331,11 @@ impl Engine for LogEngine {
             let mut index = self.index.lock().unwrap();
             index.insert(key, (value_offset, val_len as usize));
 
-            // Check if compaction is needed
             writer
                 .metadata()
                 .map_err(|e| Status::internal(e.to_string()))?
                 .len()
-                > self.compaction_threshold
+                > self.log_capacity_bytes
         };
 
         #[allow(clippy::collapsible_if)]
@@ -387,10 +386,10 @@ impl Engine for LogEngine {
         let val_len = u64::MAX; // Tombstone marker
 
         let entry_size = 8 + 8 + 8 + key_len;
-        if entry_size > self.compaction_threshold {
+        if entry_size > self.log_capacity_bytes {
             return Err(Status::invalid_argument(format!(
-                "Data size ({} bytes) exceeds the compaction threshold ({} bytes)",
-                entry_size, self.compaction_threshold
+                "Data size ({} bytes) exceeds the log capacity ({} bytes)",
+                entry_size, self.log_capacity_bytes
             )));
         }
 
@@ -429,7 +428,7 @@ impl Engine for LogEngine {
                 .metadata()
                 .map_err(|e| Status::internal(e.to_string()))?
                 .len()
-                > self.compaction_threshold
+                > self.log_capacity_bytes
         };
 
         #[allow(clippy::collapsible_if)]
@@ -458,7 +457,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_set_exceeding_threshold_returns_error() {
+    fn test_set_exceeding_capacity_returns_error() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
         let engine = LogEngine::new(data_dir, 30);
@@ -473,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_within_threshold_succeeds() {
+    fn test_set_within_capacity_succeeds() {
         let dir = tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap().to_string();
         let engine = LogEngine::new(data_dir, 100);

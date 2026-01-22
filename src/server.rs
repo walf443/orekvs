@@ -19,13 +19,13 @@ impl MyKeyValue {
     pub fn new(
         engine_type: EngineType,
         data_dir: String,
-        log_engine_compaction_threshold: u64,
+        log_capacity_bytes: u64,
         lsm_memtable_capacity_bytes: u64,
         lsm_compaction_trigger_file_count: usize,
     ) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
-            EngineType::Log => Box::new(LogEngine::new(data_dir, log_engine_compaction_threshold)),
+            EngineType::Log => Box::new(LogEngine::new(data_dir, log_capacity_bytes)),
             EngineType::LsmTree => Box::new(LsmTreeEngine::new(
                 data_dir,
                 lsm_memtable_capacity_bytes,
@@ -71,14 +71,14 @@ pub async fn run_server(
     addr: std::net::SocketAddr,
     engine_type: EngineType,
     data_dir: String,
-    log_engine_compaction_threshold: u64,
+    log_capacity_bytes: u64,
     lsm_memtable_capacity_bytes: u64,
     lsm_compaction_trigger_file_count: usize,
 ) {
     let key_value = MyKeyValue::new(
         engine_type,
         data_dir,
-        log_engine_compaction_threshold,
+        log_capacity_bytes,
         lsm_memtable_capacity_bytes,
         lsm_compaction_trigger_file_count,
     );

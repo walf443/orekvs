@@ -34,16 +34,17 @@ enum Commands {
         #[arg(long, default_value = "kv_data")]
         data_dir: String,
 
-        /// Compaction threshold in bytes for Log engine
-        #[arg(long, default_value_t = 1024)]
-        log_engine_compaction_threshold: u64,
+        /// Max size for log file in bytes for Log engine
+        #[arg(long = "log-engine-capacity-bytes", default_value_t = 1024)]
+        log_capacity_bytes: u64,
 
-        /// MemTable flush threshold in bytes for LSM-tree engine
-        #[arg(long, default_value_t = 4194304)] // 4MB
+        /// MemTable flush trigger size in bytes for LSM-tree engine
+        #[arg(long = "lsm-engine-memtable-capacity-bytes", default_value_t = 4194304)]
+        // 4MB
         lsm_memtable_capacity_bytes: u64,
 
-        /// Compaction threshold (number of SSTables) for LSM-tree engine
-        #[arg(long, default_value_t = 4)]
+        /// Compaction trigger (number of SSTables) for LSM-tree engine
+        #[arg(long = "lsm-engine-compaction-trigger-file-count", default_value_t = 4)]
         lsm_compaction_trigger_file_count: usize,
     },
     /// Test commands
@@ -92,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             addr,
             engine,
             data_dir,
-            log_engine_compaction_threshold,
+            log_capacity_bytes,
             lsm_memtable_capacity_bytes,
             lsm_compaction_trigger_file_count,
         } => {
@@ -101,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 addr,
                 engine.clone(),
                 data_dir.clone(),
-                *log_engine_compaction_threshold,
+                *log_capacity_bytes,
                 *lsm_memtable_capacity_bytes,
                 *lsm_compaction_trigger_file_count,
             )

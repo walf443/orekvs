@@ -47,13 +47,15 @@ impl MemTableState {
     pub fn insert(&self, key: String, value: Option<String>) {
         let entry_size = estimate_entry_size(&key, &value);
         let mut memtable = self.active_memtable.lock().unwrap();
-        
+
         if let Some(old_val_opt) = memtable.get(&key) {
             let old_size = estimate_entry_size(&key, old_val_opt);
             if entry_size > old_size {
-                self.current_size.fetch_add(entry_size - old_size, Ordering::SeqCst);
+                self.current_size
+                    .fetch_add(entry_size - old_size, Ordering::SeqCst);
             } else {
-                self.current_size.fetch_sub(old_size - entry_size, Ordering::SeqCst);
+                self.current_size
+                    .fetch_sub(old_size - entry_size, Ordering::SeqCst);
             }
         } else {
             self.current_size.fetch_add(entry_size, Ordering::SeqCst);
@@ -61,7 +63,7 @@ impl MemTableState {
         memtable.insert(key, value);
     }
 
-    pub fn check_flush_threshold(&self) -> Option<Arc<MemTable>> {
+    pub fn needs_flush(&self) -> Option<Arc<MemTable>> {
         let size = self.current_size.load(Ordering::SeqCst);
         if size >= self.capacity_bytes {
             let mut active = self.active_memtable.lock().unwrap();
@@ -69,16 +71,16 @@ impl MemTableState {
             if self.current_size.load(Ordering::SeqCst) >= self.capacity_bytes {
                 let immutable = Arc::new(std::mem::take(&mut *active));
                 self.current_size.store(0, Ordering::SeqCst);
-                
+
                 let mut immutables = self.immutable_memtables.lock().unwrap();
                 immutables.push(immutable.clone());
-                
+
                 return Some(immutable);
             }
         }
         None
     }
-    
+
     pub fn remove_immutable(&self, memtable: &Arc<MemTable>) {
         let mut immutables = self.immutable_memtables.lock().unwrap();
         immutables.retain(|m| !Arc::ptr_eq(m, memtable));
@@ -92,7 +94,7 @@ impl MemTableState {
                 return Some(val_opt.clone());
             }
         }
-        
+
         // Check immutable memtables
         {
             let immutables = self.immutable_memtables.lock().unwrap();
@@ -102,7 +104,7 @@ impl MemTableState {
                 }
             }
         }
-        
+
         None
     }
 }
