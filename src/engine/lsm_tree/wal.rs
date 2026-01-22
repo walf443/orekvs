@@ -259,3 +259,83 @@ impl WalWriter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_wal_creation_and_header() {
+        let dir = tempdir().unwrap();
+        let wal_id = 123;
+        let _wal = WalWriter::new(dir.path(), wal_id).unwrap();
+
+        let wal_path = dir.path().join(format!("wal_{:05}.log", wal_id));
+        assert!(wal_path.exists());
+
+        let mut file = File::open(wal_path).unwrap();
+        let mut magic = [0u8; 9];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, WAL_MAGIC_BYTES);
+
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes).unwrap();
+        assert_eq!(u32::from_le_bytes(version_bytes), WAL_VERSION);
+    }
+
+    #[test]
+    fn test_wal_append_and_read() {
+        let dir = tempdir().unwrap();
+        let wal = WalWriter::new(dir.path(), 1).unwrap();
+
+        wal.append("k1", &Some("v1".to_string())).unwrap();
+        wal.append("k2", &Some("v2".to_string())).unwrap();
+        wal.append("k1", &None).unwrap(); // Tombstone
+
+        let path = wal.path.lock().unwrap().clone();
+        let entries = WalWriter::read_entries(&path).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get("k1"), Some(&None));
+        assert_eq!(entries.get("k2"), Some(&Some("v2".to_string())));
+    }
+
+    #[test]
+    fn test_wal_rotation() {
+        let dir = tempdir().unwrap();
+        let wal = WalWriter::new(dir.path(), 1).unwrap();
+
+        wal.append("k1", &Some("v1".to_string())).unwrap();
+        let old_path = wal.path.lock().unwrap().clone();
+
+        let new_id = wal.rotate().unwrap();
+        assert_eq!(new_id, 2);
+        assert_eq!(wal.current_id(), 2);
+
+        let new_path = wal.path.lock().unwrap().clone();
+        assert_ne!(old_path, new_path);
+        assert!(new_path.exists());
+
+        wal.append("k2", &Some("v2".to_string())).unwrap();
+
+        // Old WAL should still have k1
+        let old_entries = WalWriter::read_entries(&old_path).unwrap();
+        assert_eq!(old_entries.get("k1"), Some(&Some("v1".to_string())));
+        assert!(!old_entries.contains_key("k2"));
+
+        // New WAL should have k2
+        let new_entries = WalWriter::read_entries(&new_path).unwrap();
+        assert_eq!(new_entries.get("k2"), Some(&Some("v2".to_string())));
+        assert!(!new_entries.contains_key("k1"));
+    }
+
+    #[test]
+    fn test_parse_wal_filename() {
+        assert_eq!(WalWriter::parse_wal_filename("wal_00001.log"), Some(1));
+        assert_eq!(WalWriter::parse_wal_filename("wal_12345.log"), Some(12345));
+        assert_eq!(WalWriter::parse_wal_filename("wal_00000.log"), Some(0));
+        assert_eq!(WalWriter::parse_wal_filename("other.log"), None);
+        assert_eq!(WalWriter::parse_wal_filename("wal_123.data"), None);
+    }
+}

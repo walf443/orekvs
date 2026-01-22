@@ -615,4 +615,81 @@ mod tests {
             assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
         }
     }
+
+    #[tokio::test]
+    async fn test_lsm_versioning_across_sstables() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        // Low capacity to force flush every write
+        let engine = LsmTreeEngine::new(data_dir.clone(), 10, 100);
+
+        // v1 in SSTable 1
+        engine.set("key".to_string(), "v1".to_string()).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // v2 in SSTable 2
+        engine.set("key".to_string(), "v2".to_string()).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // v3 in MemTable
+        engine.set("key".to_string(), "v3".to_string()).unwrap();
+
+        assert_eq!(engine.get("key".to_string()).unwrap(), "v3");
+
+        // Force flush v3 to SSTable 3
+        engine.trigger_flush_if_needed(); // This won't work easily because of capacity check, but another set will
+        engine.set("other".to_string(), "large_value_to_force_flush".to_string()).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        assert_eq!(engine.get("key".to_string()).unwrap(), "v3");
+    }
+
+    #[tokio::test]
+    async fn test_lsm_recovery_merges_wal_and_sst() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        {
+            let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+            // k1 goes to SSTable
+            engine.set("k1".to_string(), "v1".to_string()).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            
+            // k2 stays in WAL/MemTable
+            engine.set("k2".to_string(), "v2".to_string()).unwrap();
+            
+            // k1 updated in WAL/MemTable
+            engine.set("k1".to_string(), "v1_new".to_string()).unwrap();
+        }
+
+        {
+            let engine = LsmTreeEngine::new(data_dir.clone(), 1024, 100);
+            assert_eq!(engine.get("k1".to_string()).unwrap(), "v1_new");
+            assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lsm_delete_after_flush() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+
+        // Flush k1 to SSTable
+        engine.set("k1".to_string(), "v1".to_string()).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        
+        assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+
+        // Delete k1 (tombstone in MemTable)
+        engine.delete("k1".to_string()).unwrap();
+        assert!(engine.get("k1".to_string()).is_err());
+
+        // Flush tombstone
+        engine.set("k2".to_string(), "trigger_flush".repeat(10)).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Still should not find k1 (SSTable has v1, but newer SSTable has tombstone)
+        assert!(engine.get("k1".to_string()).is_err());
+    }
 }

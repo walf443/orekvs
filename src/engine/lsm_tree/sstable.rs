@@ -613,3 +613,185 @@ fn read_index_compressed(file: &mut File, index_offset: u64) -> Result<Vec<(Stri
 
     Ok(index)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_parse_filename() {
+        assert_eq!(parse_filename("sst_00001_00002.data"), Some((1, Some(2))));
+        assert_eq!(parse_filename("sst_00010.data"), Some((10, None)));
+        assert_eq!(parse_filename("invalid"), None);
+        assert_eq!(parse_filename("sst_abc.data"), None);
+    }
+
+    #[test]
+    fn test_sstable_creation_and_search() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_00001_00001.data");
+
+        let mut memtable = BTreeMap::new();
+        memtable.insert("key1".to_string(), Some("value1".to_string()));
+        memtable.insert("key2".to_string(), Some("value2".to_string()));
+        memtable.insert("key3".to_string(), None); // Tombstone
+
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        assert_eq!(search_key(&sst_path, "key1").unwrap(), Some("value1".to_string()));
+        assert_eq!(search_key(&sst_path, "key2").unwrap(), Some("value2".to_string()));
+        assert_eq!(search_key(&sst_path, "key3").unwrap(), None); // Should return None for tombstone
+        assert!(search_key(&sst_path, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_sstable_multiple_blocks() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_00002_00001.data");
+
+        // Use a small block size for testing if possible, but BLOCK_SIZE is constant.
+        // We'll insert enough data to trigger multiple blocks.
+        let mut memtable = BTreeMap::new();
+        let entry_count = 500;
+        for i in 0..entry_count {
+            let key = format!("key{:05}", i);
+            let value = format!("value{:05}", i);
+            memtable.insert(key, Some(value));
+        }
+
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Check some keys
+        for i in (0..entry_count).step_by(50) {
+            let key = format!("key{:05}", i);
+            let expected_value = format!("value{:05}", i);
+            assert_eq!(search_key(&sst_path, &key).unwrap(), Some(expected_value));
+        }
+
+        // Read all entries and verify
+        let read_back = read_entries(&sst_path).unwrap();
+        assert_eq!(read_back.len(), entry_count);
+        for (key, (_, value)) in read_back {
+            let i_str = &key[3..];
+            let expected_value = format!("value{}", i_str);
+            assert_eq!(value, Some(expected_value));
+        }
+    }
+
+    #[test]
+    fn test_read_entries_empty_file() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("empty.data");
+
+        // create_from_memtable with empty memtable
+        let memtable = BTreeMap::new();
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        let entries = read_entries(&sst_path).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_extract_wal_id() {
+        let path = Path::new("sst_00001_00123.data");
+        assert_eq!(extract_wal_id_from_sstable(path), Some(123));
+
+        let path_old = Path::new("sst_00001.data");
+        assert_eq!(extract_wal_id_from_sstable(path_old), None);
+    }
+
+    #[test]
+    fn test_write_timestamped_entries() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_ts.data");
+
+        let mut entries = BTreeMap::new();
+        entries.insert("k1".to_string(), (100, Some("v1".to_string())));
+        entries.insert("k2".to_string(), (200, None)); // Tombstone with specific TS
+
+        write_timestamped_entries(&sst_path, &entries).unwrap();
+
+        let read_back = read_entries(&sst_path).unwrap();
+        assert_eq!(read_back.get("k1").unwrap(), &(100, Some("v1".to_string())));
+        assert_eq!(read_back.get("k2").unwrap(), &(200, None));
+    }
+
+    #[test]
+    fn test_invalid_version() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("invalid_version.data");
+
+        {
+            let mut file = File::create(&sst_path).unwrap();
+            file.write_all(MAGIC_BYTES).unwrap();
+            file.write_all(&999u32.to_le_bytes()).unwrap(); // Wrong version
+        }
+
+        let result = search_key(&sst_path, "any");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("Unsupported SSTable version"));
+    }
+
+    #[test]
+    fn test_sstable_large_entries() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_large.data");
+
+        let mut memtable = BTreeMap::new();
+        let large_key = "k".repeat(1024); // 1KB key
+        let large_value = "v".repeat(1024 * 1024); // 1MB value
+        memtable.insert(large_key.clone(), Some(large_value.clone()));
+        memtable.insert("short".to_string(), Some("value".to_string()));
+
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        assert_eq!(search_key(&sst_path, &large_key).unwrap(), Some(large_value));
+        assert_eq!(search_key(&sst_path, "short").unwrap(), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_corrupt_block_data() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("corrupt_block.data");
+
+        let mut memtable = BTreeMap::new();
+        memtable.insert("key1".to_string(), Some("value1".to_string()));
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Corrupt the block data (between header and index)
+        let mut data = std::fs::read(&sst_path).unwrap();
+        // The first block starts after HEADER_SIZE (10)
+        // Let's flip some bits in the middle of what should be compressed data
+        if data.len() > 20 {
+            data[15] ^= 0xFF;
+        }
+        std::fs::write(&sst_path, data).unwrap();
+
+        let result = search_key(&sst_path, "key1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("decompression error"));
+    }
+
+    #[test]
+    fn test_corrupt_index_data() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("corrupt_index.data");
+
+        let mut memtable = BTreeMap::new();
+        memtable.insert("key1".to_string(), Some("value1".to_string()));
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Corrupt the index offset in the footer
+        let mut data = std::fs::read(&sst_path).unwrap();
+        let len = data.len();
+        if len > 8 {
+            // Change the index offset to something invalid
+            data[len - 4] ^= 0xFF; 
+        }
+        std::fs::write(&sst_path, data).unwrap();
+
+        let result = search_key(&sst_path, "key1");
+        assert!(result.is_err());
+    }
+}
