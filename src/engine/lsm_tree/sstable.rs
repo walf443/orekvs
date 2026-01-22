@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
-use super::wal::MemTable;
+use super::memtable::MemTable;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
 pub const DATA_VERSION: u32 = 1;
@@ -144,7 +144,7 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
 
 /// Write a MemTable to an SSTable file
 #[allow(clippy::result_large_err)]
-pub fn write_memtable(path: &Path, memtable: &MemTable) -> Result<(), Status> {
+pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Status> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)

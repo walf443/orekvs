@@ -1,5 +1,6 @@
 mod sstable;
 mod wal;
+mod memtable;
 
 use super::Engine;
 use sstable::TimestampedEntry;
@@ -9,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tonic::Status;
-use wal::{MemTable, WalWriter};
+use wal::WalWriter;
+use memtable::MemTable;
 
 #[derive(Debug)]
 pub struct LsmTreeEngine {
@@ -199,7 +201,7 @@ impl LsmTreeEngine {
 
         println!("Flushing MemTable to {:?}...", sst_path);
 
-        sstable::write_memtable(&sst_path, &memtable)?;
+        sstable::create_from_memtable(&sst_path, &memtable)?;
 
         {
             let mut sstables = self.sstables.lock().unwrap();

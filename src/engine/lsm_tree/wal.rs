@@ -7,11 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
+use super::memtable::MemTable;
+
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 const WAL_VERSION: u32 = 1;
-
-// Type alias for MemTable entries
-pub type MemTable = BTreeMap<String, Option<String>>;
 
 /// WAL (Write-Ahead Log) writer for crash recovery
 #[derive(Debug)]
