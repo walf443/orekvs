@@ -303,12 +303,15 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
 /// Write a MemTable to an SSTable file
 #[allow(clippy::result_large_err)]
 pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Status> {
+    // Write to a temporary file first, then rename for atomic operation
+    let tmp_path = path.with_extension("data.tmp");
+
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)
+        .open(&tmp_path)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Write header
@@ -376,6 +379,10 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
     file.sync_all()
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    // Atomically rename tmp file to final path
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| Status::internal(format!("Failed to rename SSTable: {}", e)))?;
+
     Ok(())
 }
 
@@ -385,12 +392,15 @@ pub fn write_timestamped_entries(
     path: &Path,
     entries: &BTreeMap<String, TimestampedEntry>,
 ) -> Result<(), Status> {
+    // Write to a temporary file first, then rename for atomic operation
+    let tmp_path = path.with_extension("data.tmp");
+
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)
+        .open(&tmp_path)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Write header
@@ -456,6 +466,10 @@ pub fn write_timestamped_entries(
     file.flush().map_err(|e| Status::internal(e.to_string()))?;
     file.sync_all()
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Atomically rename tmp file to final path
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| Status::internal(format!("Failed to rename SSTable: {}", e)))?;
 
     Ok(())
 }

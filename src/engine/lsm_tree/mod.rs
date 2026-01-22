@@ -80,11 +80,21 @@ impl LsmTreeEngine {
         let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
         let mut max_wal_id = 0u64;
 
-        // Scan for SSTable and WAL files
+        // Scan for SSTable and WAL files, and clean up any orphaned .tmp files
         if let Ok(entries) = fs::read_dir(&data_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if let Some(filename) = p.file_name().and_then(|n| n.to_str()) {
+                    // Clean up orphaned .tmp files from interrupted SSTable writes
+                    if filename.ends_with(".tmp") {
+                        if let Err(e) = fs::remove_file(&p) {
+                            eprintln!("Warning: Failed to remove orphaned tmp file {:?}: {}", p, e);
+                        } else {
+                            println!("Cleaned up orphaned tmp file: {:?}", p);
+                        }
+                        continue;
+                    }
+
                     // SSTable files (old format: sst_{id}.data, new format: sst_{sst_id}_{wal_id}.data)
                     if let Some((sst_id, wal_id_opt)) = sstable::parse_filename(filename) {
                         if sst_id >= max_sst_id {
@@ -694,14 +704,19 @@ mod tests {
             engine.set("k1".to_string(), "v1".to_string()).unwrap();
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-            // k2 stays in WAL/MemTable
+            // k2 triggers another flush to SSTable
             engine.set("k2".to_string(), "v2".to_string()).unwrap();
+            // Wait for second flush to complete
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
             // k1 updated in WAL/MemTable
             engine.set("k1".to_string(), "v1_new".to_string()).unwrap();
 
             // Wait for WAL group commit to flush before engine drop
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+            // Properly shutdown to ensure all WAL writes are flushed
+            engine.shutdown().await;
         }
 
         {
