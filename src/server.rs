@@ -7,7 +7,7 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{DeleteRequest, DeleteResponse, GetRequest, GetResponse, SetRequest, SetResponse};
 
-use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine};
+use crate::engine::{log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine, Engine};
 
 // --- gRPC Service ---
 
@@ -20,14 +20,12 @@ impl MyKeyValue {
         engine_type: EngineType,
         data_dir: String,
         log_engine_compaction_threshold: u64,
+        lsm_tree_memtable_threshold: u64,
     ) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
             EngineType::Log => Box::new(LogEngine::new(data_dir, log_engine_compaction_threshold)),
-            EngineType::LsmTree => Box::new(LsmTreeEngine::new(
-                data_dir,
-                log_engine_compaction_threshold,
-            )),
+            EngineType::LsmTree => Box::new(LsmTreeEngine::new(data_dir, lsm_tree_memtable_threshold)),
         };
         MyKeyValue { engine }
     }
@@ -47,10 +45,7 @@ impl KeyValue for MyKeyValue {
         Ok(Response::new(GetResponse { value }))
     }
 
-    async fn delete(
-        &self,
-        request: Request<DeleteRequest>,
-    ) -> Result<Response<DeleteResponse>, Status> {
+    async fn delete(&self, request: Request<DeleteRequest>) -> Result<Response<DeleteResponse>, Status> {
         let req = request.into_inner();
         self.engine.delete(req.key)?;
         Ok(Response::new(DeleteResponse { success: true }))
@@ -69,8 +64,14 @@ pub async fn run_server(
     engine_type: EngineType,
     data_dir: String,
     log_engine_compaction_threshold: u64,
+    lsm_tree_memtable_threshold: u64,
 ) {
-    let key_value = MyKeyValue::new(engine_type, data_dir, log_engine_compaction_threshold);
+    let key_value = MyKeyValue::new(
+        engine_type,
+        data_dir,
+        log_engine_compaction_threshold,
+        lsm_tree_memtable_threshold,
+    );
 
     println!("Server listening on {}", addr);
 

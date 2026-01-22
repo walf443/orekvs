@@ -37,6 +37,10 @@ enum Commands {
         /// Compaction threshold in bytes for Log engine
         #[arg(long, default_value_t = 1024)]
         log_engine_compaction_threshold: u64,
+
+        /// MemTable flush threshold in bytes for LSM-tree engine
+        #[arg(long, default_value_t = 4194304)] // 4MB
+        lsm_tree_memtable_threshold: u64,
     },
     /// Test commands
     Test {
@@ -68,11 +72,18 @@ enum TestCommands {
         parallel: usize,
     },
     /// Set a key-value pair
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+    },
     /// Get the value of a key
-    Get { key: String },
+    Get {
+        key: String,
+    },
     /// Delete a key
-    Delete { key: String },
+    Delete {
+        key: String,
+    },
 }
 
 #[tokio::main]
@@ -85,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine,
             data_dir,
             log_engine_compaction_threshold,
+            lsm_tree_memtable_threshold,
         } => {
             let addr = addr.parse()?;
             server::run_server(
@@ -92,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 engine.clone(),
                 data_dir.clone(),
                 *log_engine_compaction_threshold,
+                *lsm_tree_memtable_threshold,
             )
             .await;
             Ok(())
@@ -205,13 +218,10 @@ async fn run_test_set(
     println!("Total elapsed time: {:?}", total_elapsed);
 
     if success_count > 0 {
-        let avg_duration: std::time::Duration =
+        let avg_duration: std::time::Duration = 
             successful_durations.iter().sum::<std::time::Duration>() / success_count as u32;
         println!("Average request time (success only): {:?}", avg_duration);
-        println!(
-            "Throughput: {:.2} req/sec",
-            success_count as f64 / total_elapsed.as_secs_f64()
-        );
+        println!("Throughput: {:.2} req/sec", success_count as f64 / total_elapsed.as_secs_f64());
     }
 
     Ok(())
@@ -283,13 +293,10 @@ async fn run_test_get(
     println!("Total elapsed time: {:?}", total_elapsed);
 
     if success_count > 0 {
-        let avg_duration: std::time::Duration =
+        let avg_duration: std::time::Duration = 
             successful_durations.iter().sum::<std::time::Duration>() / success_count as u32;
         println!("Average request time (success only): {:?}", avg_duration);
-        println!(
-            "Throughput: {:.2} req/sec",
-            success_count as f64 / total_elapsed.as_secs_f64()
-        );
+        println!("Throughput: {:.2} req/sec", success_count as f64 / total_elapsed.as_secs_f64());
     }
 
     Ok(())

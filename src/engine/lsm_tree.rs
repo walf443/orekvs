@@ -207,12 +207,22 @@ impl LsmTreeEngine {
 
 impl Engine for LsmTreeEngine {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
-        let entry_size = Self::estimate_entry_size(&key, &Some(value.clone()));
+        let new_val_opt = Some(value);
+        let entry_size = Self::estimate_entry_size(&key, &new_val_opt);
         {
             let mut memtable = self.active_memtable.lock().unwrap();
-            memtable.insert(key, Some(value));
+            if let Some(old_val_opt) = memtable.get(&key) {
+                let old_size = Self::estimate_entry_size(&key, old_val_opt);
+                if entry_size > old_size {
+                    self.current_mem_size.fetch_add(entry_size - old_size, Ordering::SeqCst);
+                } else {
+                    self.current_mem_size.fetch_sub(old_size - entry_size, Ordering::SeqCst);
+                }
+            } else {
+                self.current_mem_size.fetch_add(entry_size, Ordering::SeqCst);
+            }
+            memtable.insert(key, new_val_opt);
         }
-        self.current_mem_size.fetch_add(entry_size, Ordering::SeqCst);
         self.check_flush();
         Ok(())
     }
@@ -257,9 +267,18 @@ impl Engine for LsmTreeEngine {
         let entry_size = Self::estimate_entry_size(&key, &None);
         {
             let mut memtable = self.active_memtable.lock().unwrap();
+            if let Some(old_val_opt) = memtable.get(&key) {
+                let old_size = Self::estimate_entry_size(&key, old_val_opt);
+                if entry_size > old_size {
+                    self.current_mem_size.fetch_add(entry_size - old_size, Ordering::SeqCst);
+                } else {
+                    self.current_mem_size.fetch_sub(old_size - entry_size, Ordering::SeqCst);
+                }
+            } else {
+                self.current_mem_size.fetch_add(entry_size, Ordering::SeqCst);
+            }
             memtable.insert(key, None);
         }
-        self.current_mem_size.fetch_add(entry_size, Ordering::SeqCst);
         self.check_flush();
         Ok(())
     }
@@ -308,5 +327,25 @@ mod tests {
             assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
             assert_eq!(engine.get("k3".to_string()).unwrap(), "v3");
         }
+    }
+
+    #[tokio::test]
+    async fn test_lsm_overwrite_size_tracking() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        // 閾値を100バイトに設定
+        let engine = LsmTreeEngine::new(data_dir, 100);
+
+        // 同じキーを何度も更新しても、メモリ上のサイズは増えないはず
+        for _ in 0..100 {
+            engine.set("key".to_string(), "value".to_string()).unwrap();
+        }
+        
+        // 少し待ってもSSTableが大量に生成されていないことを確認
+        // (バグがあればここで100個近いSSTableが生成される)
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        
+        let sst_count = engine.sstables.lock().unwrap().len();
+        assert!(sst_count <= 1, "Should not flush multiple times for the same key. Count: {}", sst_count);
     }
 }
