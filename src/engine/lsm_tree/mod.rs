@@ -246,6 +246,11 @@ impl LsmTreeEngine {
         }
     }
 
+    /// Shutdown the engine gracefully, flushing all pending WAL writes
+    pub async fn shutdown(&self) {
+        self.wal.shutdown().await;
+    }
+
     /// Run compaction: merge all SSTables into a single new SSTable and delete old ones
     async fn run_compaction(&self) -> Result<(), Status> {
         println!("Starting compaction...");

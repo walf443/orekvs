@@ -276,10 +276,9 @@ struct WalWriterInner {
 }
 
 /// Group commit WAL writer that batches multiple writes before sync
-#[derive(Debug)]
 pub struct GroupCommitWalWriter {
-    /// Channel to send write requests to background flusher
-    request_tx: mpsc::Sender<WriteRequest>,
+    /// Channel to send write requests to background flusher (shared across clones)
+    request_tx: Arc<Mutex<Option<mpsc::Sender<WriteRequest>>>>,
     /// Current WAL ID
     current_id: Arc<AtomicU64>,
     /// Data directory
@@ -288,16 +287,29 @@ pub struct GroupCommitWalWriter {
     inner: Arc<Mutex<WalWriterInner>>,
     /// Batch interval in microseconds
     batch_interval_micros: u64,
+    /// Handle to the background flusher task
+    flusher_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl std::fmt::Debug for GroupCommitWalWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupCommitWalWriter")
+            .field("current_id", &self.current_id)
+            .field("data_dir", &self.data_dir)
+            .field("batch_interval_micros", &self.batch_interval_micros)
+            .finish()
+    }
 }
 
 impl Clone for GroupCommitWalWriter {
     fn clone(&self) -> Self {
         GroupCommitWalWriter {
-            request_tx: self.request_tx.clone(),
+            request_tx: Arc::clone(&self.request_tx),
             current_id: Arc::clone(&self.current_id),
             data_dir: self.data_dir.clone(),
             inner: Arc::clone(&self.inner),
             batch_interval_micros: self.batch_interval_micros,
+            flusher_handle: Arc::clone(&self.flusher_handle),
         }
     }
 }
@@ -314,17 +326,45 @@ impl GroupCommitWalWriter {
 
         // Start background flusher
         let inner_clone = Arc::clone(&inner);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             Self::background_flusher(rx, inner_clone, batch_interval_micros).await;
         });
 
         Ok(GroupCommitWalWriter {
-            request_tx: tx,
+            request_tx: Arc::new(Mutex::new(Some(tx))),
             current_id: Arc::new(AtomicU64::new(wal_id)),
             data_dir: data_dir.to_path_buf(),
             inner,
             batch_interval_micros,
+            flusher_handle: Arc::new(Mutex::new(Some(handle))),
         })
+    }
+
+    /// Shutdown the WAL writer gracefully, flushing all pending writes
+    pub async fn shutdown(&self) {
+        println!("Shutting down WAL writer...");
+
+        // Drop the sender to signal the background task to finish
+        // This will cause the channel to close, signaling the background task to exit
+        {
+            let mut guard = self.request_tx.lock().unwrap();
+            guard.take(); // Drop the sender
+        }
+
+        // Take the handle to wait for the background task
+        let handle = {
+            let mut guard = self.flusher_handle.lock().unwrap();
+            guard.take()
+        };
+
+        if let Some(handle) = handle {
+            // Wait for the background task to complete
+            if let Err(e) = handle.await {
+                eprintln!("Error waiting for WAL flusher to shutdown: {}", e);
+            } else {
+                println!("WAL writer shutdown complete.");
+            }
+        }
     }
 
     /// Get current WAL ID
@@ -472,7 +512,16 @@ impl GroupCommitWalWriter {
             response: tx,
         };
 
-        self.request_tx
+        // Clone the sender while holding the lock briefly
+        let sender = {
+            let guard = self.request_tx.lock().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| Status::internal("WAL writer is shut down"))?
+                .clone()
+        };
+
+        sender
             .send(request)
             .await
             .map_err(|_| Status::internal("WAL writer channel closed"))?;
