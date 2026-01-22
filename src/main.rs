@@ -40,11 +40,11 @@ enum Commands {
 
         /// MemTable flush threshold in bytes for LSM-tree engine
         #[arg(long, default_value_t = 4194304)] // 4MB
-        lsm_tree_engine_memtable_threshold: u64,
+        lsm_memtable_capacity_bytes: u64,
 
         /// Compaction threshold (number of SSTables) for LSM-tree engine
         #[arg(long, default_value_t = 4)]
-        lsm_tree_engine_compaction_threshold: usize,
+        lsm_compaction_trigger_file_count: usize,
     },
     /// Test commands
     Test {
@@ -93,8 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             engine,
             data_dir,
             log_engine_compaction_threshold,
-            lsm_tree_engine_memtable_threshold,
-            lsm_tree_engine_compaction_threshold,
+            lsm_memtable_capacity_bytes,
+            lsm_compaction_trigger_file_count,
         } => {
             let addr = addr.parse()?;
             server::run_server(
@@ -102,8 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 engine.clone(),
                 data_dir.clone(),
                 *log_engine_compaction_threshold,
-                *lsm_tree_engine_memtable_threshold,
-                *lsm_tree_engine_compaction_threshold,
+                *lsm_memtable_capacity_bytes,
+                *lsm_compaction_trigger_file_count,
             )
             .await;
             Ok(())

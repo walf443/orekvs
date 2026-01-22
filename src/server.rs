@@ -20,16 +20,16 @@ impl MyKeyValue {
         engine_type: EngineType,
         data_dir: String,
         log_engine_compaction_threshold: u64,
-        lsm_tree_engine_memtable_threshold: u64,
-        lsm_tree_compaction_threshold: usize,
+        lsm_memtable_capacity_bytes: u64,
+        lsm_compaction_trigger_file_count: usize,
     ) -> Self {
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
             EngineType::Log => Box::new(LogEngine::new(data_dir, log_engine_compaction_threshold)),
             EngineType::LsmTree => Box::new(LsmTreeEngine::new(
                 data_dir,
-                lsm_tree_engine_memtable_threshold,
-                lsm_tree_compaction_threshold,
+                lsm_memtable_capacity_bytes,
+                lsm_compaction_trigger_file_count,
             )),
         };
         MyKeyValue { engine }
@@ -72,15 +72,15 @@ pub async fn run_server(
     engine_type: EngineType,
     data_dir: String,
     log_engine_compaction_threshold: u64,
-    lsm_tree_engine_memtable_threshold: u64,
-    lsm_tree_compaction_threshold: usize,
+    lsm_memtable_capacity_bytes: u64,
+    lsm_compaction_trigger_file_count: usize,
 ) {
     let key_value = MyKeyValue::new(
         engine_type,
         data_dir,
         log_engine_compaction_threshold,
-        lsm_tree_engine_memtable_threshold,
-        lsm_tree_compaction_threshold,
+        lsm_memtable_capacity_bytes,
+        lsm_compaction_trigger_file_count,
     );
 
     println!("Server listening on {}", addr);

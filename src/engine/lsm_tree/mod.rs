@@ -24,7 +24,7 @@ pub struct LsmTreeEngine {
     // Counter for next SSTable file ID
     next_sst_id: Arc<AtomicU64>,
     // Threshold for triggering compaction (number of SSTables)
-    compaction_threshold: usize,
+    compaction_trigger_file_count: usize,
     // Flag to prevent concurrent compaction
     compaction_in_progress: Arc<Mutex<bool>>,
     // WAL writer
@@ -38,7 +38,7 @@ impl Clone for LsmTreeEngine {
             sstables: Arc::clone(&self.sstables),
             data_dir: self.data_dir.clone(),
             next_sst_id: Arc::clone(&self.next_sst_id),
-            compaction_threshold: self.compaction_threshold,
+            compaction_trigger_file_count: self.compaction_trigger_file_count,
             compaction_in_progress: Arc::clone(&self.compaction_in_progress),
             wal: self.wal.clone(),
         }
@@ -46,7 +46,11 @@ impl Clone for LsmTreeEngine {
 }
 
 impl LsmTreeEngine {
-    pub fn new(data_dir_str: String, memtable_threshold: u64, compaction_threshold: usize) -> Self {
+    pub fn new(
+        data_dir_str: String,
+        memtable_capacity_bytes: u64,
+        compaction_trigger_file_count: usize,
+    ) -> Self {
         let data_dir = PathBuf::from(&data_dir_str);
 
         if !data_dir.exists() {
@@ -144,14 +148,14 @@ impl LsmTreeEngine {
                 .expect("Failed to write recovered entries to WAL");
         }
 
-        let mem_state = MemTableState::new(memtable_threshold, recovered_memtable, recovered_size);
+        let mem_state = MemTableState::new(memtable_capacity_bytes, recovered_memtable, recovered_size);
 
         LsmTreeEngine {
             mem_state,
             sstables: Arc::new(Mutex::new(sst_files)),
             data_dir,
             next_sst_id: Arc::new(AtomicU64::new(max_sst_id)),
-            compaction_threshold,
+            compaction_trigger_file_count,
             compaction_in_progress: Arc::new(Mutex::new(false)),
             wal,
         }
@@ -205,7 +209,7 @@ impl LsmTreeEngine {
             sstables.len()
         };
 
-        if sst_count >= self.compaction_threshold {
+        if sst_count >= self.compaction_trigger_file_count {
             let mut in_progress = self.compaction_in_progress.lock().unwrap();
             if !*in_progress {
                 *in_progress = true;

@@ -17,8 +17,8 @@ pub struct MemTableState {
     pub active_memtable: Arc<Mutex<MemTable>>,
     // MemTables currently being flushed to disk
     pub immutable_memtables: Arc<Mutex<Vec<Arc<MemTable>>>>,
-    // Threshold for MemTable size in bytes
-    pub threshold: u64,
+    // Max size for MemTable in bytes
+    pub capacity_bytes: u64,
     // Approximate size of current active MemTable
     pub current_size: Arc<AtomicU64>,
 }
@@ -28,18 +28,18 @@ impl Clone for MemTableState {
         MemTableState {
             active_memtable: Arc::clone(&self.active_memtable),
             immutable_memtables: Arc::clone(&self.immutable_memtables),
-            threshold: self.threshold,
+            capacity_bytes: self.capacity_bytes,
             current_size: Arc::clone(&self.current_size),
         }
     }
 }
 
 impl MemTableState {
-    pub fn new(threshold: u64, recovered_memtable: MemTable, recovered_size: u64) -> Self {
+    pub fn new(capacity_bytes: u64, recovered_memtable: MemTable, recovered_size: u64) -> Self {
         MemTableState {
             active_memtable: Arc::new(Mutex::new(recovered_memtable)),
             immutable_memtables: Arc::new(Mutex::new(Vec::new())),
-            threshold,
+            capacity_bytes,
             current_size: Arc::new(AtomicU64::new(recovered_size)),
         }
     }
@@ -63,10 +63,10 @@ impl MemTableState {
 
     pub fn check_flush_threshold(&self) -> Option<Arc<MemTable>> {
         let size = self.current_size.load(Ordering::SeqCst);
-        if size >= self.threshold {
+        if size >= self.capacity_bytes {
             let mut active = self.active_memtable.lock().unwrap();
             // Double check inside lock
-            if self.current_size.load(Ordering::SeqCst) >= self.threshold {
+            if self.current_size.load(Ordering::SeqCst) >= self.capacity_bytes {
                 let immutable = Arc::new(std::mem::take(&mut *active));
                 self.current_size.store(0, Ordering::SeqCst);
                 
