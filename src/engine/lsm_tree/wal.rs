@@ -23,6 +23,21 @@ struct WriteRequest {
     synced_tx: oneshot::Sender<Result<(), Status>>,
 }
 
+/// Batch write request - multiple entries with single notification
+struct BatchWriteRequest {
+    entries: Vec<(String, Option<String>)>,
+    /// Notified when all data is written to OS buffer
+    written_tx: Option<oneshot::Sender<()>>,
+    /// Notified when all data is synced to disk
+    synced_tx: oneshot::Sender<Result<(), Status>>,
+}
+
+/// Request type sent to the background flusher
+enum FlushRequest {
+    Single(WriteRequest),
+    Batch(BatchWriteRequest),
+}
+
 /// Inner state for WAL file operations
 #[derive(Debug)]
 struct WalWriterInner {
@@ -33,7 +48,7 @@ struct WalWriterInner {
 /// Group commit WAL writer that batches multiple writes before sync
 pub struct GroupCommitWalWriter {
     /// Channel to send write requests to background flusher (shared across clones)
-    request_tx: Arc<Mutex<Option<mpsc::Sender<WriteRequest>>>>,
+    request_tx: Arc<Mutex<Option<mpsc::Sender<FlushRequest>>>>,
     /// Current WAL ID
     current_id: Arc<AtomicU64>,
     /// Data directory
@@ -77,7 +92,7 @@ impl GroupCommitWalWriter {
 
         let inner = Arc::new(Mutex::new(WalWriterInner { writer: file, path }));
 
-        let (tx, rx) = mpsc::channel::<WriteRequest>(1024);
+        let (tx, rx) = mpsc::channel::<FlushRequest>(1024);
 
         // Start background flusher
         let inner_clone = Arc::clone(&inner);
@@ -152,11 +167,11 @@ impl GroupCommitWalWriter {
 
     /// Background task that batches writes and flushes periodically
     async fn background_flusher(
-        mut rx: mpsc::Receiver<WriteRequest>,
+        mut rx: mpsc::Receiver<FlushRequest>,
         inner: Arc<Mutex<WalWriterInner>>,
         batch_interval_micros: u64,
     ) {
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending: Vec<FlushRequest> = Vec::new();
 
         loop {
             // Wait for a request with timeout
@@ -189,24 +204,45 @@ impl GroupCommitWalWriter {
     }
 
     /// Flush pending writes and notify all waiting requests
-    fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<WriteRequest>) {
+    fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<FlushRequest>) {
         let mut guard = inner.lock().unwrap();
 
-        // Stage 1: Write all to OS buffer and notify "written"
+        // Stage 1: Write all to OS buffer
         for req in pending.iter() {
-            if let Err(e) = Self::write_entry_to_file(&mut guard.writer, &req.key, &req.value) {
-                // If write fails, notify all about the error and return
-                for r in pending.drain(..) {
-                    let _ = r.synced_tx.send(Err(e.clone()));
+            match req {
+                FlushRequest::Single(single) => {
+                    if let Err(e) =
+                        Self::write_entry_to_file(&mut guard.writer, &single.key, &single.value)
+                    {
+                        // If write fails, notify all about the error and return
+                        Self::notify_all_error(pending, e);
+                        return;
+                    }
                 }
-                return;
+                FlushRequest::Batch(batch) => {
+                    for (key, value) in &batch.entries {
+                        if let Err(e) = Self::write_entry_to_file(&mut guard.writer, key, value) {
+                            Self::notify_all_error(pending, e);
+                            return;
+                        }
+                    }
+                }
             }
         }
 
         // Notify all that writes are in OS buffer
         for req in pending.iter_mut() {
-            if let Some(tx) = req.written_tx.take() {
-                let _ = tx.send(());
+            match req {
+                FlushRequest::Single(single) => {
+                    if let Some(tx) = single.written_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                FlushRequest::Batch(batch) => {
+                    if let Some(tx) = batch.written_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
             }
         }
 
@@ -218,7 +254,28 @@ impl GroupCommitWalWriter {
 
         // Stage 3: Notify "synced"
         for req in pending.drain(..) {
-            let _ = req.synced_tx.send(sync_result.clone());
+            match req {
+                FlushRequest::Single(single) => {
+                    let _ = single.synced_tx.send(sync_result.clone());
+                }
+                FlushRequest::Batch(batch) => {
+                    let _ = batch.synced_tx.send(sync_result.clone());
+                }
+            }
+        }
+    }
+
+    /// Notify all pending requests about an error
+    fn notify_all_error(pending: &mut Vec<FlushRequest>, error: Status) {
+        for req in pending.drain(..) {
+            match req {
+                FlushRequest::Single(single) => {
+                    let _ = single.synced_tx.send(Err(error.clone()));
+                }
+                FlushRequest::Batch(batch) => {
+                    let _ = batch.synced_tx.send(Err(error.clone()));
+                }
+            }
         }
     }
 
@@ -272,12 +329,43 @@ impl GroupCommitWalWriter {
         let (written_tx, written_rx) = oneshot::channel();
         let (synced_tx, synced_rx) = oneshot::channel();
 
-        let request = WriteRequest {
+        let request = FlushRequest::Single(WriteRequest {
             key: key.to_string(),
             value: value.clone(),
             written_tx: Some(written_tx),
             synced_tx,
+        });
+
+        let sender = {
+            let guard = self.request_tx.lock().unwrap();
+            guard
+                .as_ref()
+                .ok_or_else(|| Status::internal("WAL writer is shut down"))?
+                .clone()
         };
+
+        sender
+            .send(request)
+            .await
+            .map_err(|_| Status::internal("WAL writer channel closed"))?;
+
+        Ok((written_rx, synced_rx))
+    }
+
+    /// Append multiple entries to the WAL as a batch with pipelining support.
+    /// Returns two receivers: one for when all data is written to OS buffer, one for when it's synced to disk.
+    pub async fn append_batch_pipelined(
+        &self,
+        entries: Vec<(String, Option<String>)>,
+    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<Result<(), Status>>), Status> {
+        let (written_tx, written_rx) = oneshot::channel();
+        let (synced_tx, synced_rx) = oneshot::channel();
+
+        let request = FlushRequest::Batch(BatchWriteRequest {
+            entries,
+            written_tx: Some(written_tx),
+            synced_tx,
+        });
 
         let sender = {
             let guard = self.request_tx.lock().unwrap();

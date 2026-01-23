@@ -472,6 +472,45 @@ impl Engine for LsmTreeEngine {
                 .map_err(|_| Status::internal("WAL synced channel closed"))?
         })
     }
+
+    fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+
+        let count = items.len();
+
+        // Convert to WAL format (key, Some(value))
+        let entries: Vec<(String, Option<String>)> = items
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect();
+
+        // 1. Start writing batch to WAL
+        let wal = self.wal.clone();
+        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined(entries))
+        })?;
+
+        // 2. Wait for WAL to be written to OS buffer
+        let _ =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
+
+        // 3. Update MemTable with all entries (they become visible to Get)
+        for (key, value) in items {
+            self.mem_state.insert(key, Some(value));
+        }
+        self.trigger_flush_if_needed();
+
+        // 4. Wait for disk sync for durability
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(synced_rx)
+                .map_err(|_| Status::internal("WAL synced channel closed"))?
+        })?;
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

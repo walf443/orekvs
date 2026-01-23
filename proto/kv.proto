@@ -6,6 +6,8 @@ service KeyValue {
   rpc Set (SetRequest) returns (SetResponse);
   rpc Get (GetRequest) returns (GetResponse);
   rpc Delete (DeleteRequest) returns (DeleteResponse);
+  rpc BatchSet (BatchSetRequest) returns (BatchSetResponse);
+  rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
 }
 
 message SetRequest {
@@ -31,4 +33,26 @@ message DeleteRequest {
 
 message DeleteResponse {
   bool success = 1;
+}
+
+message KeyValuePair {
+  string key = 1;
+  string value = 2;
+}
+
+message BatchSetRequest {
+  repeated KeyValuePair items = 1;
+}
+
+message BatchSetResponse {
+  bool success = 1;
+  int32 count = 2;
+}
+
+message BatchGetRequest {
+  repeated string keys = 1;
+}
+
+message BatchGetResponse {
+  repeated KeyValuePair items = 1;
 }

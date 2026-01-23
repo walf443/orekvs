@@ -6,7 +6,9 @@ use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use server::EngineType;
 use server::kv::key_value_client::KeyValueClient;
-use server::kv::{DeleteRequest, GetRequest, SetRequest};
+use server::kv::{
+    BatchGetRequest, BatchSetRequest, DeleteRequest, GetRequest, KeyValuePair, SetRequest,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -82,6 +84,28 @@ enum TestCommands {
         #[arg(long, default_value_t = 1000000)]
         key_range: u32,
     },
+    /// Batch set multiple random key-value pairs
+    BatchSet {
+        /// Total number of key-value pairs to set
+        count: usize,
+        /// Number of items per batch
+        #[arg(short, long, default_value_t = 100)]
+        batch_size: usize,
+        /// Maximum key value (1..N)
+        #[arg(long, default_value_t = 1000000)]
+        key_range: u32,
+    },
+    /// Batch get multiple random keys
+    BatchGet {
+        /// Total number of keys to get
+        count: usize,
+        /// Number of keys per batch
+        #[arg(short, long, default_value_t = 100)]
+        batch_size: usize,
+        /// Maximum key value (1..N)
+        #[arg(long, default_value_t = 1000000)]
+        key_range: u32,
+    },
     /// Set a key-value pair
     Set { key: String, value: String },
     /// Get the value of a key
@@ -126,6 +150,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parallel,
                 key_range,
             } => run_test_get(addr.clone(), *count, *parallel, *key_range).await,
+            TestCommands::BatchSet {
+                count,
+                batch_size,
+                key_range,
+            } => run_test_batch_set(addr.clone(), *count, *batch_size, *key_range).await,
+            TestCommands::BatchGet {
+                count,
+                batch_size,
+                key_range,
+            } => run_test_batch_get(addr.clone(), *count, *batch_size, *key_range).await,
             TestCommands::Set { key, value } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(SetRequest {
@@ -316,6 +350,125 @@ async fn run_test_get(
             success_count as f64 / total_elapsed.as_secs_f64()
         );
     }
+
+    Ok(())
+}
+
+async fn run_test_batch_set(
+    addr: String,
+    count: usize,
+    batch_size: usize,
+    key_range: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let num_batches = (count + batch_size - 1) / batch_size;
+    println!(
+        "Batch setting {} key-value pairs (range 1..={}) in {} batches of {} to {}...",
+        count, key_range, num_batches, batch_size, addr
+    );
+
+    let mut client = KeyValueClient::connect(addr).await?;
+    let start_time = Instant::now();
+    let mut total_set = 0usize;
+
+    for batch_num in 0..num_batches {
+        let items_in_batch = std::cmp::min(batch_size, count - batch_num * batch_size);
+        let mut items = Vec::with_capacity(items_in_batch);
+
+        for _ in 0..items_in_batch {
+            let mut rng = thread_rng();
+            let key = rng.gen_range(1..=key_range).to_string();
+            let value: String = (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
+            items.push(KeyValuePair { key, value });
+        }
+
+        let request = tonic::Request::new(BatchSetRequest { items });
+        let response = client.batch_set(request).await?;
+        total_set += response.into_inner().count as usize;
+
+        if num_batches <= 10 || batch_num < 3 || batch_num >= num_batches - 3 {
+            println!(
+                "[Batch {}/{}] Set {} items",
+                batch_num + 1,
+                num_batches,
+                items_in_batch
+            );
+        } else if batch_num == 3 {
+            println!("...");
+        }
+    }
+
+    let total_elapsed = start_time.elapsed();
+
+    println!("\nSummary:");
+    println!("Total count: {}", count);
+    println!("Total set: {}", total_set);
+    println!("Batch size: {}", batch_size);
+    println!("Number of batches: {}", num_batches);
+    println!("Total elapsed time: {:?}", total_elapsed);
+    println!(
+        "Throughput: {:.2} items/sec",
+        total_set as f64 / total_elapsed.as_secs_f64()
+    );
+
+    Ok(())
+}
+
+async fn run_test_batch_get(
+    addr: String,
+    count: usize,
+    batch_size: usize,
+    key_range: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let num_batches = (count + batch_size - 1) / batch_size;
+    println!(
+        "Batch getting {} keys (range 1..={}) in {} batches of {} from {}...",
+        count, key_range, num_batches, batch_size, addr
+    );
+
+    let mut client = KeyValueClient::connect(addr).await?;
+    let start_time = Instant::now();
+    let mut total_found = 0usize;
+
+    for batch_num in 0..num_batches {
+        let keys_in_batch = std::cmp::min(batch_size, count - batch_num * batch_size);
+        let mut keys = Vec::with_capacity(keys_in_batch);
+
+        for _ in 0..keys_in_batch {
+            let mut rng = thread_rng();
+            let key = rng.gen_range(1..=key_range).to_string();
+            keys.push(key);
+        }
+
+        let request = tonic::Request::new(BatchGetRequest { keys });
+        let response = client.batch_get(request).await?;
+        let found = response.into_inner().items.len();
+        total_found += found;
+
+        if num_batches <= 10 || batch_num < 3 || batch_num >= num_batches - 3 {
+            println!(
+                "[Batch {}/{}] Requested {} keys, found {}",
+                batch_num + 1,
+                num_batches,
+                keys_in_batch,
+                found
+            );
+        } else if batch_num == 3 {
+            println!("...");
+        }
+    }
+
+    let total_elapsed = start_time.elapsed();
+
+    println!("\nSummary:");
+    println!("Total requested: {}", count);
+    println!("Total found: {}", total_found);
+    println!("Batch size: {}", batch_size);
+    println!("Number of batches: {}", num_batches);
+    println!("Total elapsed time: {:?}", total_elapsed);
+    println!(
+        "Throughput: {:.2} keys/sec",
+        count as f64 / total_elapsed.as_secs_f64()
+    );
 
     Ok(())
 }
