@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
+use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry};
 use super::memtable::MemTable;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
@@ -50,6 +52,7 @@ pub fn generate_filename(sst_id: u64, wal_id: u64) -> String {
 
 /// Search for a key in an SSTable file
 #[allow(clippy::result_large_err)]
+#[allow(dead_code)]
 pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     // If file doesn't exist (deleted by compaction), skip it
     let mut file = match File::open(path) {
@@ -134,6 +137,211 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     loop {
         // Check if EOF
         if cursor.position() == cursor.get_ref().len() as u64 {
+            break;
+        }
+
+        let mut ts_bytes = [0u8; 8];
+        if cursor.read_exact(&mut ts_bytes).is_err() {
+            break;
+        }
+
+        let mut klen_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut klen_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut vlen_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut vlen_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let key_len = u64::from_le_bytes(klen_bytes);
+        let val_len = u64::from_le_bytes(vlen_bytes);
+
+        let mut key_buf = vec![0u8; key_len as usize];
+        cursor
+            .read_exact(&mut key_buf)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let current_key = String::from_utf8_lossy(&key_buf);
+
+        if current_key == key {
+            if val_len == u64::MAX {
+                return Ok(None);
+            }
+            let mut val_buf = vec![0u8; val_len as usize];
+            cursor
+                .read_exact(&mut val_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            return Ok(Some(String::from_utf8_lossy(&val_buf).to_string()));
+        }
+
+        // Optimization: If current_key > key, we can stop (entries are sorted)
+        if current_key.as_ref() > key {
+            return Err(Status::not_found("Key not found in SSTable (sorted check)"));
+        }
+
+        if val_len != u64::MAX {
+            cursor
+                .seek(SeekFrom::Current(val_len as i64))
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+    }
+    Err(Status::not_found("Key not found in SSTable"))
+}
+
+/// Search for a key in an SSTable file with block cache support
+#[allow(clippy::result_large_err)]
+pub fn search_key_cached(
+    path: &Path,
+    key: &str,
+    cache: &BlockCache,
+) -> Result<Option<String>, Status> {
+    // Try to get canonical path for consistent cache keys
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // Get or load index from cache
+    let index = get_or_load_index(path, &canonical_path, cache)?;
+
+    // Binary search in index
+    let block_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+        Ok(idx) => index[idx].1,
+        Err(idx) => {
+            if idx == 0 {
+                index[0].1
+            } else {
+                index[idx - 1].1
+            }
+        }
+    };
+
+    // Get or load block from cache
+    let block_data = get_or_load_block(path, &canonical_path, block_offset, cache)?;
+
+    // Search within block
+    search_in_block(&block_data, key)
+}
+
+/// Get index from cache or load from file
+#[allow(clippy::result_large_err)]
+fn get_or_load_index(
+    path: &Path,
+    canonical_path: &Path,
+    cache: &BlockCache,
+) -> Result<Arc<Vec<(String, u64)>>, Status> {
+    let cache_key = BlockCacheKey::for_index(canonical_path.to_path_buf());
+
+    // Check cache first
+    if let Some(CacheEntry::Index(index)) = cache.get(&cache_key) {
+        return Ok(index);
+    }
+
+    // Load from file
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Status::not_found("SSTable file not found"));
+        }
+        Err(e) => return Err(Status::internal(e.to_string())),
+    };
+
+    // Validate header
+    let mut magic = [0u8; 6];
+    if file.read_exact(&mut magic).is_err() || &magic != MAGIC_BYTES {
+        return Err(Status::internal("Invalid SSTable magic"));
+    }
+
+    let mut ver_bytes = [0u8; 4];
+    file.read_exact(&mut ver_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let version = u32::from_le_bytes(ver_bytes);
+
+    if version != 3 {
+        return Err(Status::internal(format!(
+            "Unsupported SSTable version: {}. Only version 3 is supported.",
+            version
+        )));
+    }
+
+    let file_len = file
+        .metadata()
+        .map_err(|e| Status::internal(e.to_string()))?
+        .len();
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
+        return Err(Status::internal("SSTable file too small"));
+    }
+
+    // Read footer to get index offset
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut index_offset_bytes = [0u8; 8];
+    file.read_exact(&mut index_offset_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let index_offset = u64::from_le_bytes(index_offset_bytes);
+
+    // Read and decompress index
+    let index = read_index_compressed(&mut file, index_offset)?;
+    let arc_index = Arc::new(index);
+
+    // Cache it
+    cache.insert(cache_key, CacheEntry::Index(Arc::clone(&arc_index)));
+
+    Ok(arc_index)
+}
+
+/// Get block from cache or load from file
+#[allow(clippy::result_large_err)]
+fn get_or_load_block(
+    path: &Path,
+    canonical_path: &Path,
+    block_offset: u64,
+    cache: &BlockCache,
+) -> Result<Arc<Vec<u8>>, Status> {
+    let cache_key = BlockCacheKey::for_block(canonical_path.to_path_buf(), block_offset);
+
+    // Check cache first
+    if let Some(CacheEntry::DataBlock(data)) = cache.get(&cache_key) {
+        return Ok(data);
+    }
+
+    // Load from file
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Status::not_found("SSTable file not found"));
+        }
+        Err(e) => return Err(Status::internal(e.to_string())),
+    };
+
+    file.seek(SeekFrom::Start(block_offset))
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Read compressed block
+    let mut len_bytes = [0u8; 4];
+    file.read_exact(&mut len_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let len = u32::from_le_bytes(len_bytes);
+
+    let mut compressed_block = vec![0u8; len as usize];
+    file.read_exact(&mut compressed_block)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
+        .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
+
+    let arc_data = Arc::new(decompressed);
+
+    // Cache it
+    cache.insert(cache_key, CacheEntry::DataBlock(Arc::clone(&arc_data)));
+
+    Ok(arc_data)
+}
+
+/// Search for a key within a decompressed block
+#[allow(clippy::result_large_err)]
+fn search_in_block(block_data: &[u8], key: &str) -> Result<Option<String>, Status> {
+    let mut cursor = Cursor::new(block_data);
+
+    loop {
+        if cursor.position() == block_data.len() as u64 {
             break;
         }
 

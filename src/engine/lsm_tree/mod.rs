@@ -1,8 +1,10 @@
+mod block_cache;
 mod memtable;
 mod sstable;
 mod wal;
 
 use super::Engine;
+use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use memtable::{MemTable, MemTableState};
 use sstable::TimestampedEntry;
 use std::collections::BTreeMap;
@@ -13,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use tonic::Status;
 use wal::GroupCommitWalWriter;
 
-#[derive(Debug)]
 pub struct LsmTreeEngine {
     // MemTable management state
     mem_state: MemTableState,
@@ -29,6 +30,8 @@ pub struct LsmTreeEngine {
     compaction_in_progress: Arc<Mutex<bool>>,
     // WAL writer with group commit support
     wal: GroupCommitWalWriter,
+    // Block cache for SSTable reads
+    block_cache: Arc<BlockCache>,
 }
 
 impl Clone for LsmTreeEngine {
@@ -41,6 +44,7 @@ impl Clone for LsmTreeEngine {
             compaction_trigger_file_count: self.compaction_trigger_file_count,
             compaction_in_progress: Arc::clone(&self.compaction_in_progress),
             wal: self.wal.clone(),
+            block_cache: Arc::clone(&self.block_cache),
         }
     }
 }
@@ -187,6 +191,7 @@ impl LsmTreeEngine {
             compaction_trigger_file_count,
             compaction_in_progress: Arc::new(Mutex::new(false)),
             wal,
+            block_cache: Arc::new(BlockCache::new(DEFAULT_BLOCK_CACHE_SIZE_BYTES)),
         }
     }
 
@@ -334,6 +339,8 @@ impl LsmTreeEngine {
                 eprintln!("Failed to delete old SSTable {:?}: {}", path, e);
             } else {
                 println!("Deleted old SSTable: {:?}", path);
+                // Invalidate cache entries for deleted file
+                self.block_cache.invalidate_file(path);
             }
         }
 
@@ -377,7 +384,7 @@ impl Engine for LsmTreeEngine {
             sstables.clone()
         };
         for path in sst_paths {
-            match sstable::search_key(&path, &key) {
+            match sstable::search_key_cached(&path, &key, &self.block_cache) {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => return Err(Status::not_found("Key deleted")),
                 Err(e) if e.code() == tonic::Code::NotFound => continue,
