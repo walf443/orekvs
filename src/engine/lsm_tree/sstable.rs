@@ -17,6 +17,14 @@ pub const FOOTER_SIZE: u64 = 8;
 // Target block size for compression (bytes)
 pub const BLOCK_SIZE: usize = 4096;
 
+// ZSTD compression levels (0-22, higher = better compression but slower)
+// Flush: prioritize speed for write performance
+const COMPRESSION_LEVEL_FLUSH: i32 = 1;
+// Compaction: prioritize compression ratio for storage efficiency
+const COMPRESSION_LEVEL_COMPACTION: i32 = 6;
+// Index: use higher compression since index is read once per search
+const COMPRESSION_LEVEL_INDEX: i32 = 6;
+
 // Entry with timestamp for merge-sorting during compaction
 pub type TimestampedEntry = (u64, Option<String>); // (timestamp, value)
 
@@ -337,7 +345,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
             // Compress and write block
             index.push((first_key_in_block.clone(), current_offset));
 
-            let compressed = zstd::encode_all(Cursor::new(&block_buffer), 0)
+            let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_FLUSH)
                 .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
             let len = compressed.len() as u32;
@@ -355,7 +363,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
     if !block_buffer.is_empty() {
         index.push((first_key_in_block, current_offset));
 
-        let compressed = zstd::encode_all(Cursor::new(&block_buffer), 0)
+        let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_FLUSH)
             .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
         let len = compressed.len() as u32;
@@ -369,7 +377,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
 
     // Write index
     let index_offset = current_offset;
-    write_index_compressed(&mut file, &index)?;
+    write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
 
     // Write footer
     file.write_all(&index_offset.to_le_bytes())
@@ -425,8 +433,9 @@ pub fn write_timestamped_entries(
         if block_buffer.len() >= BLOCK_SIZE {
             index.push((first_key_in_block.clone(), current_offset));
 
-            let compressed = zstd::encode_all(Cursor::new(&block_buffer), 0)
-                .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
+            let compressed =
+                zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_COMPACTION)
+                    .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
             let len = compressed.len() as u32;
             file.write_all(&len.to_le_bytes())
@@ -443,7 +452,7 @@ pub fn write_timestamped_entries(
     if !block_buffer.is_empty() {
         index.push((first_key_in_block, current_offset));
 
-        let compressed = zstd::encode_all(Cursor::new(&block_buffer), 0)
+        let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_COMPACTION)
             .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
         let len = compressed.len() as u32;
@@ -457,7 +466,7 @@ pub fn write_timestamped_entries(
 
     // Write index
     let index_offset = current_offset;
-    write_index_compressed(&mut file, &index)?;
+    write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
 
     // Write footer
     file.write_all(&index_offset.to_le_bytes())
@@ -543,7 +552,12 @@ pub fn generate_path(data_dir: &Path, sst_id: u64, wal_id: u64) -> PathBuf {
     data_dir.join(generate_filename(sst_id, wal_id))
 }
 
-fn write_index_compressed(file: &mut File, index: &[(String, u64)]) -> Result<(), Status> {
+#[allow(clippy::result_large_err)]
+fn write_index_compressed(
+    file: &mut File,
+    index: &[(String, u64)],
+    compression_level: i32,
+) -> Result<(), Status> {
     let mut buffer = Vec::new();
     let num_entries = index.len() as u64;
     buffer
@@ -565,7 +579,7 @@ fn write_index_compressed(file: &mut File, index: &[(String, u64)]) -> Result<()
             .map_err(|e| Status::internal(e.to_string()))?;
     }
 
-    let compressed = zstd::encode_all(Cursor::new(&buffer), 0)
+    let compressed = zstd::encode_all(Cursor::new(&buffer), compression_level)
         .map_err(|e| Status::internal(format!("Index compression error: {}", e)))?;
 
     // Write compressed size then data
@@ -578,6 +592,7 @@ fn write_index_compressed(file: &mut File, index: &[(String, u64)]) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn read_index_compressed(file: &mut File, index_offset: u64) -> Result<Vec<(String, u64)>, Status> {
     file.seek(SeekFrom::Start(index_offset))
         .map_err(|e| Status::internal(e.to_string()))?;
