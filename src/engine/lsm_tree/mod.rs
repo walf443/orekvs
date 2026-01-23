@@ -758,4 +758,89 @@ mod tests {
         // Still should not find k1 (SSTable has v1, but newer SSTable has tombstone)
         assert!(engine.get("k1".to_string()).is_err());
     }
+
+    /// Benchmark test to measure block cache effectiveness
+    /// Run with: cargo test bench_block_cache --release -- --nocapture
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_block_cache_effectiveness() {
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        // Create engine with larger memtable to batch keys into fewer SSTables
+        let engine = LsmTreeEngine::new(data_dir.clone(), 50 * 1024, 100);
+
+        // Phase 1: Write data to create SSTables
+        let num_keys = 5000;
+        println!("\n=== Block Cache Benchmark ===");
+        println!("Writing {} keys...", num_keys);
+
+        for i in 0..num_keys {
+            engine
+                .set(format!("key{:05}", i), format!("value{:05}", i))
+                .unwrap();
+        }
+
+        // Force flush remaining memtable by writing more data
+        for i in 0..100 {
+            engine
+                .set(format!("flush{:05}", i), "x".repeat(1000))
+                .unwrap();
+        }
+
+        // Wait for all flushes to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+        let sst_paths: Vec<PathBuf> = engine.sstables.lock().unwrap().clone();
+        println!("Created {} SSTables", sst_paths.len());
+
+        // Phase 2: Compare cached vs non-cached reads directly on SSTable
+        println!("\n--- Direct SSTable Read Comparison ---");
+
+        // Test key that should be in SSTable
+        let test_key = "key00100";
+
+        // Non-cached reads (using search_key directly)
+        let iterations = 1000;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for path in &sst_paths {
+                let _ = sstable::search_key(path, test_key);
+            }
+        }
+        let no_cache_duration = start.elapsed();
+        println!(
+            "Without cache: {} SSTable searches in {:?} ({:.2}/sec)",
+            iterations * sst_paths.len(),
+            no_cache_duration,
+            (iterations * sst_paths.len()) as f64 / no_cache_duration.as_secs_f64()
+        );
+
+        // Cached reads (using search_key_cached)
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for path in &sst_paths {
+                let _ = sstable::search_key_cached(path, test_key, &engine.block_cache);
+            }
+        }
+        let cache_duration = start.elapsed();
+        println!(
+            "With cache:    {} SSTable searches in {:?} ({:.2}/sec)",
+            iterations * sst_paths.len(),
+            cache_duration,
+            (iterations * sst_paths.len()) as f64 / cache_duration.as_secs_f64()
+        );
+
+        let stats = engine.block_cache.stats();
+        println!(
+            "\nCache stats: {} entries, {} bytes",
+            stats.entries, stats.size_bytes
+        );
+
+        let improvement = no_cache_duration.as_secs_f64() / cache_duration.as_secs_f64();
+        println!("\n=== Results ===");
+        println!("Cache speedup: {:.2}x faster with block cache", improvement);
+        println!("================================\n");
+    }
 }
