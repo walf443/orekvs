@@ -1,10 +1,12 @@
 mod block_cache;
+mod bloom;
 mod memtable;
 mod sstable;
 mod wal;
 
 use super::Engine;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
+use bloom::BloomFilter;
 use memtable::{MemTable, MemTableState};
 use sstable::TimestampedEntry;
 use std::collections::BTreeMap;
@@ -15,11 +17,17 @@ use std::sync::{Arc, Mutex};
 use tonic::Status;
 use wal::GroupCommitWalWriter;
 
+/// Handle to an SSTable with its Bloom filter
+struct SstableHandle {
+    path: PathBuf,
+    bloom: BloomFilter,
+}
+
 pub struct LsmTreeEngine {
     // MemTable management state
     mem_state: MemTableState,
-    // List of SSTable file paths on disk (newest first)
-    sstables: Arc<Mutex<Vec<PathBuf>>>,
+    // List of SSTable file handles (newest first)
+    sstables: Arc<Mutex<Vec<Arc<SstableHandle>>>>,
     // Base directory for SSTables
     data_dir: PathBuf,
     // Counter for next SSTable file ID
@@ -124,6 +132,20 @@ impl LsmTreeEngine {
         sst_files.sort_by(|a, b| b.cmp(a));
         wal_files.sort_by_key(|(id, _)| *id);
 
+        // Build SstableHandles with Bloom filters for existing SSTables
+        let mut sst_handles = Vec::new();
+        for p in &sst_files {
+            let keys = sstable::read_keys(p).expect("Failed to read SSTable keys for Bloom filter");
+            let mut bloom = BloomFilter::new(keys.len(), 0.01);
+            for key in &keys {
+                bloom.insert(key);
+            }
+            sst_handles.push(Arc::new(SstableHandle {
+                path: p.clone(),
+                bloom,
+            }));
+        }
+
         // Recover MemTable from WAL files that are newer than the latest SSTable
         let mut recovered_memtable: MemTable = BTreeMap::new();
         let mut recovered_size: u64 = 0;
@@ -185,7 +207,7 @@ impl LsmTreeEngine {
 
         LsmTreeEngine {
             mem_state,
-            sstables: Arc::new(Mutex::new(sst_files)),
+            sstables: Arc::new(Mutex::new(sst_handles)),
             data_dir,
             next_sst_id: Arc::new(AtomicU64::new(max_sst_id)),
             compaction_trigger_file_count,
@@ -217,9 +239,19 @@ impl LsmTreeEngine {
 
         sstable::create_from_memtable(&sst_path, &memtable)?;
 
+        // Build Bloom filter for the new SSTable
+        let mut bloom = BloomFilter::new(memtable.len(), 0.01);
+        for key in memtable.keys() {
+            bloom.insert(key);
+        }
+        let handle = Arc::new(SstableHandle {
+            path: sst_path,
+            bloom,
+        });
+
         {
             let mut sstables = self.sstables.lock().unwrap();
-            sstables.insert(0, sst_path);
+            sstables.insert(0, handle);
         }
 
         self.mem_state.remove_immutable(&memtable);
@@ -271,12 +303,12 @@ impl LsmTreeEngine {
         println!("Starting compaction...");
 
         // Get current SSTables to compact
-        let sst_paths: Vec<PathBuf> = {
+        let sst_handles: Vec<Arc<SstableHandle>> = {
             let sstables = self.sstables.lock().unwrap();
             sstables.clone()
         };
 
-        if sst_paths.len() < 2 {
+        if sst_handles.len() < 2 {
             println!("Not enough SSTables to compact");
             return Ok(());
         }
@@ -284,8 +316,8 @@ impl LsmTreeEngine {
         // Merge all SSTables, keeping only the latest value for each key
         let mut merged: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
 
-        for path in &sst_paths {
-            let entries = sstable::read_entries(path)?;
+        for handle in &sst_handles {
+            let entries = sstable::read_entries(&handle.path)?;
             for (key, (timestamp, value)) in entries {
                 match merged.get(&key) {
                     Some((existing_ts, _)) if *existing_ts >= timestamp => {
@@ -304,9 +336,9 @@ impl LsmTreeEngine {
         // Write merged data to a new SSTable
         let new_sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         // Use the max WAL ID from compacted SSTables
-        let max_wal_id = sst_paths
+        let max_wal_id = sst_handles
             .iter()
-            .filter_map(|p| sstable::extract_wal_id_from_sstable(p))
+            .filter_map(|h| sstable::extract_wal_id_from_sstable(&h.path))
             .max()
             .unwrap_or(0);
         let new_sst_path = sstable::generate_path(&self.data_dir, new_sst_id, max_wal_id);
@@ -315,38 +347,49 @@ impl LsmTreeEngine {
 
         sstable::write_timestamped_entries(&new_sst_path, &merged)?;
 
+        // Build Bloom filter for the compacted SSTable
+        let mut bloom = BloomFilter::new(merged.len(), 0.01);
+        for key in merged.keys() {
+            bloom.insert(key);
+        }
+        let new_handle = Arc::new(SstableHandle {
+            path: new_sst_path.clone(),
+            bloom,
+        });
+
         // Update sstables list: remove compacted SSTables and add new one
         // Keep any SSTables that were added during compaction (by flush)
-        let compacted_set: std::collections::HashSet<_> = sst_paths.iter().collect();
+        let compacted_paths: std::collections::HashSet<_> =
+            sst_handles.iter().map(|h| h.path.clone()).collect();
         {
             let mut sstables = self.sstables.lock().unwrap();
             // Keep SSTables that were not part of this compaction
-            let mut new_list: Vec<PathBuf> = sstables
+            let mut new_list: Vec<Arc<SstableHandle>> = sstables
                 .iter()
-                .filter(|p| !compacted_set.contains(p))
+                .filter(|h| !compacted_paths.contains(&h.path))
                 .cloned()
                 .collect();
             // Add the new compacted SSTable
-            new_list.push(new_sst_path);
+            new_list.push(new_handle);
             // Sort by path (descending) to maintain newest-first order
-            new_list.sort_by(|a, b| b.cmp(a));
+            new_list.sort_by(|a, b| b.path.cmp(&a.path));
             *sstables = new_list;
         }
 
         // Delete old SSTable files after updating the list
-        for path in &sst_paths {
-            if let Err(e) = fs::remove_file(path) {
-                eprintln!("Failed to delete old SSTable {:?}: {}", path, e);
+        for handle in &sst_handles {
+            if let Err(e) = fs::remove_file(&handle.path) {
+                eprintln!("Failed to delete old SSTable {:?}: {}", handle.path, e);
             } else {
-                println!("Deleted old SSTable: {:?}", path);
+                println!("Deleted old SSTable: {:?}", handle.path);
                 // Invalidate cache entries for deleted file
-                self.block_cache.invalidate_file(path);
+                self.block_cache.invalidate_file(&handle.path);
             }
         }
 
         println!(
             "Compaction finished. Merged {} SSTables into 1.",
-            sst_paths.len()
+            sst_handles.len()
         );
         Ok(())
     }
@@ -379,12 +422,15 @@ impl Engine for LsmTreeEngine {
                 .ok_or_else(|| Status::not_found("Key deleted"));
         }
 
-        let sst_paths = {
+        let handles = {
             let sstables = self.sstables.lock().unwrap();
             sstables.clone()
         };
-        for path in sst_paths {
-            match sstable::search_key_cached(&path, &key, &self.block_cache) {
+        for handle in handles {
+            if !handle.bloom.contains(&key) {
+                continue;
+            }
+            match sstable::search_key_cached(&handle.path, &key, &self.block_cache) {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => return Err(Status::not_found("Key deleted")),
                 Err(e) if e.code() == tonic::Code::NotFound => continue,
@@ -792,8 +838,8 @@ mod tests {
         // Wait for all flushes to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-        let sst_paths: Vec<PathBuf> = engine.sstables.lock().unwrap().clone();
-        println!("Created {} SSTables", sst_paths.len());
+        let sst_handles: Vec<Arc<SstableHandle>> = engine.sstables.lock().unwrap().clone();
+        println!("Created {} SSTables", sst_handles.len());
 
         // Phase 2: Compare cached vs non-cached reads directly on SSTable
         println!("\n--- Direct SSTable Read Comparison ---");
@@ -805,31 +851,31 @@ mod tests {
         let iterations = 1000;
         let start = Instant::now();
         for _ in 0..iterations {
-            for path in &sst_paths {
-                let _ = sstable::search_key(path, test_key);
+            for handle in &sst_handles {
+                let _ = sstable::search_key(&handle.path, test_key);
             }
         }
         let no_cache_duration = start.elapsed();
         println!(
             "Without cache: {} SSTable searches in {:?} ({:.2}/sec)",
-            iterations * sst_paths.len(),
+            iterations * sst_handles.len(),
             no_cache_duration,
-            (iterations * sst_paths.len()) as f64 / no_cache_duration.as_secs_f64()
+            (iterations * sst_handles.len()) as f64 / no_cache_duration.as_secs_f64()
         );
 
         // Cached reads (using search_key_cached)
         let start = Instant::now();
         for _ in 0..iterations {
-            for path in &sst_paths {
-                let _ = sstable::search_key_cached(path, test_key, &engine.block_cache);
+            for handle in &sst_handles {
+                let _ = sstable::search_key_cached(&handle.path, test_key, &engine.block_cache);
             }
         }
         let cache_duration = start.elapsed();
         println!(
             "With cache:    {} SSTable searches in {:?} ({:.2}/sec)",
-            iterations * sst_paths.len(),
+            iterations * sst_handles.len(),
             cache_duration,
-            (iterations * sst_paths.len()) as f64 / cache_duration.as_secs_f64()
+            (iterations * sst_handles.len()) as f64 / cache_duration.as_secs_f64()
         );
 
         let stats = engine.block_cache.stats();

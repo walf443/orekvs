@@ -393,6 +393,92 @@ fn search_in_block(block_data: &[u8], key: &str) -> Result<Option<String>, Statu
     Err(Status::not_found("Key not found in SSTable"))
 }
 
+/// Read only keys from an SSTable file
+#[allow(clippy::result_large_err)]
+pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Status::internal(e.to_string())),
+    };
+
+    // Read magic and version
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    if &header[0..6] != MAGIC_BYTES {
+        return Err(Status::internal("Invalid SSTable magic"));
+    }
+
+    let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
+    if version != 3 {
+        return Err(Status::internal(format!("Unsupported SSTable version: {}", version)));
+    }
+
+    let file_len = file.metadata().map_err(|e| Status::internal(e.to_string()))?.len();
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
+        return Ok(Vec::new());
+    }
+
+    // Read footer for index offset
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut index_offset_bytes = [0u8; 8];
+    file.read_exact(&mut index_offset_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let end_offset = u64::from_le_bytes(index_offset_bytes);
+
+    file.seek(SeekFrom::Start(HEADER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut keys = Vec::new();
+
+    loop {
+        if file.stream_position().map_err(|e| Status::internal(e.to_string()))? >= end_offset {
+            break;
+        }
+
+        let mut len_bytes = [0u8; 4];
+        if file.read_exact(&mut len_bytes).is_err() {
+            break;
+        }
+        let len = u32::from_le_bytes(len_bytes);
+
+        let mut compressed_block = vec![0u8; len as usize];
+        file.read_exact(&mut compressed_block)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
+            .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
+
+        let mut cursor = Cursor::new(decompressed);
+        loop {
+            if cursor.position() == cursor.get_ref().len() as u64 {
+                break;
+            }
+
+            // Skip timestamp (8) + read klen (8) + vlen (8)
+            cursor.seek(SeekFrom::Current(8)).map_err(|e| Status::internal(e.to_string()))?;
+            
+            let mut lengths = [0u8; 16];
+            cursor.read_exact(&mut lengths).map_err(|e| Status::internal(e.to_string()))?;
+            let key_len = u64::from_le_bytes(lengths[0..8].try_into().unwrap());
+            let val_len = u64::from_le_bytes(lengths[8..16].try_into().unwrap());
+
+            let mut key_buf = vec![0u8; key_len as usize];
+            cursor.read_exact(&mut key_buf).map_err(|e| Status::internal(e.to_string()))?;
+            keys.push(String::from_utf8_lossy(&key_buf).to_string());
+
+            if val_len != u64::MAX {
+                cursor.seek(SeekFrom::Current(val_len as i64)).map_err(|e| Status::internal(e.to_string()))?;
+            }
+        }
+    }
+
+    Ok(keys)
+}
+
 /// Read all entries from an SSTable file
 #[allow(clippy::result_large_err)]
 pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
