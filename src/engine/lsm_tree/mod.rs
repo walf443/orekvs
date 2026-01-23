@@ -404,14 +404,12 @@ impl Engine for LsmTreeEngine {
         let key_clone = key.clone();
         let val_clone = new_val_opt.clone();
         let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(wal.append_pipelined(&key_clone, &val_clone))
+            tokio::runtime::Handle::current().block_on(wal.append_pipelined(&key_clone, &val_clone))
         })?;
 
         // 2. Wait for WAL to be written to OS buffer
-        let _ = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(written_rx)
-        });
+        let _ =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
 
         // 3. Update MemTable immediately (it becomes visible to Get)
         self.mem_state.insert(key, new_val_opt);
@@ -460,9 +458,8 @@ impl Engine for LsmTreeEngine {
         })?;
 
         // 2. Wait for WAL to be written to OS buffer
-        let _ = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(written_rx)
-        });
+        let _ =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
 
         // 3. Update MemTable
         self.mem_state.insert(key, None);
@@ -827,8 +824,9 @@ mod tests {
     }
 
     /// Benchmark test to measure block cache effectiveness
-    /// Run with: cargo test bench_block_cache --release -- --nocapture
+    /// Run with: cargo test bench_block_cache --release -- --nocapture --ignored
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // This is a benchmark, not a unit test - run explicitly when needed
     async fn bench_block_cache_effectiveness() {
         use std::time::Instant;
 
