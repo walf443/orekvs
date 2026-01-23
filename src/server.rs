@@ -128,6 +128,10 @@ impl Engine for LsmTreeEngineWrapper {
     fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
         self.0.batch_set(items)
     }
+
+    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
+        self.0.batch_get(keys)
+    }
 }
 
 #[tonic::async_trait]
@@ -177,13 +181,11 @@ impl KeyValue for MyKeyValue {
         request: Request<BatchGetRequest>,
     ) -> Result<Response<BatchGetResponse>, Status> {
         let req = request.into_inner();
-        let mut items = Vec::with_capacity(req.keys.len());
-
-        for key in req.keys {
-            if let Ok(value) = self.engine.get(key.clone()) {
-                items.push(KeyValuePair { key, value });
-            }
-        }
+        let results = self.engine.batch_get(req.keys);
+        let items = results
+            .into_iter()
+            .map(|(key, value)| KeyValuePair { key, value })
+            .collect();
 
         Ok(Response::new(BatchGetResponse { items }))
     }

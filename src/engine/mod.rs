@@ -21,4 +21,13 @@ pub trait Engine: Send + Sync + 'static {
         }
         Ok(count)
     }
+
+    /// Batch get multiple keys.
+    /// Default implementation calls get() for each key.
+    /// Engines can override this for optimized batch processing.
+    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
+        keys.into_iter()
+            .filter_map(|key| self.get(key.clone()).ok().map(|value| (key, value)))
+            .collect()
+    }
 }

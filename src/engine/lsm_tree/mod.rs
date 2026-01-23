@@ -511,6 +511,69 @@ impl Engine for LsmTreeEngine {
 
         Ok(count)
     }
+
+    fn batch_get(&self, mut keys: Vec<String>) -> Vec<(String, String)> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort keys for better cache locality
+        keys.sort();
+
+        let mut results = Vec::with_capacity(keys.len());
+
+        // First pass: check MemTable for all keys (fast, in-memory)
+        let mut remaining_keys = Vec::new();
+        for key in keys {
+            if let Some(val_opt) = self.mem_state.get(&key) {
+                if let Some(value) = val_opt {
+                    results.push((key, value));
+                }
+                // If val_opt is None, it's a tombstone - skip
+            } else {
+                remaining_keys.push(key);
+            }
+        }
+
+        // Second pass: check SSTables for remaining keys
+        if !remaining_keys.is_empty() {
+            let handles = {
+                let sstables = self.sstables.lock().unwrap();
+                sstables.clone()
+            };
+
+            for key in remaining_keys {
+                // Check each SSTable (newest first)
+                for handle in &handles {
+                    // Skip if bloom filter says key is definitely not present
+                    if !handle.bloom.contains(&key) {
+                        continue;
+                    }
+
+                    match sstable::search_key_cached(&handle.path, &key, &self.block_cache) {
+                        Ok(Some(v)) => {
+                            results.push((key.clone(), v));
+                            break;
+                        }
+                        Ok(None) => {
+                            // Tombstone found - key is deleted
+                            break;
+                        }
+                        Err(e) if e.code() == tonic::Code::NotFound => {
+                            // Key not in this SSTable, continue to next
+                            continue;
+                        }
+                        Err(_) => {
+                            // Error reading SSTable, skip this key
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
 }
 
 #[cfg(test)]
@@ -860,6 +923,81 @@ mod tests {
 
         // Still should not find k1 (SSTable has v1, but newer SSTable has tombstone)
         assert!(engine.get("k1".to_string()).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_get_basic() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+        // Set some values
+        engine.set("a".to_string(), "va".to_string()).unwrap();
+        engine.set("b".to_string(), "vb".to_string()).unwrap();
+        engine.set("c".to_string(), "vc".to_string()).unwrap();
+
+        // batch_get with existing and non-existing keys
+        let keys = vec![
+            "c".to_string(),
+            "a".to_string(),
+            "nonexistent".to_string(),
+            "b".to_string(),
+        ];
+        let results = engine.batch_get(keys);
+
+        // Should return 3 results (excluding nonexistent)
+        assert_eq!(results.len(), 3);
+
+        // Results should be returned (order may vary due to sorting)
+        let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
+        assert_eq!(result_map.get("a"), Some(&"va".to_string()));
+        assert_eq!(result_map.get("b"), Some(&"vb".to_string()));
+        assert_eq!(result_map.get("c"), Some(&"vc".to_string()));
+        assert_eq!(result_map.get("nonexistent"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_get_with_tombstone() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+        engine.set("a".to_string(), "va".to_string()).unwrap();
+        engine.set("b".to_string(), "vb".to_string()).unwrap();
+        engine.delete("a".to_string()).unwrap();
+
+        let keys = vec!["a".to_string(), "b".to_string()];
+        let results = engine.batch_get(keys);
+
+        // Should return only "b" (a is deleted)
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ("b".to_string(), "vb".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_get_from_sstable() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        // Small memtable to force flush to SSTable
+        let engine = LsmTreeEngine::new(data_dir, 50, 100);
+
+        // Insert data that will be flushed to SSTable
+        engine
+            .set("key1".to_string(), "value1".to_string())
+            .unwrap();
+        engine
+            .set("key2".to_string(), "value2".to_string())
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // batch_get should find keys in SSTable
+        let keys = vec!["key2".to_string(), "key1".to_string(), "key3".to_string()];
+        let results = engine.batch_get(keys);
+
+        assert_eq!(results.len(), 2);
+        let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
+        assert_eq!(result_map.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(result_map.get("key2"), Some(&"value2".to_string()));
     }
 
     /// Benchmark test to measure block cache effectiveness
