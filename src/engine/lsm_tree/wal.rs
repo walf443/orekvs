@@ -13,11 +13,14 @@ use super::memtable::MemTable;
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 const WAL_VERSION: u32 = 1;
 
-/// Write request for group commit
+/// Write request for group commit with pipelining
 struct WriteRequest {
     key: String,
     value: Option<String>,
-    response: oneshot::Sender<Result<(), Status>>,
+    /// Notified when data is written to OS buffer
+    written_tx: Option<oneshot::Sender<()>>,
+    /// Notified when data is synced to disk
+    synced_tx: oneshot::Sender<Result<(), Status>>,
 }
 
 /// Inner state for WAL file operations
@@ -187,31 +190,36 @@ impl GroupCommitWalWriter {
 
     /// Flush pending writes and notify all waiting requests
     fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<WriteRequest>) {
-        let result = Self::flush_batch(inner, pending);
-        for req in pending.drain(..) {
-            let _ = req.response.send(result.clone());
-        }
-    }
-
-    /// Write all pending entries to WAL and sync once
-    #[allow(clippy::result_large_err)]
-    fn flush_batch(
-        inner: &Arc<Mutex<WalWriterInner>>,
-        requests: &[WriteRequest],
-    ) -> Result<(), Status> {
         let mut guard = inner.lock().unwrap();
 
-        for req in requests {
-            Self::write_entry_to_file(&mut guard.writer, &req.key, &req.value)?;
+        // Stage 1: Write all to OS buffer and notify "written"
+        for req in pending.iter() {
+            if let Err(e) = Self::write_entry_to_file(&mut guard.writer, &req.key, &req.value) {
+                // If write fails, notify all about the error and return
+                for r in pending.drain(..) {
+                    let _ = r.synced_tx.send(Err(e.clone()));
+                }
+                return;
+            }
         }
 
-        // Single sync_all for all entries
-        guard
+        // Notify all that writes are in OS buffer
+        for req in pending.iter_mut() {
+            if let Some(tx) = req.written_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+
+        // Stage 2: Sync to disk
+        let sync_result = guard
             .writer
             .sync_all()
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| Status::internal(e.to_string()));
 
-        Ok(())
+        // Stage 3: Notify "synced"
+        for req in pending.drain(..) {
+            let _ = req.synced_tx.send(sync_result.clone());
+        }
     }
 
     /// Write a single entry to the file (without sync)
@@ -254,17 +262,23 @@ impl GroupCommitWalWriter {
         Ok(())
     }
 
-    /// Append an entry to the WAL asynchronously (group commit)
-    pub async fn append_async(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
-        let (tx, rx) = oneshot::channel();
+    /// Append an entry to the WAL with pipelining support.
+    /// Returns two receivers: one for when it's written to OS buffer, one for when it's synced to disk.
+    pub async fn append_pipelined(
+        &self,
+        key: &str,
+        value: &Option<String>,
+    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<Result<(), Status>>), Status> {
+        let (written_tx, written_rx) = oneshot::channel();
+        let (synced_tx, synced_rx) = oneshot::channel();
 
         let request = WriteRequest {
             key: key.to_string(),
             value: value.clone(),
-            response: tx,
+            written_tx: Some(written_tx),
+            synced_tx,
         };
 
-        // Clone the sender while holding the lock briefly
         let sender = {
             let guard = self.request_tx.lock().unwrap();
             guard
@@ -278,7 +292,16 @@ impl GroupCommitWalWriter {
             .await
             .map_err(|_| Status::internal("WAL writer channel closed"))?;
 
-        rx.await
+        Ok((written_rx, synced_rx))
+    }
+
+    /// Append an entry to the WAL asynchronously (group commit)
+    #[allow(dead_code)]
+    pub async fn append_async(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
+        let (_written_rx, synced_rx) = self.append_pipelined(key, value).await?;
+
+        synced_rx
+            .await
             .map_err(|_| Status::internal("WAL response channel closed"))?
     }
 

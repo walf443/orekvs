@@ -399,19 +399,30 @@ impl Engine for LsmTreeEngine {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
         let new_val_opt = Some(value);
 
-        // 1. Write to WAL FIRST (before MemTable) for durability
-        // Use block_in_place to allow blocking within async context (e.g., tokio runtime)
+        // 1. Start writing to WAL
         let wal = self.wal.clone();
         let key_clone = key.clone();
         let val_clone = new_val_opt.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wal.append_async(&key_clone, &val_clone))
+        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(wal.append_pipelined(&key_clone, &val_clone))
         })?;
 
-        // 2. Then update MemTable
+        // 2. Wait for WAL to be written to OS buffer
+        let _ = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(written_rx)
+        });
+
+        // 3. Update MemTable immediately (it becomes visible to Get)
         self.mem_state.insert(key, new_val_opt);
         self.trigger_flush_if_needed();
-        Ok(())
+
+        // 4. Finally wait for disk sync for durability
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(synced_rx)
+                .map_err(|_| Status::internal("WAL synced channel closed"))?
+        })
     }
 
     fn get(&self, key: String) -> Result<String, Status> {
@@ -441,18 +452,28 @@ impl Engine for LsmTreeEngine {
     }
 
     fn delete(&self, key: String) -> Result<(), Status> {
-        // 1. Write tombstone to WAL FIRST
-        // Use block_in_place to allow blocking within async context
+        // 1. Start writing tombstone to WAL
         let wal = self.wal.clone();
         let key_clone = key.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wal.append_async(&key_clone, &None))
+        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(wal.append_pipelined(&key_clone, &None))
         })?;
 
-        // 2. Then update MemTable
+        // 2. Wait for WAL to be written to OS buffer
+        let _ = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(written_rx)
+        });
+
+        // 3. Update MemTable
         self.mem_state.insert(key, None);
         self.trigger_flush_if_needed();
-        Ok(())
+
+        // 4. Wait for disk sync
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(synced_rx)
+                .map_err(|_| Status::internal("WAL synced channel closed"))?
+        })
     }
 }
 
