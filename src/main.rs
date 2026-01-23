@@ -373,7 +373,7 @@ async fn run_test_batch_set(
     batch_size: usize,
     key_range: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let num_batches = (count + batch_size - 1) / batch_size;
+    let num_batches = count.div_ceil(batch_size);
     println!(
         "Batch setting {} key-value pairs (range 1..={}) in {} batches of {} to {}...",
         count, key_range, num_batches, batch_size, addr
@@ -433,7 +433,7 @@ async fn run_test_batch_get(
     key_range: u32,
     duplicate_rate: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let num_batches = (count + batch_size - 1) / batch_size;
+    let num_batches = count.div_ceil(batch_size);
     println!(
         "Batch getting {} keys (range 1..={}, duplicate_rate={:.0}%) in {} batches of {} from {}...",
         count,

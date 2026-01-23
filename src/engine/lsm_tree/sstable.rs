@@ -7,15 +7,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
 use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry, ParsedBlockEntry};
+use super::bloom::BloomFilter;
 use super::memtable::MemTable;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 3;
+pub const DATA_VERSION: u32 = 4;
 
 // Header size: 6 bytes magic + 4 bytes version
 pub const HEADER_SIZE: u64 = 10;
-// Footer size: 8 bytes (index offset)
-pub const FOOTER_SIZE: u64 = 8;
+// Footer size for V4: index_offset(8) + bloom_offset(8) + footer_magic(8)
+pub const FOOTER_SIZE_V4: u64 = 24;
+// Footer size for V3 (legacy): index_offset(8)
+pub const FOOTER_SIZE_V3: u64 = 8;
+// Footer magic bytes
+pub const FOOTER_MAGIC: u64 = 0x4F52454C534D4654; // "ORELSMFT" in hex
 // Target block size for compression (bytes)
 pub const BLOCK_SIZE: usize = 4096;
 
@@ -75,29 +80,44 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 {
+    if version != 3 && version != 4 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only version 3 is supported.",
+            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
             version
         )));
     }
 
-    // V3: Block Compression + Compressed Index
     let file_len = file
         .metadata()
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+
+    let footer_size = if version == 4 {
+        FOOTER_SIZE_V4
+    } else {
+        FOOTER_SIZE_V3
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Err(Status::internal("SSTable file too small"));
     }
 
-    // Read footer
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let mut index_offset_bytes = [0u8; 8];
-    file.read_exact(&mut index_offset_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let index_offset = u64::from_le_bytes(index_offset_bytes);
+    // Read footer to get index offset
+    let index_offset = if version == 4 {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut footer = [0u8; 24];
+        file.read_exact(&mut footer)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(footer[0..8].try_into().unwrap())
+    } else {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut index_offset_bytes = [0u8; 8];
+        file.read_exact(&mut index_offset_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(index_offset_bytes)
+    };
 
     // Read index
     let index = read_index_compressed(&mut file, index_offset)?;
@@ -255,9 +275,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 {
+    if version != 3 && version != 4 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only version 3 is supported.",
+            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
             version
         )));
     }
@@ -266,17 +286,33 @@ fn get_or_load_index(
         .metadata()
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+
+    let footer_size = if version == 4 {
+        FOOTER_SIZE_V4
+    } else {
+        FOOTER_SIZE_V3
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Err(Status::internal("SSTable file too small"));
     }
 
     // Read footer to get index offset
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let mut index_offset_bytes = [0u8; 8];
-    file.read_exact(&mut index_offset_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let index_offset = u64::from_le_bytes(index_offset_bytes);
+    let index_offset = if version == 4 {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut footer = [0u8; 24];
+        file.read_exact(&mut footer)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(footer[0..8].try_into().unwrap())
+    } else {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut index_offset_bytes = [0u8; 8];
+        file.read_exact(&mut index_offset_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(index_offset_bytes)
+    };
 
     // Read and decompress index
     let index = read_index_compressed(&mut file, index_offset)?;
@@ -488,9 +524,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if version != 3 {
+    if version != 3 && version != 4 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}",
+            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
             version
         )));
     }
@@ -499,17 +535,33 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
         .metadata()
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+
+    let footer_size = if version == 4 {
+        FOOTER_SIZE_V4
+    } else {
+        FOOTER_SIZE_V3
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Ok(Vec::new());
     }
 
-    // Read footer for index offset
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let mut index_offset_bytes = [0u8; 8];
-    file.read_exact(&mut index_offset_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let end_offset = u64::from_le_bytes(index_offset_bytes);
+    // Read footer to get index offset (marks end of data blocks)
+    let end_offset = if version == 4 {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut footer = [0u8; 24];
+        file.read_exact(&mut footer)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(footer[0..8].try_into().unwrap())
+    } else {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut index_offset_bytes = [0u8; 8];
+        file.read_exact(&mut index_offset_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(index_offset_bytes)
+    };
 
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -597,9 +649,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 {
+    if version != 3 && version != 4 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only version 3 is supported.",
+            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
             version
         )));
     }
@@ -608,16 +660,33 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .metadata()
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+
+    let footer_size = if version == 4 {
+        FOOTER_SIZE_V4
+    } else {
+        FOOTER_SIZE_V3
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Ok(BTreeMap::new()); // Corrupt or empty?
     }
-    // Read footer
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let mut index_offset_bytes = [0u8; 8];
-    file.read_exact(&mut index_offset_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let end_offset = u64::from_le_bytes(index_offset_bytes);
+
+    // Read footer to get index offset (which marks end of data blocks)
+    let end_offset = if version == 4 {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut footer = [0u8; 24];
+        file.read_exact(&mut footer)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(footer[0..8].try_into().unwrap())
+    } else {
+        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut index_offset_bytes = [0u8; 8];
+        file.read_exact(&mut index_offset_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        u64::from_le_bytes(index_offset_bytes)
+    };
 
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -698,7 +767,7 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
 
 /// Write a MemTable to an SSTable file
 #[allow(clippy::result_large_err)]
-pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Status> {
+pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFilter, Status> {
     // Write to a temporary file first, then rename for atomic operation
     let tmp_path = path.with_extension("data.tmp");
 
@@ -715,6 +784,12 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&DATA_VERSION.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Build Bloom filter from keys
+    let mut bloom = BloomFilter::new(memtable.len().max(1), 0.01);
+    for key in memtable.keys() {
+        bloom.insert(key);
+    }
 
     let mut current_offset = HEADER_SIZE;
     let mut index: Vec<(String, u64)> = Vec::new();
@@ -765,10 +840,24 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
 
     // Write index
     let index_offset = current_offset;
-    write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    current_offset += index_size;
 
-    // Write footer
+    // Write Bloom filter
+    let bloom_offset = current_offset;
+    let bloom_data = bloom.serialize();
+    let bloom_len = bloom_data.len() as u64;
+    file.write_all(&bloom_len.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&bloom_data)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write V4 footer: index_offset + bloom_offset + magic
     file.write_all(&index_offset.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&bloom_offset.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&FOOTER_MAGIC.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
     file.flush().map_err(|e| Status::internal(e.to_string()))?;
@@ -779,7 +868,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
     std::fs::rename(&tmp_path, path)
         .map_err(|e| Status::internal(format!("Failed to rename SSTable: {}", e)))?;
 
-    Ok(())
+    Ok(bloom)
 }
 
 /// Write timestamped entries to an SSTable file (used for compaction)
@@ -787,7 +876,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
 pub fn write_timestamped_entries(
     path: &Path,
     entries: &BTreeMap<String, TimestampedEntry>,
-) -> Result<(), Status> {
+) -> Result<BloomFilter, Status> {
     // Write to a temporary file first, then rename for atomic operation
     let tmp_path = path.with_extension("data.tmp");
 
@@ -804,6 +893,12 @@ pub fn write_timestamped_entries(
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&DATA_VERSION.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Build Bloom filter from keys
+    let mut bloom = BloomFilter::new(entries.len().max(1), 0.01);
+    for key in entries.keys() {
+        bloom.insert(key);
+    }
 
     let mut current_offset = HEADER_SIZE;
     let mut index: Vec<(String, u64)> = Vec::new();
@@ -854,10 +949,24 @@ pub fn write_timestamped_entries(
 
     // Write index
     let index_offset = current_offset;
-    write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    current_offset += index_size;
 
-    // Write footer
+    // Write Bloom filter
+    let bloom_offset = current_offset;
+    let bloom_data = bloom.serialize();
+    let bloom_len = bloom_data.len() as u64;
+    file.write_all(&bloom_len.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&bloom_data)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write V4 footer: index_offset + bloom_offset + magic
     file.write_all(&index_offset.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&bloom_offset.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&FOOTER_MAGIC.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
     file.flush().map_err(|e| Status::internal(e.to_string()))?;
@@ -868,7 +977,7 @@ pub fn write_timestamped_entries(
     std::fs::rename(&tmp_path, path)
         .map_err(|e| Status::internal(format!("Failed to rename SSTable: {}", e)))?;
 
-    Ok(())
+    Ok(bloom)
 }
 
 /// Write a single entry to a writer
@@ -940,12 +1049,85 @@ pub fn generate_path(data_dir: &Path, sst_id: u64, wal_id: u64) -> PathBuf {
     data_dir.join(generate_filename(sst_id, wal_id))
 }
 
+/// Read Bloom filter from SSTable file (V4 format)
+/// Returns None for V3 format (Bloom filter not embedded)
+#[allow(clippy::result_large_err)]
+pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => return Err(Status::internal(e.to_string())),
+    };
+
+    // Read and verify header
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    if &header[0..6] != MAGIC_BYTES {
+        return Err(Status::internal("Invalid SSTable magic"));
+    }
+
+    let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
+
+    if version < 4 {
+        // V3 or earlier: no embedded Bloom filter
+        return Ok(None);
+    }
+
+    let file_len = file
+        .metadata()
+        .map_err(|e| Status::internal(e.to_string()))?
+        .len();
+
+    if file_len < HEADER_SIZE + FOOTER_SIZE_V4 {
+        return Err(Status::internal("SSTable file too small for V4 format"));
+    }
+
+    // Read footer
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut footer = [0u8; 24];
+    file.read_exact(&mut footer)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let _index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+    let footer_magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+
+    if footer_magic != FOOTER_MAGIC {
+        return Err(Status::internal("Invalid footer magic"));
+    }
+
+    // Read Bloom filter
+    file.seek(SeekFrom::Start(bloom_offset))
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Read bloom filter size
+    let mut size_bytes = [0u8; 8];
+    file.read_exact(&mut size_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let bloom_size = u64::from_le_bytes(size_bytes) as usize;
+
+    // Read bloom filter data
+    let mut bloom_data = vec![0u8; bloom_size];
+    file.read_exact(&mut bloom_data)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    BloomFilter::deserialize(&bloom_data)
+        .map(Some)
+        .ok_or_else(|| Status::internal("Failed to deserialize Bloom filter"))
+}
+
 #[allow(clippy::result_large_err)]
 fn write_index_compressed(
     file: &mut File,
     index: &[(String, u64)],
     compression_level: i32,
-) -> Result<(), Status> {
+) -> Result<u64, Status> {
     let mut buffer = Vec::new();
     let num_entries = index.len() as u64;
     buffer
@@ -977,7 +1159,8 @@ fn write_index_compressed(
     file.write_all(&compressed)
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    Ok(())
+    // Return total bytes written: 8 (size) + len (compressed data)
+    Ok(8 + len)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1141,6 +1324,33 @@ mod tests {
     }
 
     #[test]
+    fn test_read_bloom_filter_v4() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_bloom_v4.data");
+
+        let mut memtable = BTreeMap::new();
+        memtable.insert("apple".to_string(), Some("red".to_string()));
+        memtable.insert("banana".to_string(), Some("yellow".to_string()));
+        memtable.insert("cherry".to_string(), Some("red".to_string()));
+
+        // This creates a V4 SSTable with embedded Bloom filter
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Read the Bloom filter from the SSTable
+        let bloom = read_bloom_filter(&sst_path)
+            .expect("should read successfully")
+            .expect("should have Bloom filter (V4)");
+
+        // Verify the Bloom filter contains the keys
+        assert!(bloom.contains("apple"));
+        assert!(bloom.contains("banana"));
+        assert!(bloom.contains("cherry"));
+        // Keys not in the SSTable should (likely) not match
+        // Note: false positives are possible, but unlikely for small sets
+        assert!(!bloom.contains("grape"));
+    }
+
+    #[test]
     fn test_invalid_version() {
         let dir = tempdir().unwrap();
         let sst_path = dir.path().join("invalid_version.data");
@@ -1221,12 +1431,14 @@ mod tests {
         memtable.insert("key1".to_string(), Some("value1".to_string()));
         create_from_memtable(&sst_path, &memtable).unwrap();
 
-        // Corrupt the index offset in the footer
+        // Corrupt the index offset in the footer (V4 format)
+        // Footer layout: index_offset(8) + bloom_offset(8) + footer_magic(8)
+        // index_offset is at offset len - 24
         let mut data = std::fs::read(&sst_path).unwrap();
         let len = data.len();
-        if len > 8 {
+        if len > 24 {
             // Change the index offset to something invalid
-            data[len - 4] ^= 0xFF;
+            data[len - 24] ^= 0xFF;
         }
         std::fs::write(&sst_path, data).unwrap();
 

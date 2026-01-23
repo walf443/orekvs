@@ -136,11 +136,20 @@ impl LsmTreeEngine {
         // Build SstableHandles with Bloom filters for existing SSTables
         let mut sst_handles = Vec::new();
         for p in &sst_files {
-            let keys = sstable::read_keys(p).expect("Failed to read SSTable keys for Bloom filter");
-            let mut bloom = BloomFilter::new(keys.len(), 0.01);
-            for key in &keys {
-                bloom.insert(key);
-            }
+            // Try to read embedded Bloom filter (V4 format), fall back to building from keys
+            let bloom = match sstable::read_bloom_filter(p) {
+                Ok(Some(bf)) => bf,
+                Ok(None) | Err(_) => {
+                    // V3 format or error: build Bloom filter from keys
+                    let keys = sstable::read_keys(p)
+                        .expect("Failed to read SSTable keys for Bloom filter");
+                    let mut bf = BloomFilter::new(keys.len().max(1), 0.01);
+                    for key in &keys {
+                        bf.insert(key);
+                    }
+                    bf
+                }
+            };
             sst_handles.push(Arc::new(SstableHandle {
                 path: p.clone(),
                 bloom,
@@ -238,13 +247,9 @@ impl LsmTreeEngine {
 
         println!("Flushing MemTable to {:?}...", sst_path);
 
-        sstable::create_from_memtable(&sst_path, &memtable)?;
+        // create_from_memtable returns the embedded Bloom filter
+        let bloom = sstable::create_from_memtable(&sst_path, &memtable)?;
 
-        // Build Bloom filter for the new SSTable
-        let mut bloom = BloomFilter::new(memtable.len(), 0.01);
-        for key in memtable.keys() {
-            bloom.insert(key);
-        }
         let handle = Arc::new(SstableHandle {
             path: sst_path,
             bloom,
@@ -346,13 +351,9 @@ impl LsmTreeEngine {
 
         println!("Writing compacted SSTable to {:?}...", new_sst_path);
 
-        sstable::write_timestamped_entries(&new_sst_path, &merged)?;
+        // write_timestamped_entries returns the embedded Bloom filter
+        let bloom = sstable::write_timestamped_entries(&new_sst_path, &merged)?;
 
-        // Build Bloom filter for the compacted SSTable
-        let mut bloom = BloomFilter::new(merged.len(), 0.01);
-        for key in merged.keys() {
-            bloom.insert(key);
-        }
         let new_handle = Arc::new(SstableHandle {
             path: new_sst_path.clone(),
             bloom,
@@ -1121,5 +1122,100 @@ mod tests {
         println!("\n=== Results ===");
         println!("Cache speedup: {:.2}x faster with block cache", improvement);
         println!("================================\n");
+    }
+
+    /// Benchmark test to measure Bloom filter loading improvement
+    /// Run with: cargo test bench_bloom_loading --release -- --nocapture --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_bloom_loading() {
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        println!("\n=== Bloom Filter Loading Benchmark ===");
+        println!("Creating test data...");
+
+        // Create engine and populate with data to create multiple SSTables
+        {
+            let engine = LsmTreeEngine::new(data_dir.clone(), 50 * 1024, 100);
+
+            // Write enough data to create multiple SSTables
+            for i in 0..10000 {
+                engine
+                    .set(format!("key{:06}", i), format!("value{:06}", i))
+                    .unwrap();
+            }
+
+            // Force flush
+            for i in 0..50 {
+                engine
+                    .set(format!("flush{:05}", i), "x".repeat(2000))
+                    .unwrap();
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            engine.shutdown().await;
+        }
+
+        // Count SSTable files
+        let sst_files: Vec<_> = fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|s| s.starts_with("sst_") && s.ends_with(".data"))
+            })
+            .map(|e| e.path())
+            .collect();
+
+        println!("Created {} SSTables", sst_files.len());
+
+        // Benchmark V4 (read_bloom_filter)
+        let iterations = 10;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for path in &sst_files {
+                let _ = sstable::read_bloom_filter(path);
+            }
+        }
+        let v4_duration = start.elapsed();
+
+        // Benchmark V3 style (read_keys + build bloom)
+        let start = Instant::now();
+        for _ in 0..iterations {
+            for path in &sst_files {
+                let keys = sstable::read_keys(path).unwrap();
+                let mut bloom = BloomFilter::new(keys.len().max(1), 0.01);
+                for key in &keys {
+                    bloom.insert(key);
+                }
+            }
+        }
+        let v3_duration = start.elapsed();
+
+        println!(
+            "\n=== Results ({} iterations x {} SSTables) ===",
+            iterations,
+            sst_files.len()
+        );
+        println!(
+            "V4 (read_bloom_filter):   {:?} ({:.2} ms/SSTable)",
+            v4_duration,
+            v4_duration.as_secs_f64() * 1000.0 / (iterations * sst_files.len()) as f64
+        );
+        println!(
+            "V3 (read_keys + build):   {:?} ({:.2} ms/SSTable)",
+            v3_duration,
+            v3_duration.as_secs_f64() * 1000.0 / (iterations * sst_files.len()) as f64
+        );
+        println!(
+            "Speedup: {:.2}x faster with embedded Bloom filter",
+            v3_duration.as_secs_f64() / v4_duration.as_secs_f64()
+        );
+        println!("=====================================\n");
     }
 }
