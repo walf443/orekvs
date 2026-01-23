@@ -210,10 +210,10 @@ impl GroupCommitWalWriter {
             }
         }
 
-        // Stage 2: Sync to disk
+        // Stage 2: Sync data to disk (fdatasync - skips metadata sync for better performance)
         let sync_result = guard
             .writer
-            .sync_all()
+            .sync_data()
             .map_err(|e| Status::internal(e.to_string()));
 
         // Stage 3: Notify "synced"
@@ -316,7 +316,7 @@ impl GroupCommitWalWriter {
 
         guard
             .writer
-            .sync_all()
+            .sync_data()
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(())
@@ -332,10 +332,10 @@ impl GroupCommitWalWriter {
         {
             let mut guard = self.inner.lock().unwrap();
 
-            // Ensure old WAL is synced
+            // Ensure old WAL data is synced
             guard
                 .writer
-                .sync_all()
+                .sync_data()
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             guard.writer = new_file;

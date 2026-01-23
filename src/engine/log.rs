@@ -289,7 +289,7 @@ impl LogEngine {
             new_index.insert(key.clone(), (value_offset, length));
         }
 
-        if let Err(e) = new_file.sync_all() {
+        if let Err(e) = new_file.sync_data() {
             self.is_compacting.store(false, Ordering::SeqCst);
             return Err(Status::internal(e.to_string()));
         }
@@ -356,7 +356,7 @@ impl Engine for LogEngine {
                 .write_all(val_bytes)
                 .map_err(|e| Status::internal(e.to_string()))?;
             writer
-                .sync_all()
+                .sync_data()
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             // Calculate where the value starts:
@@ -454,7 +454,7 @@ impl Engine for LogEngine {
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             writer
-                .sync_all()
+                .sync_data()
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             let mut index = self.index.lock().unwrap();

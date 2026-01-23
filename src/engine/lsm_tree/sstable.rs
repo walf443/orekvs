@@ -772,7 +772,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<(), Stat
         .map_err(|e| Status::internal(e.to_string()))?;
 
     file.flush().map_err(|e| Status::internal(e.to_string()))?;
-    file.sync_all()
+    file.sync_data()
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Atomically rename tmp file to final path
@@ -861,7 +861,7 @@ pub fn write_timestamped_entries(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     file.flush().map_err(|e| Status::internal(e.to_string()))?;
-    file.sync_all()
+    file.sync_data()
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Atomically rename tmp file to final path
