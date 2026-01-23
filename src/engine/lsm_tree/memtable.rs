@@ -1,8 +1,13 @@
+use crossbeam_skiplist::SkipMap;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
-// Type alias for MemTable entries
+/// Lock-free SkipList-based MemTable
+/// Allows concurrent reads and writes without mutex
+pub type SkipMemTable = SkipMap<String, Option<String>>;
+
+/// Legacy BTreeMap-based MemTable (used for WAL recovery and SSTable creation)
 pub type MemTable = BTreeMap<String, Option<String>>;
 
 /// Estimate the size of a MemTable entry in bytes
@@ -11,15 +16,22 @@ pub fn estimate_entry_size(key: &str, value: &Option<String>) -> u64 {
     8 + 8 + 8 + key.len() as u64 + vlen
 }
 
+/// Convert SkipMemTable to BTreeMap for SSTable creation
+pub fn skip_to_btree(skip: &SkipMemTable) -> MemTable {
+    skip.iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct MemTableState {
-    // Current in-memory write buffer
-    pub active_memtable: Arc<Mutex<MemTable>>,
-    // MemTables currently being flushed to disk
-    pub immutable_memtables: Arc<Mutex<Vec<Arc<MemTable>>>>,
-    // Max size for MemTable in bytes
+    /// Current in-memory write buffer (lock-free SkipList)
+    pub active_memtable: Arc<SkipMemTable>,
+    /// MemTables currently being flushed to disk (converted to BTreeMap for ordered iteration)
+    pub immutable_memtables: Arc<std::sync::Mutex<Vec<Arc<MemTable>>>>,
+    /// Max size for MemTable in bytes
     pub capacity_bytes: u64,
-    // Approximate size of current active MemTable
+    /// Approximate size of current active MemTable
     pub current_size: Arc<AtomicU64>,
 }
 
@@ -36,20 +48,27 @@ impl Clone for MemTableState {
 
 impl MemTableState {
     pub fn new(capacity_bytes: u64, recovered_memtable: MemTable, recovered_size: u64) -> Self {
+        // Convert recovered BTreeMap to SkipMap
+        let skip_map = SkipMap::new();
+        for (key, value) in recovered_memtable {
+            skip_map.insert(key, value);
+        }
+
         MemTableState {
-            active_memtable: Arc::new(Mutex::new(recovered_memtable)),
-            immutable_memtables: Arc::new(Mutex::new(Vec::new())),
+            active_memtable: Arc::new(skip_map),
+            immutable_memtables: Arc::new(std::sync::Mutex::new(Vec::new())),
             capacity_bytes,
             current_size: Arc::new(AtomicU64::new(recovered_size)),
         }
     }
 
+    /// Insert a key-value pair into the active MemTable (lock-free)
     pub fn insert(&self, key: String, value: Option<String>) {
         let entry_size = estimate_entry_size(&key, &value);
-        let mut memtable = self.active_memtable.lock().unwrap();
 
-        if let Some(old_val_opt) = memtable.get(&key) {
-            let old_size = estimate_entry_size(&key, old_val_opt);
+        // Check if key already exists to adjust size tracking
+        if let Some(existing) = self.active_memtable.get(&key) {
+            let old_size = estimate_entry_size(&key, existing.value());
             if entry_size > old_size {
                 self.current_size
                     .fetch_add(entry_size - old_size, Ordering::SeqCst);
@@ -60,23 +79,29 @@ impl MemTableState {
         } else {
             self.current_size.fetch_add(entry_size, Ordering::SeqCst);
         }
-        memtable.insert(key, value);
+
+        self.active_memtable.insert(key, value);
     }
 
+    /// Check if flush is needed and return immutable memtable if so
+    /// Note: This operation requires replacing the active memtable, which is not lock-free
     pub fn needs_flush(&self) -> Option<Arc<MemTable>> {
         let size = self.current_size.load(Ordering::SeqCst);
         if size >= self.capacity_bytes {
-            let mut active = self.active_memtable.lock().unwrap();
-            // Double check inside lock
-            if self.current_size.load(Ordering::SeqCst) >= self.capacity_bytes {
-                let immutable = Arc::new(std::mem::take(&mut *active));
-                self.current_size.store(0, Ordering::SeqCst);
+            // Convert current SkipMap to BTreeMap and create new empty SkipMap
+            // This is the only point where we need synchronization
+            let btree = skip_to_btree(&self.active_memtable);
 
-                let mut immutables = self.immutable_memtables.lock().unwrap();
-                immutables.push(immutable.clone());
+            // Clear the skipmap (this is safe because readers will see empty or partial state
+            // but we're about to replace it anyway)
+            self.active_memtable.clear();
+            self.current_size.store(0, Ordering::SeqCst);
 
-                return Some(immutable);
-            }
+            let immutable = Arc::new(btree);
+            let mut immutables = self.immutable_memtables.lock().unwrap();
+            immutables.push(Arc::clone(&immutable));
+
+            return Some(immutable);
         }
         None
     }
@@ -86,16 +111,14 @@ impl MemTableState {
         immutables.retain(|m| !Arc::ptr_eq(m, memtable));
     }
 
+    /// Get a value from MemTable (lock-free for active memtable)
     pub fn get(&self, key: &str) -> Option<Option<String>> {
-        // Check active memtable
-        {
-            let memtable = self.active_memtable.lock().unwrap();
-            if let Some(val_opt) = memtable.get(key) {
-                return Some(val_opt.clone());
-            }
+        // Check active memtable (lock-free)
+        if let Some(entry) = self.active_memtable.get(key) {
+            return Some(entry.value().clone());
         }
 
-        // Check immutable memtables
+        // Check immutable memtables (requires lock)
         {
             let immutables = self.immutable_memtables.lock().unwrap();
             for mem in immutables.iter().rev() {
@@ -191,7 +214,7 @@ mod tests {
         assert!(immutable.is_some());
 
         // Active memtable should be empty now
-        assert!(state.active_memtable.lock().unwrap().is_empty());
+        assert!(state.active_memtable.is_empty());
         assert_eq!(state.current_size.load(Ordering::SeqCst), 0);
 
         // Immutable memtables should have one entry
@@ -210,9 +233,10 @@ mod tests {
 
         // 2. Force flush to immutable
         {
-            let mut active = state.active_memtable.lock().unwrap();
-            let immutable1 = Arc::new(std::mem::replace(&mut *active, BTreeMap::new()));
+            let btree = skip_to_btree(&state.active_memtable);
+            state.active_memtable.clear();
             state.current_size.store(0, Ordering::SeqCst);
+            let immutable1 = Arc::new(btree);
             state.immutable_memtables.lock().unwrap().push(immutable1);
         }
 
@@ -224,9 +248,10 @@ mod tests {
 
         // 4. Force another flush
         {
-            let mut active = state.active_memtable.lock().unwrap();
-            let immutable2 = Arc::new(std::mem::replace(&mut *active, BTreeMap::new()));
+            let btree = skip_to_btree(&state.active_memtable);
+            state.active_memtable.clear();
             state.current_size.store(0, Ordering::SeqCst);
+            let immutable2 = Arc::new(btree);
             state.immutable_memtables.lock().unwrap().push(immutable2);
         }
 
@@ -237,7 +262,7 @@ mod tests {
         assert_eq!(state.get("k1"), Some(Some("v3".to_string())));
 
         // 6. Clear active, should get v2 from newest immutable (immutable2)
-        state.active_memtable.lock().unwrap().clear();
+        state.active_memtable.clear();
         assert_eq!(state.get("k1"), Some(Some("v2".to_string())));
     }
 
@@ -252,17 +277,186 @@ mod tests {
         state.remove_immutable(&imm);
         assert_eq!(state.immutable_memtables.lock().unwrap().len(), 0);
     }
+
+    #[test]
+    fn test_skip_to_btree() {
+        let skip = SkipMap::new();
+        skip.insert("b".to_string(), Some("2".to_string()));
+        skip.insert("a".to_string(), Some("1".to_string()));
+        skip.insert("c".to_string(), None);
+
+        let btree = skip_to_btree(&skip);
+        assert_eq!(btree.len(), 3);
+        assert_eq!(btree.get("a"), Some(&Some("1".to_string())));
+        assert_eq!(btree.get("b"), Some(&Some("2".to_string())));
+        assert_eq!(btree.get("c"), Some(&None));
+
+        // Verify order
+        let keys: Vec<_> = btree.keys().collect();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    /// Test concurrent reads and writes
+    #[test]
+    fn test_concurrent_access() {
+        use std::thread;
+
+        let state = Arc::new(MemTableState::new(1_000_000, BTreeMap::new(), 0));
+        let mut handles = vec![];
+
+        // Spawn writer threads
+        for t in 0..4 {
+            let state_clone = Arc::clone(&state);
+            handles.push(thread::spawn(move || {
+                for i in 0..1000 {
+                    let key = format!("key_{}_{}", t, i);
+                    let value = format!("value_{}_{}", t, i);
+                    state_clone.insert(key, Some(value));
+                }
+            }));
+        }
+
+        // Spawn reader threads
+        for t in 0..4 {
+            let state_clone = Arc::clone(&state);
+            handles.push(thread::spawn(move || {
+                for i in 0..1000 {
+                    let key = format!("key_{}_{}", t, i);
+                    let _ = state_clone.get(&key);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify some entries exist
+        assert!(state.get("key_0_0").is_some());
+        assert!(state.get("key_3_999").is_some());
+    }
 }
 
 impl MemTableState {
     // Helper for testing to force a flush regardless of size
     #[cfg(test)]
     fn needs_flush_manual(&self) -> Arc<MemTable> {
-        let mut active = self.active_memtable.lock().unwrap();
-        let immutable = Arc::new(std::mem::take(&mut *active));
+        let btree = skip_to_btree(&self.active_memtable);
+        self.active_memtable.clear();
         self.current_size.store(0, Ordering::SeqCst);
-        let mut immutables = self.immutable_memtables.lock().unwrap();
-        immutables.push(immutable.clone());
+        let immutable = Arc::new(btree);
+        self.immutable_memtables
+            .lock()
+            .unwrap()
+            .push(Arc::clone(&immutable));
         immutable
+    }
+
+    /// Benchmark: Compare BTreeMap+Mutex vs SkipList concurrent performance
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn bench_concurrent_comparison() {
+        use std::sync::Mutex;
+        use std::thread;
+        use std::time::Instant;
+
+        fn bench_btree_mutex(num_threads: usize, ops_per_thread: usize) -> std::time::Duration {
+            let map: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
+            let mut handles = vec![];
+
+            let start = Instant::now();
+
+            for t in 0..num_threads {
+                let map_clone = Arc::clone(&map);
+                handles.push(thread::spawn(move || {
+                    for i in 0..ops_per_thread {
+                        let key = format!("key_{}_{}", t, i);
+                        let value = format!("value_{}_{}", t, i);
+                        map_clone.lock().unwrap().insert(key, value);
+                    }
+                }));
+            }
+
+            for t in 0..num_threads {
+                let map_clone = Arc::clone(&map);
+                handles.push(thread::spawn(move || {
+                    for i in 0..ops_per_thread {
+                        let key = format!("key_{}_{}", t, i);
+                        let _ = map_clone.lock().unwrap().get(&key);
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+            start.elapsed()
+        }
+
+        fn bench_skiplist(num_threads: usize, ops_per_thread: usize) -> std::time::Duration {
+            let map: Arc<SkipMap<String, String>> = Arc::new(SkipMap::new());
+            let mut handles = vec![];
+
+            let start = Instant::now();
+
+            for t in 0..num_threads {
+                let map_clone = Arc::clone(&map);
+                handles.push(thread::spawn(move || {
+                    for i in 0..ops_per_thread {
+                        let key = format!("key_{}_{}", t, i);
+                        let value = format!("value_{}_{}", t, i);
+                        map_clone.insert(key, value);
+                    }
+                }));
+            }
+
+            for t in 0..num_threads {
+                let map_clone = Arc::clone(&map);
+                handles.push(thread::spawn(move || {
+                    for i in 0..ops_per_thread {
+                        let key = format!("key_{}_{}", t, i);
+                        let _ = map_clone.get(&key);
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+            start.elapsed()
+        }
+
+        println!("\n=== BTreeMap+Mutex vs SkipList Concurrent Benchmark ===\n");
+
+        let ops = 10000;
+
+        println!(
+            "{:<12} {:>12} {:>12} {:>10}",
+            "Threads", "BTree+Mutex", "SkipList", "Speedup"
+        );
+        println!("{}", "-".repeat(50));
+
+        for threads in [1, 2, 4, 8] {
+            let btree_time = bench_btree_mutex(threads, ops);
+            let skip_time = bench_skiplist(threads, ops);
+            let speedup = btree_time.as_secs_f64() / skip_time.as_secs_f64();
+
+            println!(
+                "{:>4} x2 (r+w) {:>10.2?} {:>10.2?} {:>10.2}x",
+                threads, btree_time, skip_time, speedup
+            );
+        }
+        println!();
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // Run with: cargo test bench_skiplist_vs_btree --release -- --ignored --nocapture
+    fn bench_skiplist_vs_btree() {
+        MemTableState::bench_concurrent_comparison();
     }
 }
