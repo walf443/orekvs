@@ -413,10 +413,16 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
     if version != 3 {
-        return Err(Status::internal(format!("Unsupported SSTable version: {}", version)));
+        return Err(Status::internal(format!(
+            "Unsupported SSTable version: {}",
+            version
+        )));
     }
 
-    let file_len = file.metadata().map_err(|e| Status::internal(e.to_string()))?.len();
+    let file_len = file
+        .metadata()
+        .map_err(|e| Status::internal(e.to_string()))?
+        .len();
     if file_len < HEADER_SIZE + FOOTER_SIZE {
         return Ok(Vec::new());
     }
@@ -435,7 +441,11 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     let mut keys = Vec::new();
 
     loop {
-        if file.stream_position().map_err(|e| Status::internal(e.to_string()))? >= end_offset {
+        if file
+            .stream_position()
+            .map_err(|e| Status::internal(e.to_string()))?
+            >= end_offset
+        {
             break;
         }
 
@@ -459,19 +469,27 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
             }
 
             // Skip timestamp (8) + read klen (8) + vlen (8)
-            cursor.seek(SeekFrom::Current(8)).map_err(|e| Status::internal(e.to_string()))?;
-            
+            cursor
+                .seek(SeekFrom::Current(8))
+                .map_err(|e| Status::internal(e.to_string()))?;
+
             let mut lengths = [0u8; 16];
-            cursor.read_exact(&mut lengths).map_err(|e| Status::internal(e.to_string()))?;
+            cursor
+                .read_exact(&mut lengths)
+                .map_err(|e| Status::internal(e.to_string()))?;
             let key_len = u64::from_le_bytes(lengths[0..8].try_into().unwrap());
             let val_len = u64::from_le_bytes(lengths[8..16].try_into().unwrap());
 
             let mut key_buf = vec![0u8; key_len as usize];
-            cursor.read_exact(&mut key_buf).map_err(|e| Status::internal(e.to_string()))?;
+            cursor
+                .read_exact(&mut key_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
             keys.push(String::from_utf8_lossy(&key_buf).to_string());
 
             if val_len != u64::MAX {
-                cursor.seek(SeekFrom::Current(val_len as i64)).map_err(|e| Status::internal(e.to_string()))?;
+                cursor
+                    .seek(SeekFrom::Current(val_len as i64))
+                    .map_err(|e| Status::internal(e.to_string()))?;
             }
         }
     }

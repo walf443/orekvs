@@ -67,6 +67,9 @@ enum TestCommands {
         /// Concurrency level
         #[arg(short, long, default_value_t = 1)]
         parallel: usize,
+        /// Maximum key value (1..N)
+        #[arg(long, default_value_t = 1000000)]
+        key_range: u32,
     },
     /// Get multiple random keys
     RandomGet {
@@ -75,6 +78,9 @@ enum TestCommands {
         /// Concurrency level
         #[arg(short, long, default_value_t = 1)]
         parallel: usize,
+        /// Maximum key value (1..N)
+        #[arg(long, default_value_t = 1000000)]
+        key_range: u32,
     },
     /// Set a key-value pair
     Set { key: String, value: String },
@@ -110,12 +116,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Commands::Test { addr, command } => match command {
-            TestCommands::RandomSet { count, parallel } => {
-                run_test_set(addr.clone(), *count, *parallel).await
-            }
-            TestCommands::RandomGet { count, parallel } => {
-                run_test_get(addr.clone(), *count, *parallel).await
-            }
+            TestCommands::RandomSet {
+                count,
+                parallel,
+                key_range,
+            } => run_test_set(addr.clone(), *count, *parallel, *key_range).await,
+            TestCommands::RandomGet {
+                count,
+                parallel,
+                key_range,
+            } => run_test_get(addr.clone(), *count, *parallel, *key_range).await,
             TestCommands::Set { key, value } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(SetRequest {
@@ -154,10 +164,11 @@ async fn run_test_set(
     addr: String,
     count: usize,
     parallel: usize,
+    key_range: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Generating and setting {} random key-value pairs with parallelism {} to {}...",
-        count, parallel, addr
+        "Generating and setting {} random key-value pairs (range 1..={}) with parallelism {} to {}...",
+        count, key_range, parallel, addr
     );
 
     let client = KeyValueClient::connect(addr).await?;
@@ -171,7 +182,7 @@ async fn run_test_set(
         let handle = tokio::spawn(async move {
             let (key, value) = {
                 let mut rng = thread_rng();
-                let key = rng.gen_range(1..=100).to_string();
+                let key = rng.gen_range(1..=key_range).to_string();
                 let value: String = (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
                 (key, value)
             };
@@ -234,10 +245,11 @@ async fn run_test_get(
     addr: String,
     count: usize,
     parallel: usize,
+    key_range: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Generating and getting {} random keys with parallelism {} from {}...",
-        count, parallel, addr
+        "Generating and getting {} random keys (range 1..={}) with parallelism {} from {}...",
+        count, key_range, parallel, addr
     );
 
     let client = KeyValueClient::connect(addr).await?;
@@ -251,7 +263,7 @@ async fn run_test_get(
         let handle = tokio::spawn(async move {
             let key = {
                 let mut rng = thread_rng();
-                rng.gen_range(1..=100).to_string()
+                rng.gen_range(1..=key_range).to_string()
             };
 
             let request = tonic::Request::new(GetRequest { key: key.clone() });

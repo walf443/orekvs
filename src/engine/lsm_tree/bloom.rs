@@ -14,7 +14,7 @@ impl BloomFilter {
         let n = expected_entries as f64;
         let p = false_positive_rate;
         let m = (-(n * p.ln()) / (2.0f64.ln().powi(2))).ceil() as usize;
-        
+
         // k = (m / n) * ln(2)
         let k = ((m as f64 / n) * 2.0f64.ln()).ceil() as u32;
         let k = k.clamp(1, 30); // Sanity check
