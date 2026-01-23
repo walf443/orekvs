@@ -8,6 +8,7 @@ use super::Engine;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use bloom::BloomFilter;
 use memtable::{MemTable, MemTableState};
+use rayon::prelude::*;
 use sstable::TimestampedEntry;
 use std::collections::BTreeMap;
 use std::fs;
@@ -517,12 +518,16 @@ impl Engine for LsmTreeEngine {
             return Vec::new();
         }
 
-        // Sort keys for better cache locality
+        // Sort keys for better cache locality when accessing SSTables
         keys.sort();
+        // Remove duplicates to avoid redundant lookups
+        keys.dedup();
 
         let mut results = Vec::with_capacity(keys.len());
 
         // First pass: check MemTable for all keys (fast, in-memory)
+        // MemTable uses SkipMap which is already thread-safe, but sequential access
+        // is efficient enough and maintains sorted order benefits
         let mut remaining_keys = Vec::new();
         for key in keys {
             if let Some(val_opt) = self.mem_state.get(&key) {
@@ -535,41 +540,47 @@ impl Engine for LsmTreeEngine {
             }
         }
 
-        // Second pass: check SSTables for remaining keys
+        // Second pass: check SSTables for remaining keys in parallel
         if !remaining_keys.is_empty() {
             let handles = {
                 let sstables = self.sstables.lock().unwrap();
                 sstables.clone()
             };
 
-            for key in remaining_keys {
-                // Check each SSTable (newest first)
-                for handle in &handles {
-                    // Skip if bloom filter says key is definitely not present
-                    if !handle.bloom.contains(&key) {
-                        continue;
-                    }
-
-                    match sstable::search_key_cached(&handle.path, &key, &self.block_cache) {
-                        Ok(Some(v)) => {
-                            results.push((key.clone(), v));
-                            break;
-                        }
-                        Ok(None) => {
-                            // Tombstone found - key is deleted
-                            break;
-                        }
-                        Err(e) if e.code() == tonic::Code::NotFound => {
-                            // Key not in this SSTable, continue to next
+            // Process keys in parallel using rayon
+            let sstable_results: Vec<(String, String)> = remaining_keys
+                .par_iter()
+                .filter_map(|key| {
+                    // Check each SSTable (newest first)
+                    for handle in &handles {
+                        // Skip if bloom filter says key is definitely not present
+                        if !handle.bloom.contains(key) {
                             continue;
                         }
-                        Err(_) => {
-                            // Error reading SSTable, skip this key
-                            break;
+
+                        match sstable::search_key_cached(&handle.path, key, &self.block_cache) {
+                            Ok(Some(v)) => {
+                                return Some((key.clone(), v));
+                            }
+                            Ok(None) => {
+                                // Tombstone found - key is deleted
+                                return None;
+                            }
+                            Err(e) if e.code() == tonic::Code::NotFound => {
+                                // Key not in this SSTable, continue to next
+                                continue;
+                            }
+                            Err(_) => {
+                                // Error reading SSTable, skip this key
+                                return None;
+                            }
                         }
                     }
-                }
-            }
+                    None
+                })
+                .collect();
+
+            results.extend(sstable_results);
         }
 
         results
@@ -972,6 +983,32 @@ mod tests {
         // Should return only "b" (a is deleted)
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], ("b".to_string(), "vb".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_get_with_duplicates() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+        engine.set("a".to_string(), "va".to_string()).unwrap();
+        engine.set("b".to_string(), "vb".to_string()).unwrap();
+
+        // Request with duplicate keys
+        let keys = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ];
+        let results = engine.batch_get(keys);
+
+        // Should return only unique keys (duplicates removed)
+        assert_eq!(results.len(), 2);
+        let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
+        assert_eq!(result_map.get("a"), Some(&"va".to_string()));
+        assert_eq!(result_map.get("b"), Some(&"vb".to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread")]
