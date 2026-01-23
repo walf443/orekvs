@@ -6,7 +6,8 @@
       "Bash(cargo test:*)",
       "Bash(cargo build:*)",
       "Bash(./target/release/orelsm:*)",
-      "Bash(time cargo nextest run:*)"
+      "Bash(time cargo nextest run:*)",
+      "Bash(cargo nextest run:*)"
     ]
   }
 }

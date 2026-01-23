@@ -35,13 +35,20 @@ impl BlockCacheKey {
     }
 }
 
+/// Parsed block entry: (key, value_option)
+/// Entries are sorted by key for binary search
+pub type ParsedBlockEntry = (String, Option<String>);
+
 /// Cached entry types
 #[derive(Clone)]
 pub enum CacheEntry {
-    /// Decompressed data block
+    /// Decompressed data block (raw bytes) - kept for potential future use
+    #[allow(dead_code)]
     DataBlock(Arc<Vec<u8>>),
     /// Decompressed and parsed index
     Index(Arc<Vec<(String, u64)>>),
+    /// Parsed block entries (sorted by key for binary search)
+    ParsedBlock(Arc<Vec<ParsedBlockEntry>>),
 }
 
 impl CacheEntry {
@@ -49,6 +56,10 @@ impl CacheEntry {
         match self {
             CacheEntry::DataBlock(data) => data.len(),
             CacheEntry::Index(index) => index.iter().map(|(k, _)| k.len() + 8).sum::<usize>(),
+            CacheEntry::ParsedBlock(entries) => entries
+                .iter()
+                .map(|(k, v)| k.len() + v.as_ref().map_or(0, |s| s.len()))
+                .sum::<usize>(),
         }
     }
 }

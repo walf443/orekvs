@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
-use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry};
+use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry, ParsedBlockEntry};
 use super::memtable::MemTable;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
@@ -189,6 +189,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
 }
 
 /// Search for a key in an SSTable file with block cache support
+/// Uses binary search on parsed block entries for O(log n) lookup within blocks
 #[allow(clippy::result_large_err)]
 pub fn search_key_cached(
     path: &Path,
@@ -201,7 +202,7 @@ pub fn search_key_cached(
     // Get or load index from cache
     let index = get_or_load_index(path, &canonical_path, cache)?;
 
-    // Binary search in index
+    // Binary search in index to find the right block
     let block_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
         Ok(idx) => index[idx].1,
         Err(idx) => {
@@ -213,11 +214,11 @@ pub fn search_key_cached(
         }
     };
 
-    // Get or load block from cache
-    let block_data = get_or_load_block(path, &canonical_path, block_offset, cache)?;
+    // Get or load parsed block from cache
+    let parsed_entries = get_or_load_parsed_block(path, &canonical_path, block_offset, cache)?;
 
-    // Search within block
-    search_in_block(&block_data, key)
+    // Binary search within parsed block entries
+    search_in_parsed_block(&parsed_entries, key)
 }
 
 /// Get index from cache or load from file
@@ -287,19 +288,20 @@ fn get_or_load_index(
     Ok(arc_index)
 }
 
-/// Get block from cache or load from file
+/// Get parsed block from cache or load and parse from file
+/// Returns parsed entries sorted by key for binary search
 #[allow(clippy::result_large_err)]
-fn get_or_load_block(
+fn get_or_load_parsed_block(
     path: &Path,
     canonical_path: &Path,
     block_offset: u64,
     cache: &BlockCache,
-) -> Result<Arc<Vec<u8>>, Status> {
+) -> Result<Arc<Vec<ParsedBlockEntry>>, Status> {
     let cache_key = BlockCacheKey::for_block(canonical_path.to_path_buf(), block_offset);
 
-    // Check cache first
-    if let Some(CacheEntry::DataBlock(data)) = cache.get(&cache_key) {
-        return Ok(data);
+    // Check cache first for parsed block
+    if let Some(CacheEntry::ParsedBlock(entries)) = cache.get(&cache_key) {
+        return Ok(entries);
     }
 
     // Load from file
@@ -327,16 +329,90 @@ fn get_or_load_block(
     let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
         .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
 
-    let arc_data = Arc::new(decompressed);
+    // Parse all entries in the block
+    let entries = parse_block_entries(&decompressed)?;
+    let arc_entries = Arc::new(entries);
 
-    // Cache it
-    cache.insert(cache_key, CacheEntry::DataBlock(Arc::clone(&arc_data)));
+    // Cache parsed entries
+    cache.insert(cache_key, CacheEntry::ParsedBlock(Arc::clone(&arc_entries)));
 
-    Ok(arc_data)
+    Ok(arc_entries)
 }
 
-/// Search for a key within a decompressed block
+/// Parse all entries from a decompressed block into a sorted vector
 #[allow(clippy::result_large_err)]
+fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Status> {
+    let mut entries = Vec::new();
+    let mut cursor = Cursor::new(block_data);
+
+    loop {
+        if cursor.position() == block_data.len() as u64 {
+            break;
+        }
+
+        // Skip timestamp (8 bytes)
+        let mut ts_bytes = [0u8; 8];
+        if cursor.read_exact(&mut ts_bytes).is_err() {
+            break;
+        }
+
+        let mut klen_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut klen_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut vlen_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut vlen_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let key_len = u64::from_le_bytes(klen_bytes);
+        let val_len = u64::from_le_bytes(vlen_bytes);
+
+        let mut key_buf = vec![0u8; key_len as usize];
+        cursor
+            .read_exact(&mut key_buf)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let key = String::from_utf8_lossy(&key_buf).to_string();
+
+        let value = if val_len == u64::MAX {
+            None // Tombstone
+        } else {
+            let mut val_buf = vec![0u8; val_len as usize];
+            cursor
+                .read_exact(&mut val_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Some(String::from_utf8_lossy(&val_buf).to_string())
+        };
+
+        entries.push((key, value));
+    }
+
+    // Entries are already sorted by key (written in BTreeMap order)
+    Ok(entries)
+}
+
+/// Binary search within parsed block entries
+/// Returns Ok(Some(value)) if found, Ok(None) if tombstone, Err if not found
+#[allow(clippy::result_large_err)]
+fn search_in_parsed_block(
+    entries: &[ParsedBlockEntry],
+    key: &str,
+) -> Result<Option<String>, Status> {
+    match entries.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+        Ok(idx) => {
+            // Found the key
+            Ok(entries[idx].1.clone())
+        }
+        Err(_) => {
+            // Key not in this block
+            Err(Status::not_found("Key not found in SSTable"))
+        }
+    }
+}
+
+/// Search for a key within a decompressed block (linear scan - legacy)
+#[allow(clippy::result_large_err)]
+#[allow(dead_code)]
 fn search_in_block(block_data: &[u8], key: &str) -> Result<Option<String>, Status> {
     let mut cursor = Cursor::new(block_data);
 
