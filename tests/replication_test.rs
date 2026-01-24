@@ -1,10 +1,16 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
 use orelsm::server::kv::key_value_client::KeyValueClient;
 use orelsm::server::kv::{GetRequest, PromoteRequest, SetRequest};
+
+/// Get an available port by binding to port 0 and letting the OS assign one
+fn get_available_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to port 0");
+    listener.local_addr().unwrap().port()
+}
 
 /// Test configuration
 struct TestNode {
@@ -14,7 +20,13 @@ struct TestNode {
 }
 
 impl TestNode {
-    fn new(port: u16, replication_port: Option<u16>) -> Self {
+    fn new(with_replication: bool) -> Self {
+        let port = get_available_port();
+        let replication_port = if with_replication {
+            Some(get_available_port())
+        } else {
+            None
+        };
         Self {
             data_dir: TempDir::new().expect("Failed to create temp dir"),
             addr: format!("127.0.0.1:{}", port).parse().unwrap(),
@@ -85,10 +97,10 @@ async fn promote_to_leader(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_leader_follower_replication() {
-    // Configure nodes
-    let leader = TestNode::new(15001, Some(15002));
-    let follower1 = TestNode::new(15003, None);
-    let follower2 = TestNode::new(15005, None);
+    // Configure nodes with random ports
+    let leader = TestNode::new(true);
+    let follower1 = TestNode::new(false);
+    let follower2 = TestNode::new(false);
 
     let leader_addr = format!("http://{}", leader.addr);
     let leader_repl_addr = format!("http://127.0.0.1:{}", leader.replication_port.unwrap());
@@ -202,7 +214,8 @@ async fn test_leader_follower_replication() {
 
     // Promote follower1 to leader
     println!("Promoting follower1 to leader...");
-    let promote_result = promote_to_leader(&follower1_addr, true, 15004).await;
+    let new_repl_port = get_available_port();
+    let promote_result = promote_to_leader(&follower1_addr, true, new_repl_port as u32).await;
     assert!(promote_result.is_ok(), "Failed to promote follower1");
     println!("Follower1 promoted: {}", promote_result.unwrap());
 
@@ -238,8 +251,8 @@ async fn test_follower_failover() {
     // 3. Follower is promoted to leader
     // 4. New leader continues serving
 
-    let leader = TestNode::new(16001, Some(16002));
-    let follower = TestNode::new(16003, None);
+    let leader = TestNode::new(true);
+    let follower = TestNode::new(false);
 
     let leader_addr = format!("http://{}", leader.addr);
     let leader_repl_addr = format!("http://127.0.0.1:{}", leader.replication_port.unwrap());
