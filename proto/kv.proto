@@ -10,6 +10,8 @@ service KeyValue {
   rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
   rpc BatchDelete (BatchDeleteRequest) returns (BatchDeleteResponse);
   rpc GetMetrics (GetMetricsRequest) returns (GetMetricsResponse);
+  // Promote follower to leader (stops replication, enables writes)
+  rpc PromoteToLeader (PromoteRequest) returns (PromoteResponse);
 }
 
 message SetRequest {
@@ -69,6 +71,16 @@ message BatchDeleteResponse {
 }
 
 message GetMetricsRequest {
+}
+
+message PromoteRequest {
+  bool enable_replication_service = 1;  // Whether to start replication service for followers
+  uint32 replication_port = 2;          // Port for replication service (0 = default: main port + 1)
+}
+
+message PromoteResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 message GetMetricsResponse {

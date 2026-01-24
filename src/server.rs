@@ -10,7 +10,8 @@ use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
     BatchSetResponse, DeleteRequest, DeleteResponse, GetMetricsRequest, GetMetricsResponse,
-    GetRequest, GetResponse, KeyValuePair, SetRequest, SetResponse,
+    GetRequest, GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest,
+    SetResponse,
 };
 
 use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine};
@@ -263,6 +264,17 @@ impl KeyValue for MyKeyValue {
             Ok(Response::new(GetMetricsResponse::default()))
         }
     }
+
+    async fn promote_to_leader(
+        &self,
+        _request: Request<PromoteRequest>,
+    ) -> Result<Response<PromoteResponse>, Status> {
+        // This server is already a leader
+        Ok(Response::new(PromoteResponse {
+            success: false,
+            message: "This server is already running as a leader".to_string(),
+        }))
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -370,7 +382,7 @@ pub async fn run_follower(
     addr: std::net::SocketAddr,
 ) {
     use std::fs;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::Ordering;
     use tokio::sync::RwLock;
 
     // Create data directory
@@ -379,9 +391,10 @@ pub async fn run_follower(
         fs::create_dir_all(&data_path).expect("Failed to create data directory");
     }
 
-    // Shutdown flag
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_server = Arc::clone(&shutdown_flag);
+    // Create follower state for promotion support
+    let follower_state = Arc::new(FollowerState::new(data_path.clone(), addr));
+    let follower_state_for_server = Arc::clone(&follower_state);
+    let follower_state_for_repl = Arc::clone(&follower_state);
 
     // Create swappable engine holder
     let engine_holder: Arc<RwLock<Arc<LsmTreeEngine>>> =
@@ -395,10 +408,15 @@ pub async fn run_follower(
     println!("Starting follower, replicating from {}", leader_addr);
     println!("Follower serving read requests on {}", addr);
 
-    // Start read-only server with swappable engine
+    // Shutdown flag
+    let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag_server = Arc::clone(&shutdown_flag);
+
+    // Start server with swappable engine and promotion support
     let server_handle = tokio::spawn(async move {
         let key_value = SwappableFollowerKeyValue {
             engine_holder: engine_holder_for_server,
+            state: follower_state_for_server,
         };
         if let Err(e) = Server::builder()
             .add_service(KeyValueServer::new(key_value))
@@ -435,12 +453,32 @@ pub async fn run_follower(
         }
     });
 
-    // Replication loop with engine reload support
+    // Replication loop with engine reload support and promotion support
     let data_path_for_repl = data_path.clone();
     let engine_holder_for_repl = Arc::clone(&engine_holder);
 
+    // Create stop channel for promotion
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut guard = follower_state_for_repl.stop_replication_tx.lock().await;
+        *guard = Some(stop_tx);
+    }
+
     loop {
+        // Check if we should stop (shutdown or promoted to leader)
         if shutdown_flag.load(Ordering::SeqCst) {
+            println!("Shutdown requested, stopping replication...");
+            break;
+        }
+
+        if follower_state_for_repl.is_write_enabled() {
+            println!("Promoted to leader, stopping replication...");
+            break;
+        }
+
+        // Check for stop signal (non-blocking)
+        if stop_rx.try_recv().is_ok() {
+            println!("Stop signal received, stopping replication...");
             break;
         }
 
@@ -495,6 +533,11 @@ pub async fn run_follower(
                 println!("Engine reloaded, continuing replication...");
                 // Continue to next iteration of the loop
             }
+            Err(e) if e.code() == tonic::Code::Cancelled => {
+                // Replication was cancelled (promotion)
+                println!("Replication cancelled");
+                break;
+            }
             Err(e) => {
                 eprintln!("Replication error: {}", e);
                 // Wait before retrying
@@ -515,17 +558,94 @@ pub async fn run_follower(
     println!("Follower stopped.");
 }
 
-/// Read-only key-value service for followers with swappable engine
+/// Shared state for follower that can be promoted to leader
+pub struct FollowerState {
+    /// Whether writes are enabled (false = follower, true = leader)
+    write_enabled: std::sync::atomic::AtomicBool,
+    /// Channel to signal replication to stop
+    stop_replication_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Data directory for replication service
+    data_dir: PathBuf,
+    /// Server address (for calculating replication port)
+    server_addr: std::net::SocketAddr,
+    /// Replication service handle
+    replication_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl FollowerState {
+    fn new(data_dir: PathBuf, server_addr: std::net::SocketAddr) -> Self {
+        Self {
+            write_enabled: std::sync::atomic::AtomicBool::new(false),
+            stop_replication_tx: tokio::sync::Mutex::new(None),
+            data_dir,
+            server_addr,
+            replication_handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    fn is_write_enabled(&self) -> bool {
+        self.write_enabled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn enable_writes(&self) {
+        self.write_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn stop_replication(&self) -> bool {
+        let mut guard = self.stop_replication_tx.lock().await;
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn start_replication_service(&self, port: u16) -> Result<(), Status> {
+        let repl_addr = std::net::SocketAddr::new(self.server_addr.ip(), port);
+        let replication_service = ReplicationService::new(self.data_dir.clone());
+
+        println!("Starting replication service on {}", repl_addr);
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = Server::builder()
+                .add_service(ReplicationServer::new(replication_service))
+                .serve(repl_addr)
+                .await
+            {
+                eprintln!("Replication server error: {}", e);
+            }
+        });
+
+        let mut guard = self.replication_handle.lock().await;
+        *guard = Some(handle);
+
+        Ok(())
+    }
+}
+
+/// Key-value service for followers with swappable engine and promotion support
 struct SwappableFollowerKeyValue {
     engine_holder: Arc<tokio::sync::RwLock<Arc<LsmTreeEngine>>>,
+    state: Arc<FollowerState>,
 }
 
 #[tonic::async_trait]
 impl KeyValue for SwappableFollowerKeyValue {
-    async fn set(&self, _request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
-        Err(Status::failed_precondition(
-            "This is a read-only follower. Writes must go to the leader.",
-        ))
+    async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        if !self.state.is_write_enabled() {
+            return Err(Status::failed_precondition(
+                "This is a read-only follower. Writes must go to the leader, or promote this node first.",
+            ));
+        }
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        engine.set(req.key, req.value)?;
+        Ok(Response::new(SetResponse { success: true }))
     }
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -540,20 +660,46 @@ impl KeyValue for SwappableFollowerKeyValue {
 
     async fn delete(
         &self,
-        _request: Request<DeleteRequest>,
+        request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
-        Err(Status::failed_precondition(
-            "This is a read-only follower. Writes must go to the leader.",
-        ))
+        if !self.state.is_write_enabled() {
+            return Err(Status::failed_precondition(
+                "This is a read-only follower. Writes must go to the leader, or promote this node first.",
+            ));
+        }
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        engine.delete(req.key)?;
+        Ok(Response::new(DeleteResponse { success: true }))
     }
 
     async fn batch_set(
         &self,
-        _request: Request<BatchSetRequest>,
+        request: Request<BatchSetRequest>,
     ) -> Result<Response<BatchSetResponse>, Status> {
-        Err(Status::failed_precondition(
-            "This is a read-only follower. Writes must go to the leader.",
-        ))
+        if !self.state.is_write_enabled() {
+            return Err(Status::failed_precondition(
+                "This is a read-only follower. Writes must go to the leader, or promote this node first.",
+            ));
+        }
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        let items: Vec<(String, String)> = req
+            .items
+            .into_iter()
+            .map(|item| (item.key, item.value))
+            .collect();
+        let count = engine.batch_set(items)? as i32;
+        Ok(Response::new(BatchSetResponse {
+            success: true,
+            count,
+        }))
     }
 
     async fn batch_get(
@@ -576,11 +722,23 @@ impl KeyValue for SwappableFollowerKeyValue {
 
     async fn batch_delete(
         &self,
-        _request: Request<BatchDeleteRequest>,
+        request: Request<BatchDeleteRequest>,
     ) -> Result<Response<BatchDeleteResponse>, Status> {
-        Err(Status::failed_precondition(
-            "This is a read-only follower. Writes must go to the leader.",
-        ))
+        if !self.state.is_write_enabled() {
+            return Err(Status::failed_precondition(
+                "This is a read-only follower. Writes must go to the leader, or promote this node first.",
+            ));
+        }
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        let count = engine.batch_delete(req.keys)? as i32;
+        Ok(Response::new(BatchDeleteResponse {
+            success: true,
+            count,
+        }))
     }
 
     async fn get_metrics(
@@ -617,6 +775,54 @@ impl KeyValue for SwappableFollowerKeyValue {
             blockcache_misses: cache_stats.misses,
             blockcache_evictions: cache_stats.evictions,
             blockcache_hit_ratio: cache_stats.hit_ratio,
+        }))
+    }
+
+    async fn promote_to_leader(
+        &self,
+        request: Request<PromoteRequest>,
+    ) -> Result<Response<PromoteResponse>, Status> {
+        if self.state.is_write_enabled() {
+            return Ok(Response::new(PromoteResponse {
+                success: false,
+                message: "Already running as leader".to_string(),
+            }));
+        }
+
+        let req = request.into_inner();
+
+        // Stop replication
+        let stopped = self.state.stop_replication().await;
+        if stopped {
+            println!("Replication stopped for leader promotion");
+        }
+
+        // Enable writes
+        self.state.enable_writes();
+        println!("Write operations enabled - now running as leader");
+
+        // Start replication service if requested
+        if req.enable_replication_service {
+            let port = if req.replication_port > 0 {
+                req.replication_port as u16
+            } else {
+                self.state.server_addr.port() + 1
+            };
+
+            if let Err(e) = self.state.start_replication_service(port).await {
+                return Ok(Response::new(PromoteResponse {
+                    success: true,
+                    message: format!(
+                        "Promoted to leader but failed to start replication service: {}",
+                        e
+                    ),
+                }));
+            }
+        }
+
+        Ok(Response::new(PromoteResponse {
+            success: true,
+            message: "Successfully promoted to leader".to_string(),
         }))
     }
 }
