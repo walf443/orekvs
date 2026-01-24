@@ -63,17 +63,17 @@ enum Commands {
         #[arg(long)]
         leader_addr: Option<String>,
 
-        /// WAL retention period in seconds (default: 604800 = 7 days, 0 = disabled)
-        #[arg(long = "wal-retention-secs")]
-        wal_retention_secs: Option<u64>,
+        /// WAL retention period in seconds for LSM-tree engine (default: 604800 = 7 days, 0 = disabled)
+        #[arg(long = "lsm-engine-wal-retention-secs")]
+        lsm_wal_retention_secs: Option<u64>,
 
-        /// Maximum total WAL size in bytes (default: 1073741824 = 1GB, 0 = disabled)
-        #[arg(long = "wal-max-size-bytes")]
-        wal_max_size_bytes: Option<u64>,
+        /// Maximum total WAL size in bytes for LSM-tree engine (default: 1073741824 = 1GB, 0 = disabled)
+        #[arg(long = "lsm-engine-wal-max-size-bytes")]
+        lsm_wal_max_size_bytes: Option<u64>,
 
-        /// Disable WAL archiving (keep all WAL files for replication)
-        #[arg(long = "disable-wal-archive")]
-        disable_wal_archive: bool,
+        /// Disable WAL archiving for LSM-tree engine (keep all WAL files for replication)
+        #[arg(long = "lsm-engine-disable-wal-archive")]
+        lsm_disable_wal_archive: bool,
     },
     /// Test commands
     Test {
@@ -175,23 +175,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_replication,
             replication_port,
             leader_addr,
-            wal_retention_secs,
-            wal_max_size_bytes,
-            disable_wal_archive,
+            lsm_wal_retention_secs,
+            lsm_wal_max_size_bytes,
+            lsm_disable_wal_archive,
         } => {
             let addr: std::net::SocketAddr = addr.parse()?;
 
             // Build WAL archive config
-            let wal_archive_config = if *disable_wal_archive {
+            let wal_archive_config = if *lsm_disable_wal_archive {
                 WalArchiveConfig::disabled()
             } else {
                 WalArchiveConfig {
-                    retention_secs: match wal_retention_secs {
+                    retention_secs: match lsm_wal_retention_secs {
                         Some(0) => None,
                         Some(secs) => Some(*secs),
                         None => Some(orelsm::engine::lsm_tree::DEFAULT_WAL_RETENTION_SECS),
                     },
-                    max_size_bytes: match wal_max_size_bytes {
+                    max_size_bytes: match lsm_wal_max_size_bytes {
                         Some(0) => None,
                         Some(bytes) => Some(*bytes),
                         None => Some(orelsm::engine::lsm_tree::DEFAULT_WAL_MAX_SIZE_BYTES),
