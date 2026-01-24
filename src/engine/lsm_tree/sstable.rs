@@ -8,6 +8,7 @@ use tonic::Status;
 
 use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry, ParsedBlockEntry};
 use super::bloom::BloomFilter;
+use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
 use super::mmap::MappedFile;
 
@@ -385,7 +386,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let len = u32::from_le_bytes(len_bytes);
 
-    let mut compressed_block = vec![0u8; len as usize];
+    let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
     file.read_exact(&mut compressed_block)
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -674,7 +675,7 @@ fn get_or_load_parsed_block(
         .map_err(|e| Status::internal(e.to_string()))?;
     let len = u32::from_le_bytes(len_bytes);
 
-    let mut compressed_block = vec![0u8; len as usize];
+    let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
     file.read_exact(&mut compressed_block)
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -826,7 +827,7 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
         }
         let len = u32::from_le_bytes(len_bytes);
 
-        let mut compressed_block = vec![0u8; len as usize];
+        let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
         file.read_exact(&mut compressed_block)
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -936,7 +937,7 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         }
         let len = u32::from_le_bytes(len_bytes);
 
-        let mut compressed_block = vec![0u8; len as usize];
+        let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
         file.read_exact(&mut compressed_block)
             .map_err(|e| Status::internal(e.to_string()))?;
 

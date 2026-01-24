@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
+use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
@@ -211,8 +212,8 @@ impl GroupCommitWalWriter {
     fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<FlushRequest>) {
         let mut guard = inner.lock().unwrap();
 
-        // Stage 1: Serialize all entries to a buffer
-        let mut entries_buf = Vec::new();
+        // Stage 1: Serialize all entries to a pooled buffer (reduces allocation overhead)
+        let mut entries_buf = PooledBuffer::new(4096);
         for req in pending.iter() {
             match req {
                 FlushRequest::Single(single) => {
