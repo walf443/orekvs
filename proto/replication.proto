@@ -8,6 +8,12 @@ service Replication {
 
   // Leader情報を取得
   rpc GetLeaderInfo(Empty) returns (LeaderInfo);
+
+  // スナップショットをリクエスト（WALが利用不可の場合）
+  rpc RequestSnapshot(SnapshotRequest) returns (SnapshotInfo);
+
+  // SSTableファイルをストリーミングで取得
+  rpc StreamSnapshot(StreamSnapshotRequest) returns (stream SnapshotChunk);
 }
 
 message Empty {}
@@ -28,4 +34,27 @@ message WALBatch {
 message LeaderInfo {
   uint64 current_wal_id = 1;
   uint64 current_offset = 2;
+}
+
+message SnapshotRequest {
+  uint64 requested_wal_id = 1;  // followerが必要とするWAL ID
+}
+
+message SnapshotInfo {
+  bool snapshot_required = 1;           // スナップショットが必要かどうか
+  repeated string sstable_files = 2;    // 転送するSSTableファイル名一覧
+  uint64 resume_wal_id = 3;             // スナップショット後に開始するWAL ID
+  uint64 resume_offset = 4;             // スナップショット後に開始するoffset
+  uint64 total_bytes = 5;               // 転送する総バイト数
+}
+
+message StreamSnapshotRequest {
+  string filename = 1;  // 取得するSSTableファイル名
+}
+
+message SnapshotChunk {
+  string filename = 1;      // ファイル名
+  bytes data = 2;           // ファイルデータ（チャンク）
+  uint64 offset = 3;        // このチャンクのファイル内offset
+  bool is_last = 4;         // 最後のチャンクかどうか
 }

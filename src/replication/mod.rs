@@ -4,10 +4,13 @@ mod proto {
 
 pub use proto::replication_client::ReplicationClient;
 pub use proto::replication_server::{Replication, ReplicationServer};
-pub use proto::{Empty, LeaderInfo, StreamWalRequest, WalBatch};
+pub use proto::{
+    Empty, LeaderInfo, SnapshotChunk, SnapshotInfo, SnapshotRequest, StreamSnapshotRequest,
+    StreamWalRequest, WalBatch,
+};
 
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
@@ -34,6 +37,8 @@ const CATCHUP_BATCH_BYTES: usize = 64 * 1024;
 const REALTIME_POLL_INTERVAL_MS: u64 = 10;
 /// Maximum allowed key/value size (1GB) to prevent memory allocation attacks
 const MAX_ENTRY_SIZE: u64 = 1024 * 1024 * 1024;
+/// Chunk size for snapshot file transfer (64KB)
+const SNAPSHOT_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Leader-side replication service
 pub struct ReplicationService {
@@ -71,6 +76,40 @@ impl ReplicationService {
         } else {
             (0, 0)
         }
+    }
+
+    /// Get list of SSTable files
+    fn get_sstable_files(&self) -> Vec<(String, PathBuf)> {
+        let mut sstable_files = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    // SSTable files: sst_*.data (e.g., sst_00001.data or sst_00001_00002.data)
+                    if filename.starts_with("sst_") && filename.ends_with(".data") {
+                        sstable_files.push((filename.to_string(), path));
+                    }
+                }
+            }
+        }
+        sstable_files.sort_by(|(a, _), (b, _)| a.cmp(b));
+        sstable_files
+    }
+
+    /// Check if the requested WAL is available
+    fn is_wal_available(&self, wal_id: u64) -> bool {
+        if wal_id == 0 {
+            // Initial sync, check if any WAL exists
+            return !self.get_wal_files().is_empty();
+        }
+        let wal_files = self.get_wal_files();
+        // WAL is available if we have it or a newer one
+        wal_files.iter().any(|(id, _)| *id >= wal_id)
+    }
+
+    /// Get the oldest available WAL ID
+    fn get_oldest_wal_id(&self) -> Option<u64> {
+        self.get_wal_files().first().map(|(id, _)| *id)
     }
 
     /// Read WAL entries from a specific position
@@ -345,6 +384,8 @@ pub fn deserialize_entries(data: &[u8]) -> Result<Vec<WalEntry>, Status> {
 impl Replication for ReplicationService {
     type StreamWALEntriesStream =
         Pin<Box<dyn Stream<Item = Result<WalBatch, Status>> + Send + 'static>>;
+    type StreamSnapshotStream =
+        Pin<Box<dyn Stream<Item = Result<SnapshotChunk, Status>> + Send + 'static>>;
 
     async fn stream_wal_entries(
         &self,
@@ -446,6 +487,141 @@ impl Replication for ReplicationService {
             current_offset,
         }))
     }
+
+    async fn request_snapshot(
+        &self,
+        request: Request<SnapshotRequest>,
+    ) -> Result<Response<SnapshotInfo>, Status> {
+        let req = request.into_inner();
+        let requested_wal_id = req.requested_wal_id;
+
+        // Check if the requested WAL is available
+        if self.is_wal_available(requested_wal_id) {
+            // WAL is available, no snapshot needed
+            return Ok(Response::new(SnapshotInfo {
+                snapshot_required: false,
+                sstable_files: vec![],
+                resume_wal_id: 0,
+                resume_offset: 0,
+                total_bytes: 0,
+            }));
+        }
+
+        // WAL is not available, snapshot required
+        let sstable_files = self.get_sstable_files();
+        let filenames: Vec<String> = sstable_files.iter().map(|(name, _)| name.clone()).collect();
+
+        // Calculate total bytes
+        let total_bytes: u64 = sstable_files
+            .iter()
+            .filter_map(|(_, path)| fs::metadata(path).ok().map(|m| m.len()))
+            .sum();
+
+        // Get the resume position (oldest available WAL or current position)
+        let (resume_wal_id, resume_offset) = if let Some(oldest_id) = self.get_oldest_wal_id() {
+            (oldest_id, 0)
+        } else {
+            self.get_current_position()
+        };
+
+        println!(
+            "Snapshot requested for WAL {}, will transfer {} SSTable files ({} bytes), resume at WAL {} offset {}",
+            requested_wal_id,
+            filenames.len(),
+            total_bytes,
+            resume_wal_id,
+            resume_offset
+        );
+
+        Ok(Response::new(SnapshotInfo {
+            snapshot_required: true,
+            sstable_files: filenames,
+            resume_wal_id,
+            resume_offset,
+            total_bytes,
+        }))
+    }
+
+    async fn stream_snapshot(
+        &self,
+        request: Request<StreamSnapshotRequest>,
+    ) -> Result<Response<Self::StreamSnapshotStream>, Status> {
+        let req = request.into_inner();
+        let filename = req.filename;
+        let file_path = self.data_dir.join(&filename);
+
+        // Validate filename to prevent path traversal
+        if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+            return Err(Status::invalid_argument("Invalid filename"));
+        }
+
+        // Check file exists
+        if !file_path.exists() {
+            return Err(Status::not_found(format!("File not found: {}", filename)));
+        }
+
+        let (tx, rx) = mpsc::channel(16);
+        let filename_clone = filename.clone();
+
+        println!("Starting snapshot transfer for file: {}", filename);
+
+        tokio::spawn(async move {
+            let result = (|| -> Result<(), Status> {
+                let mut file =
+                    File::open(&file_path).map_err(|e| Status::internal(e.to_string()))?;
+                let file_len = file
+                    .metadata()
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .len();
+
+                let mut offset = 0u64;
+                let mut buf = vec![0u8; SNAPSHOT_CHUNK_SIZE];
+
+                while offset < file_len {
+                    let bytes_read = file
+                        .read(&mut buf)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    let is_last = offset + bytes_read as u64 >= file_len;
+                    let chunk = SnapshotChunk {
+                        filename: filename_clone.clone(),
+                        data: buf[..bytes_read].to_vec(),
+                        offset,
+                        is_last,
+                    };
+
+                    offset += bytes_read as u64;
+
+                    if tx.blocking_send(Ok(chunk)).is_err() {
+                        // Receiver dropped
+                        break;
+                    }
+                }
+
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                let _ = tx.blocking_send(Err(e));
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+/// Result of a replication connection
+pub enum ReplicationResult {
+    /// Normal stream end, should reconnect
+    Continue,
+    /// Snapshot was applied, engine needs to reload
+    SnapshotApplied {
+        resume_wal_id: u64,
+        resume_offset: u64,
+    },
 }
 
 /// Follower replication client
@@ -486,6 +662,7 @@ impl FollowerReplicator {
     }
 
     /// Start replication from leader
+    /// Returns SnapshotApplied if a snapshot was downloaded and the caller should reload the engine
     pub async fn start<F>(&self, mut apply_fn: F) -> Result<(), Status>
     where
         F: FnMut(WalEntry) -> Result<(), Status> + Send,
@@ -498,9 +675,23 @@ impl FollowerReplicator {
                 .connect_and_stream(&mut wal_id, &mut offset, &mut apply_fn)
                 .await
             {
-                Ok(()) => {
+                Ok(ReplicationResult::Continue) => {
                     // Stream ended normally (shouldn't happen in normal operation)
                     println!("Replication stream ended, reconnecting...");
+                }
+                Ok(ReplicationResult::SnapshotApplied {
+                    resume_wal_id,
+                    resume_offset,
+                }) => {
+                    // Snapshot was applied, update position and continue
+                    wal_id = resume_wal_id;
+                    offset = resume_offset;
+                    println!(
+                        "Snapshot applied, resuming from WAL {} offset {}",
+                        wal_id, offset
+                    );
+                    // Note: caller should reload the engine after snapshot
+                    return Err(Status::aborted("Snapshot applied, engine reload required"));
                 }
                 Err(e) => {
                     eprintln!("Replication error: {}, reconnecting in 1s...", e);
@@ -510,12 +701,101 @@ impl FollowerReplicator {
         }
     }
 
+    /// Check if snapshot is needed and download it if so
+    async fn check_and_download_snapshot(
+        &self,
+        client: &mut ReplicationClient<tonic::transport::Channel>,
+        wal_id: u64,
+    ) -> Result<Option<(u64, u64)>, Status> {
+        let request = SnapshotRequest {
+            requested_wal_id: wal_id,
+        };
+
+        let response = client
+            .request_snapshot(request)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let info = response.into_inner();
+
+        if !info.snapshot_required {
+            return Ok(None);
+        }
+
+        println!(
+            "Snapshot required: downloading {} SSTable files ({} bytes)",
+            info.sstable_files.len(),
+            info.total_bytes
+        );
+
+        // Download each SSTable file
+        for filename in &info.sstable_files {
+            self.download_sstable_file(client, filename).await?;
+        }
+
+        println!("Snapshot download complete");
+
+        // Save the new replication state
+        self.save_replication_state(info.resume_wal_id, info.resume_offset)?;
+
+        Ok(Some((info.resume_wal_id, info.resume_offset)))
+    }
+
+    /// Download a single SSTable file from leader
+    async fn download_sstable_file(
+        &self,
+        client: &mut ReplicationClient<tonic::transport::Channel>,
+        filename: &str,
+    ) -> Result<(), Status> {
+        let request = StreamSnapshotRequest {
+            filename: filename.to_string(),
+        };
+
+        let mut stream = client
+            .stream_snapshot(request)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .into_inner();
+
+        let file_path = self.data_dir.join(filename);
+
+        // Create temporary file for atomic write
+        let temp_path = self.data_dir.join(format!("{}.tmp", filename));
+        let mut file = File::create(&temp_path).map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut bytes_received = 0u64;
+
+        while let Some(result) = tokio_stream::StreamExt::next(&mut stream).await {
+            let chunk = result?;
+
+            file.write_all(&chunk.data)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            bytes_received += chunk.data.len() as u64;
+
+            if chunk.is_last {
+                break;
+            }
+        }
+
+        // Sync and rename atomically
+        file.sync_all()
+            .map_err(|e| Status::internal(e.to_string()))?;
+        drop(file);
+
+        fs::rename(&temp_path, &file_path).map_err(|e| Status::internal(e.to_string()))?;
+
+        println!("Downloaded {} ({} bytes)", filename, bytes_received);
+
+        Ok(())
+    }
+
     async fn connect_and_stream<F>(
         &self,
         wal_id: &mut u64,
         offset: &mut u64,
         apply_fn: &mut F,
-    ) -> Result<(), Status>
+    ) -> Result<ReplicationResult, Status>
     where
         F: FnMut(WalEntry) -> Result<(), Status>,
     {
@@ -524,6 +804,17 @@ impl FollowerReplicator {
             .map_err(|e| Status::internal(format!("Failed to connect to leader: {}", e)))?;
 
         println!("Connected to leader at {}", self.leader_addr);
+
+        // Check if snapshot is needed
+        if let Some((resume_wal_id, resume_offset)) = self
+            .check_and_download_snapshot(&mut client, *wal_id)
+            .await?
+        {
+            return Ok(ReplicationResult::SnapshotApplied {
+                resume_wal_id,
+                resume_offset,
+            });
+        }
 
         let request = StreamWalRequest {
             from_wal_id: *wal_id,
@@ -559,7 +850,7 @@ impl FollowerReplicator {
             self.save_replication_state(*wal_id, *offset)?;
         }
 
-        Ok(())
+        Ok(ReplicationResult::Continue)
     }
 }
 

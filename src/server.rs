@@ -370,6 +370,8 @@ pub async fn run_follower(
     addr: std::net::SocketAddr,
 ) {
     use std::fs;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::RwLock;
 
     // Create data directory
     let data_path = PathBuf::from(&data_dir);
@@ -377,22 +379,26 @@ pub async fn run_follower(
         fs::create_dir_all(&data_path).expect("Failed to create data directory");
     }
 
-    // Create LSM engine for the follower
-    let engine = Arc::new(LsmTreeEngine::new(
-        data_dir.clone(),
-        lsm_memtable_capacity_bytes,
-        lsm_compaction_trigger_file_count,
-    ));
-    let engine_for_replication = Arc::clone(&engine);
-    let engine_for_server = Arc::clone(&engine);
+    // Shutdown flag
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_server = Arc::clone(&shutdown_flag);
+
+    // Create swappable engine holder
+    let engine_holder: Arc<RwLock<Arc<LsmTreeEngine>>> =
+        Arc::new(RwLock::new(Arc::new(LsmTreeEngine::new(
+            data_dir.clone(),
+            lsm_memtable_capacity_bytes,
+            lsm_compaction_trigger_file_count,
+        ))));
+    let engine_holder_for_server = Arc::clone(&engine_holder);
 
     println!("Starting follower, replicating from {}", leader_addr);
     println!("Follower serving read requests on {}", addr);
 
-    // Start read-only server
+    // Start read-only server with swappable engine
     let server_handle = tokio::spawn(async move {
-        let key_value = FollowerKeyValue {
-            engine: engine_for_server,
+        let key_value = SwappableFollowerKeyValue {
+            engine_holder: engine_holder_for_server,
         };
         if let Err(e) = Server::builder()
             .add_service(KeyValueServer::new(key_value))
@@ -420,6 +426,8 @@ pub async fn run_follower(
                     ctrl_c.await.expect("Failed to listen for ctrl+c signal");
                     println!("\nReceived shutdown signal...");
                 }
+
+                shutdown_flag_server.store(true, Ordering::SeqCst);
             })
             .await
         {
@@ -427,37 +435,93 @@ pub async fn run_follower(
         }
     });
 
-    // Start replication
-    let replicator = FollowerReplicator::new(leader_addr, data_path);
+    // Replication loop with engine reload support
+    let data_path_for_repl = data_path.clone();
+    let engine_holder_for_repl = Arc::clone(&engine_holder);
 
-    // Apply WAL entries to the engine
-    if let Err(e) = replicator
-        .start(move |entry| {
-            if let Some(value) = entry.value {
-                engine_for_replication.set(entry.key, value)
-            } else {
-                engine_for_replication.delete(entry.key)
+    loop {
+        if shutdown_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let replicator = FollowerReplicator::new(leader_addr.clone(), data_path_for_repl.clone());
+        let engine_holder_clone = Arc::clone(&engine_holder_for_repl);
+
+        // Apply WAL entries to the engine
+        let result = replicator
+            .start(move |entry| {
+                // Get current engine reference
+                let engine = {
+                    let guard = engine_holder_clone.blocking_read();
+                    Arc::clone(&*guard)
+                };
+
+                if let Some(value) = entry.value {
+                    engine.set(entry.key, value)
+                } else {
+                    engine.delete(entry.key)
+                }
+            })
+            .await;
+
+        match result {
+            Ok(()) => {
+                // Normal exit (shouldn't happen)
+                break;
             }
-        })
-        .await
-    {
-        eprintln!("Replication error: {}", e);
+            Err(e) if e.code() == tonic::Code::Aborted => {
+                // Snapshot applied, reload engine
+                println!("Reloading engine after snapshot...");
+
+                // Shutdown old engine
+                {
+                    let old_engine = engine_holder_for_repl.read().await;
+                    old_engine.shutdown().await;
+                }
+
+                // Create new engine (will load the downloaded SSTables)
+                let new_engine = Arc::new(LsmTreeEngine::new(
+                    data_dir.clone(),
+                    lsm_memtable_capacity_bytes,
+                    lsm_compaction_trigger_file_count,
+                ));
+
+                // Swap engine
+                {
+                    let mut guard = engine_holder_for_repl.write().await;
+                    *guard = new_engine;
+                }
+
+                println!("Engine reloaded, continuing replication...");
+                // Continue to next iteration of the loop
+            }
+            Err(e) => {
+                eprintln!("Replication error: {}", e);
+                // Wait before retrying
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
     }
 
     // Wait for server to finish
     let _ = server_handle.await;
 
-    engine.shutdown().await;
+    // Shutdown final engine
+    {
+        let engine = engine_holder.read().await;
+        engine.shutdown().await;
+    }
+
     println!("Follower stopped.");
 }
 
-/// Read-only key-value service for followers
-struct FollowerKeyValue {
-    engine: Arc<LsmTreeEngine>,
+/// Read-only key-value service for followers with swappable engine
+struct SwappableFollowerKeyValue {
+    engine_holder: Arc<tokio::sync::RwLock<Arc<LsmTreeEngine>>>,
 }
 
 #[tonic::async_trait]
-impl KeyValue for FollowerKeyValue {
+impl KeyValue for SwappableFollowerKeyValue {
     async fn set(&self, _request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
         Err(Status::failed_precondition(
             "This is a read-only follower. Writes must go to the leader.",
@@ -466,7 +530,11 @@ impl KeyValue for FollowerKeyValue {
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        let value = self.engine.get(req.key)?;
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        let value = engine.get(req.key)?;
         Ok(Response::new(GetResponse { value }))
     }
 
@@ -493,7 +561,11 @@ impl KeyValue for FollowerKeyValue {
         request: Request<BatchGetRequest>,
     ) -> Result<Response<BatchGetResponse>, Status> {
         let req = request.into_inner();
-        let results = self.engine.batch_get(req.keys);
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        let results = engine.batch_get(req.keys);
         let items = results
             .into_iter()
             .map(|(key, value)| KeyValuePair { key, value })
@@ -515,8 +587,12 @@ impl KeyValue for FollowerKeyValue {
         &self,
         _request: Request<GetMetricsRequest>,
     ) -> Result<Response<GetMetricsResponse>, Status> {
-        let metrics = self.engine.metrics();
-        let cache_stats = self.engine.cache_stats();
+        let engine = {
+            let guard = self.engine_holder.read().await;
+            Arc::clone(&*guard)
+        };
+        let metrics = engine.metrics();
+        let cache_stats = engine.cache_stats();
 
         Ok(Response::new(GetMetricsResponse {
             get_count: metrics.get_count,
