@@ -131,6 +131,19 @@ async fn test_leader_follower_replication() {
     );
     println!("Leader started on {}", leader.addr);
 
+    // Write initial data to leader before followers connect
+    println!("Writing initial data to leader...");
+    for i in 0..5 {
+        set_key(
+            &leader_addr,
+            &format!("initial_key{}", i),
+            &format!("initial_value{}", i),
+        )
+        .await
+        .expect("Failed to write initial data to leader");
+    }
+    println!("Wrote 5 initial key-value pairs to leader");
+
     // Start follower1
     let follower1_data = follower1.data_path();
     let follower1_socket = follower1.addr;
@@ -189,8 +202,35 @@ async fn test_leader_follower_replication() {
     // Wait for replication
     sleep(Duration::from_secs(1)).await;
 
-    // Verify data on followers
+    // Verify data on followers (including initial data written before followers started)
     println!("Verifying data on followers...");
+
+    // Verify initial data (written before followers connected)
+    for i in 0..5 {
+        let key = format!("initial_key{}", i);
+        let expected = format!("initial_value{}", i);
+
+        let value1 = get_key(&follower1_addr, &key)
+            .await
+            .expect("Failed to read initial data from follower1");
+        assert_eq!(
+            value1, expected,
+            "Follower1 initial data mismatch for {}",
+            key
+        );
+
+        let value2 = get_key(&follower2_addr, &key)
+            .await
+            .expect("Failed to read initial data from follower2");
+        assert_eq!(
+            value2, expected,
+            "Follower2 initial data mismatch for {}",
+            key
+        );
+    }
+    println!("Initial data verified on both followers");
+
+    // Verify live data (written after followers connected)
     for i in 0..10 {
         let key = format!("key{}", i);
         let expected = format!("value{}", i);
@@ -281,6 +321,18 @@ async fn test_follower_failover() {
     );
     println!("[Failover] Leader started");
 
+    // Write initial data before follower starts
+    for i in 0..3 {
+        set_key(
+            &leader_addr,
+            &format!("initial_failover_key{}", i),
+            &format!("initial_failover_value{}", i),
+        )
+        .await
+        .expect("Failed to write initial data to leader");
+    }
+    println!("[Failover] Wrote 3 initial keys to leader");
+
     // Start follower
     let follower_data = follower.data_path();
     let follower_socket = follower.addr;
@@ -318,14 +370,22 @@ async fn test_follower_failover() {
     // Wait for replication
     sleep(Duration::from_secs(1)).await;
 
-    // Verify follower has the data
+    // Verify follower has the data (including initial data written before follower started)
+    for i in 0..3 {
+        let value = get_key(&follower_addr, &format!("initial_failover_key{}", i))
+            .await
+            .expect("Failed to read initial data from follower");
+        assert_eq!(value, format!("initial_failover_value{}", i));
+    }
+    println!("[Failover] Initial data verified on follower");
+
     for i in 0..5 {
         let value = get_key(&follower_addr, &format!("failover_key{}", i))
             .await
             .expect("Failed to read from follower");
         assert_eq!(value, format!("failover_value{}", i));
     }
-    println!("[Failover] Verified data on follower");
+    println!("[Failover] All data verified on follower");
 
     // Simulate leader failure by aborting
     leader_handle.abort();
@@ -339,7 +399,13 @@ async fn test_follower_failover() {
     assert!(promote_result.is_ok(), "Failed to promote follower");
     println!("[Failover] Follower promoted to leader");
 
-    // Verify new leader has all the data
+    // Verify new leader has all the data (including initial data)
+    for i in 0..3 {
+        let value = get_key(&follower_addr, &format!("initial_failover_key{}", i))
+            .await
+            .expect("Failed to read initial data from new leader");
+        assert_eq!(value, format!("initial_failover_value{}", i));
+    }
     for i in 0..5 {
         let value = get_key(&follower_addr, &format!("failover_key{}", i))
             .await
