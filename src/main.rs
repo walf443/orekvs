@@ -98,6 +98,9 @@ enum TestCommands {
         /// Maximum key value (1..N)
         #[arg(long, default_value_t = 1000000)]
         key_range: u32,
+        /// Value size in bytes
+        #[arg(long, default_value_t = 20)]
+        value_size: usize,
     },
     /// Get multiple random keys
     RandomGet {
@@ -237,7 +240,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 count,
                 parallel,
                 key_range,
-            } => run_test_set(addr.clone(), *count, *parallel, *key_range).await,
+                value_size,
+            } => run_test_set(addr.clone(), *count, *parallel, *key_range, *value_size).await,
             TestCommands::RandomGet {
                 count,
                 parallel,
@@ -308,10 +312,11 @@ async fn run_test_set(
     count: usize,
     parallel: usize,
     key_range: u32,
+    value_size: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Generating and setting {} random key-value pairs (range 1..={}) with parallelism {} to {}...",
-        count, key_range, parallel, addr
+        "Generating and setting {} random key-value pairs (range 1..={}, value_size={}) with parallelism {} to {}...",
+        count, key_range, value_size, parallel, addr
     );
 
     let client = KeyValueClient::connect(addr).await?;
@@ -326,7 +331,9 @@ async fn run_test_set(
             let (key, value) = {
                 let mut rng = thread_rng();
                 let key = rng.gen_range(1..=key_range).to_string();
-                let value: String = (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
+                let value: String = (0..value_size)
+                    .map(|_| rng.sample(Alphanumeric) as char)
+                    .collect();
                 (key, value)
             };
 

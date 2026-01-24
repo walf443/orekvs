@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,11 @@ use tonic::Status;
 use super::memtable::MemTable;
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
-const WAL_VERSION: u32 = 1;
+const WAL_VERSION: u32 = 2;
+/// Minimum batch size in bytes to enable compression
+const COMPRESSION_THRESHOLD: usize = 512;
+/// Block flag: compressed
+const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
 
 /// Write request for group commit with pipelining
 struct WriteRequest {
@@ -207,27 +211,33 @@ impl GroupCommitWalWriter {
     fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<FlushRequest>) {
         let mut guard = inner.lock().unwrap();
 
-        // Stage 1: Write all to OS buffer
+        // Stage 1: Serialize all entries to a buffer
+        let mut entries_buf = Vec::new();
         for req in pending.iter() {
             match req {
                 FlushRequest::Single(single) => {
                     if let Err(e) =
-                        Self::write_entry_to_file(&mut guard.writer, &single.key, &single.value)
+                        Self::serialize_entry(&mut entries_buf, &single.key, &single.value)
                     {
-                        // If write fails, notify all about the error and return
                         Self::notify_all_error(pending, e);
                         return;
                     }
                 }
                 FlushRequest::Batch(batch) => {
                     for (key, value) in &batch.entries {
-                        if let Err(e) = Self::write_entry_to_file(&mut guard.writer, key, value) {
+                        if let Err(e) = Self::serialize_entry(&mut entries_buf, key, value) {
                             Self::notify_all_error(pending, e);
                             return;
                         }
                     }
                 }
             }
+        }
+
+        // Stage 2: Write block (compressed if large enough)
+        if let Err(e) = Self::write_block(&mut guard.writer, &entries_buf) {
+            Self::notify_all_error(pending, e);
+            return;
         }
 
         // Notify all that writes are in OS buffer
@@ -246,13 +256,13 @@ impl GroupCommitWalWriter {
             }
         }
 
-        // Stage 2: Sync data to disk (fdatasync - skips metadata sync for better performance)
+        // Stage 3: Sync data to disk (fdatasync - skips metadata sync for better performance)
         let sync_result = guard
             .writer
             .sync_data()
             .map_err(|e| Status::internal(e.to_string()));
 
-        // Stage 3: Notify "synced"
+        // Stage 4: Notify "synced"
         for req in pending.drain(..) {
             match req {
                 FlushRequest::Single(single) => {
@@ -279,13 +289,9 @@ impl GroupCommitWalWriter {
         }
     }
 
-    /// Write a single entry to the file (without sync)
+    /// Serialize a single entry to a buffer
     #[allow(clippy::result_large_err)]
-    fn write_entry_to_file(
-        writer: &mut File,
-        key: &str,
-        value: &Option<String>,
-    ) -> Result<(), Status> {
+    fn serialize_entry(buf: &mut Vec<u8>, key: &str, value: &Option<String>) -> Result<(), Status> {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u64;
         let (val_len, val_bytes): (u64, &[u8]) = match value {
@@ -298,23 +304,67 @@ impl GroupCommitWalWriter {
             .unwrap()
             .as_secs();
 
-        writer
-            .write_all(&timestamp.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&key_len.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&val_len.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(key_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        buf.extend_from_slice(&timestamp.to_le_bytes());
+        buf.extend_from_slice(&key_len.to_le_bytes());
+        buf.extend_from_slice(&val_len.to_le_bytes());
+        buf.extend_from_slice(key_bytes);
         if val_len != u64::MAX {
-            writer
-                .write_all(val_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            buf.extend_from_slice(val_bytes);
         }
+
+        Ok(())
+    }
+
+    /// Write a block to the file, compressing if size exceeds threshold
+    #[allow(clippy::result_large_err)]
+    fn write_block(writer: &mut File, data: &[u8]) -> Result<(), Status> {
+        let uncompressed_size = data.len() as u32;
+
+        if data.len() >= COMPRESSION_THRESHOLD {
+            // Try to compress
+            match zstd::encode_all(Cursor::new(data), 3) {
+                Ok(compressed) if compressed.len() < data.len() => {
+                    // Compression was beneficial
+                    let flags = BLOCK_FLAG_COMPRESSED;
+                    let data_size = compressed.len() as u32;
+
+                    writer
+                        .write_all(&[flags])
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    writer
+                        .write_all(&uncompressed_size.to_le_bytes())
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    writer
+                        .write_all(&data_size.to_le_bytes())
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                    writer
+                        .write_all(&compressed)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+
+                    return Ok(());
+                }
+                _ => {
+                    // Compression failed or didn't reduce size, fall through to uncompressed
+                }
+            }
+        }
+
+        // Write uncompressed block
+        let flags = 0u8;
+        let data_size = data.len() as u32;
+
+        writer
+            .write_all(&[flags])
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&uncompressed_size.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&data_size.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(data)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(())
     }
@@ -388,9 +438,14 @@ impl GroupCommitWalWriter {
     pub fn write_entries(&self, entries: &MemTable) -> Result<(), Status> {
         let mut guard = self.inner.lock().unwrap();
 
+        // Serialize all entries to buffer
+        let mut buf = Vec::new();
         for (key, value) in entries {
-            Self::write_entry_to_file(&mut guard.writer, key, value)?;
+            Self::serialize_entry(&mut buf, key, value)?;
         }
+
+        // Write as a block
+        Self::write_block(&mut guard.writer, &buf)?;
 
         guard
             .writer
@@ -451,14 +506,20 @@ impl GroupCommitWalWriter {
         file.read_exact(&mut version_bytes)
             .map_err(|e| Status::internal(e.to_string()))?;
         let version = u32::from_le_bytes(version_bytes);
-        if version != WAL_VERSION {
-            return Err(Status::internal(format!(
+
+        match version {
+            1 => Self::read_entries_v1(&mut file),
+            2 => Self::read_entries_v2(&mut file),
+            _ => Err(Status::internal(format!(
                 "Unsupported WAL version: {}",
                 version
-            )));
+            ))),
         }
+    }
 
-        // Read entries
+    /// Read entries from WAL v1 format (uncompressed, entry-by-entry)
+    #[allow(clippy::result_large_err)]
+    fn read_entries_v1(file: &mut File) -> Result<MemTable, Status> {
         let mut memtable = BTreeMap::new();
 
         loop {
@@ -496,6 +557,95 @@ impl GroupCommitWalWriter {
         }
 
         Ok(memtable)
+    }
+
+    /// Read entries from WAL v2 format (block-based with optional compression)
+    #[allow(clippy::result_large_err)]
+    fn read_entries_v2(file: &mut File) -> Result<MemTable, Status> {
+        let mut memtable = BTreeMap::new();
+
+        loop {
+            // Read block header
+            let mut flags = [0u8; 1];
+            if file.read_exact(&mut flags).is_err() {
+                break; // End of file
+            }
+
+            let mut uncompressed_size_bytes = [0u8; 4];
+            let mut data_size_bytes = [0u8; 4];
+
+            file.read_exact(&mut uncompressed_size_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            file.read_exact(&mut data_size_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
+            let data_size = u32::from_le_bytes(data_size_bytes) as usize;
+
+            // Read block data
+            let mut data = vec![0u8; data_size];
+            file.read_exact(&mut data)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Decompress if needed
+            let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
+                zstd::decode_all(Cursor::new(&data))
+                    .map_err(|e| Status::internal(format!("Decompression error: {}", e)))?
+            } else {
+                data
+            };
+
+            // Parse entries from buffer
+            Self::parse_entries_from_buffer(&entries_data, &mut memtable)?;
+        }
+
+        Ok(memtable)
+    }
+
+    /// Parse entries from a buffer into a memtable
+    #[allow(clippy::result_large_err)]
+    fn parse_entries_from_buffer(buf: &[u8], memtable: &mut MemTable) -> Result<(), Status> {
+        let mut cursor = Cursor::new(buf);
+
+        loop {
+            let mut ts_bytes = [0u8; 8];
+            if cursor.read_exact(&mut ts_bytes).is_err() {
+                break; // End of buffer
+            }
+
+            let mut klen_bytes = [0u8; 8];
+            let mut vlen_bytes = [0u8; 8];
+
+            cursor
+                .read_exact(&mut klen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            cursor
+                .read_exact(&mut vlen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let key_len = u64::from_le_bytes(klen_bytes);
+            let val_len = u64::from_le_bytes(vlen_bytes);
+
+            let mut key_buf = vec![0u8; key_len as usize];
+            cursor
+                .read_exact(&mut key_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let key = String::from_utf8_lossy(&key_buf).to_string();
+
+            let value = if val_len == u64::MAX {
+                None // Tombstone
+            } else {
+                let mut val_buf = vec![0u8; val_len as usize];
+                cursor
+                    .read_exact(&mut val_buf)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Some(String::from_utf8_lossy(&val_buf).to_string())
+            };
+
+            memtable.insert(key, value);
+        }
+
+        Ok(())
     }
 
     /// Parse WAL filename and return WAL ID
@@ -559,30 +709,12 @@ mod tests {
         fn append(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
             let mut wal = self.writer.lock().unwrap();
 
-            let key_bytes = key.as_bytes();
-            let key_len = key_bytes.len() as u64;
-            let (val_len, val_bytes): (u64, &[u8]) = match value {
-                Some(v) => (v.len() as u64, v.as_bytes()),
-                None => (u64::MAX, &[]),
-            };
+            // Serialize entry to buffer (v2 format)
+            let mut buf = Vec::new();
+            GroupCommitWalWriter::serialize_entry(&mut buf, key, value)?;
 
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-
-            wal.write_all(&timestamp.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            wal.write_all(&key_len.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            wal.write_all(&val_len.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            wal.write_all(key_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if val_len != u64::MAX {
-                wal.write_all(val_bytes)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-            }
+            // Write as uncompressed block (test data is small)
+            GroupCommitWalWriter::write_block(&mut wal, &buf)?;
 
             wal.sync_all()
                 .map_err(|e| Status::internal(e.to_string()))?;
