@@ -86,9 +86,9 @@ impl MappedSSTable {
         }
 
         let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if !(4..=6).contains(&version) {
+        if !(5..=6).contains(&version) {
             return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
+                "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
                 version
             )));
         }
@@ -166,48 +166,8 @@ impl MappedSSTable {
         let decompressed = zstd::decode_all(Cursor::new(compressed))
             .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
 
-        // Parse index entries based on version
-        if self.version >= 5 {
-            self.parse_index_v5(&decompressed)
-        } else {
-            self.parse_index_v4(&decompressed)
-        }
-    }
-
-    /// Parse V4 index format (no prefix compression)
-    #[allow(clippy::result_large_err)]
-    fn parse_index_v4(&self, decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
-        let mut cursor = Cursor::new(decompressed);
-        let mut num_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut num_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let num_entries = u64::from_le_bytes(num_bytes);
-
-        let mut index = Vec::with_capacity(num_entries as usize);
-        for _ in 0..num_entries {
-            let mut klen_bytes = [0u8; 8];
-            cursor
-                .read_exact(&mut klen_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let key_len = u64::from_le_bytes(klen_bytes);
-
-            let mut key_buf = vec![0u8; key_len as usize];
-            cursor
-                .read_exact(&mut key_buf)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let key = String::from_utf8_lossy(&key_buf).to_string();
-
-            let mut off_bytes = [0u8; 8];
-            cursor
-                .read_exact(&mut off_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let offset = u64::from_le_bytes(off_bytes);
-
-            index.push((key, offset));
-        }
-
-        Ok(index)
+        // Parse index entries (v5+ uses prefix compression)
+        self.parse_index_v5(&decompressed)
     }
 
     /// Parse V5 index format (with prefix compression)
@@ -375,9 +335,9 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(4..=6).contains(&version) {
+    if !(5..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
             version
         )));
     }
@@ -399,12 +359,8 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
 
-    // Read index (V5 uses prefix compression)
-    let index = if version >= 5 {
-        read_index_prefix_compressed(&mut file, index_offset)?
-    } else {
-        read_index_compressed(&mut file, index_offset)?
-    };
+    // Read index (v5+ uses prefix compression)
+    let index = read_index_prefix_compressed(&mut file, index_offset)?;
 
     // Binary search in index
     let start_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
@@ -660,9 +616,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(4..=6).contains(&version) {
+    if !(5..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
             version
         )));
     }
@@ -684,12 +640,8 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
 
-    // Read and decompress index (V5 uses prefix compression)
-    let index = if version >= 5 {
-        read_index_prefix_compressed(&mut file, index_offset)?
-    } else {
-        read_index_compressed(&mut file, index_offset)?
-    };
+    // Read and decompress index (v5+ uses prefix compression)
+    let index = read_index_prefix_compressed(&mut file, index_offset)?;
     let arc_index = Arc::new(index);
 
     // Cache it
@@ -841,9 +793,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if !(4..=6).contains(&version) {
+    if !(5..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
             version
         )));
     }
@@ -959,9 +911,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(4..=6).contains(&version) {
+    if !(5..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
             version
         )));
     }
@@ -1391,9 +1343,9 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if !(4..=6).contains(&version) {
+    if !(5..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
             version
         )));
     }
@@ -1694,58 +1646,6 @@ fn read_index_prefix_compressed(
     Ok(index)
 }
 
-#[allow(clippy::result_large_err)]
-#[allow(dead_code)]
-fn read_index_compressed(file: &mut File, index_offset: u64) -> Result<Vec<(String, u64)>, Status> {
-    file.seek(SeekFrom::Start(index_offset))
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let len = u64::from_le_bytes(len_bytes);
-
-    let mut compressed = vec![0u8; len as usize];
-    file.read_exact(&mut compressed)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let decompressed = zstd::decode_all(Cursor::new(&compressed))
-        .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
-
-    let mut cursor = Cursor::new(decompressed);
-    let mut num_bytes = [0u8; 8];
-    cursor
-        .read_exact(&mut num_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let num_entries = u64::from_le_bytes(num_bytes);
-
-    let mut index = Vec::with_capacity(num_entries as usize);
-
-    for _ in 0..num_entries {
-        let mut klen_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut klen_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let key_len = u64::from_le_bytes(klen_bytes);
-
-        let mut key_buf = vec![0u8; key_len as usize];
-        cursor
-            .read_exact(&mut key_buf)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let key = String::from_utf8_lossy(&key_buf).to_string();
-
-        let mut off_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut off_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let offset = u64::from_le_bytes(off_bytes);
-
-        index.push((key, offset));
-    }
-
-    Ok(index)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1856,16 +1756,15 @@ mod tests {
     }
 
     #[test]
-    fn test_read_bloom_filter_v4() {
+    fn test_read_bloom_filter() {
         let dir = tempdir().unwrap();
-        let sst_path = dir.path().join("sst_bloom_v4.data");
+        let sst_path = dir.path().join("sst_bloom.data");
 
         let mut memtable = BTreeMap::new();
         memtable.insert("apple".to_string(), Some("red".to_string()));
         memtable.insert("banana".to_string(), Some("yellow".to_string()));
         memtable.insert("cherry".to_string(), Some("red".to_string()));
 
-        // This creates a V4 SSTable with embedded Bloom filter
         create_from_memtable(&sst_path, &memtable).unwrap();
 
         // Read the Bloom filter from the SSTable
