@@ -153,20 +153,10 @@ impl LsmTreeEngine {
                 }
             };
 
-            // Try to read embedded Bloom filter (V4 format), fall back to building from keys
-            let bloom = match mmap.read_bloom_filter() {
-                Ok(Some(bf)) => bf,
-                Ok(None) | Err(_) => {
-                    // V3 format or error: build Bloom filter from keys
-                    let keys = sstable::read_keys(p)
-                        .expect("Failed to read SSTable keys for Bloom filter");
-                    let mut bf = BloomFilter::new(keys.len().max(1), 0.01);
-                    for key in &keys {
-                        bf.insert(key);
-                    }
-                    bf
-                }
-            };
+            // Read embedded Bloom filter
+            let bloom = mmap
+                .read_bloom_filter()
+                .expect("Failed to read Bloom filter from SSTable");
             sst_handles.push(Arc::new(SstableHandle { mmap, bloom }));
         }
 

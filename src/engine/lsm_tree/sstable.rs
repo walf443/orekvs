@@ -16,13 +16,8 @@ pub const DATA_VERSION: u32 = 5;
 
 // Header size: 6 bytes magic + 4 bytes version
 pub const HEADER_SIZE: u64 = 10;
-// Footer size for V5: index_offset(8) + bloom_offset(8) + footer_magic(8)
-#[allow(dead_code)]
-pub const FOOTER_SIZE_V5: u64 = 24;
-// Footer size for V4: index_offset(8) + bloom_offset(8) + footer_magic(8)
-pub const FOOTER_SIZE_V4: u64 = 24;
-// Footer size for V3 (legacy): index_offset(8)
-pub const FOOTER_SIZE_V3: u64 = 8;
+// Footer size: index_offset(8) + bloom_offset(8) + footer_magic(8)
+pub const FOOTER_SIZE: u64 = 24;
 
 // Prefix compression restart interval for index
 // Every N entries, store full key for random access
@@ -52,7 +47,7 @@ pub struct MappedSSTable {
     path: PathBuf,
     version: u32,
     index_offset: u64,
-    bloom_offset: Option<u64>, // None for V3 format
+    bloom_offset: u64,
 }
 
 impl MappedSSTable {
@@ -79,44 +74,27 @@ impl MappedSSTable {
         }
 
         let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if version != 3 && version != 4 && version != 5 {
+        if version != 4 && version != 5 {
             return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
+                "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
                 version
             )));
         }
 
         let file_len = mmap.len();
-        let footer_size = if version >= 4 {
-            FOOTER_SIZE_V4 as usize // V4 and V5 have same footer size
-        } else {
-            FOOTER_SIZE_V3 as usize
-        };
-
-        if file_len < HEADER_SIZE as usize + footer_size {
+        if file_len < HEADER_SIZE as usize + FOOTER_SIZE as usize {
             return Err(Status::internal("SSTable file too small for footer"));
         }
 
         // Read footer
-        let (index_offset, bloom_offset) = if version >= 4 {
-            let footer_start = file_len - FOOTER_SIZE_V4 as usize;
-            let footer = mmap.slice(footer_start, footer_start + 24);
-            let idx_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-            let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-            let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-            if magic != FOOTER_MAGIC {
-                return Err(Status::internal("Invalid footer magic"));
-            }
-            (idx_off, Some(bloom_off))
-        } else {
-            let footer_start = file_len - FOOTER_SIZE_V3 as usize;
-            let idx_off = u64::from_le_bytes(
-                mmap.slice(footer_start, footer_start + 8)
-                    .try_into()
-                    .unwrap(),
-            );
-            (idx_off, None)
-        };
+        let footer_start = file_len - FOOTER_SIZE as usize;
+        let footer = mmap.slice(footer_start, footer_start + 24);
+        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+        let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        if magic != FOOTER_MAGIC {
+            return Err(Status::internal("Invalid footer magic"));
+        }
 
         Ok(Self {
             mmap,
@@ -285,13 +263,10 @@ impl MappedSSTable {
             .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))
     }
 
-    /// Read and deserialize the Bloom filter (V4 only)
+    /// Read and deserialize the Bloom filter
     #[allow(clippy::result_large_err)]
-    pub fn read_bloom_filter(&self) -> Result<Option<BloomFilter>, Status> {
-        let bloom_offset = match self.bloom_offset {
-            Some(off) => off as usize,
-            None => return Ok(None), // V3 format
-        };
+    pub fn read_bloom_filter(&self) -> Result<BloomFilter, Status> {
+        let bloom_offset = self.bloom_offset as usize;
 
         // Read bloom filter size
         let size_bytes = self
@@ -307,7 +282,6 @@ impl MappedSSTable {
             .ok_or_else(|| Status::internal("Failed to read Bloom filter data"))?;
 
         BloomFilter::deserialize(bloom_data)
-            .map(Some)
             .ok_or_else(|| Status::internal("Failed to deserialize Bloom filter"))
     }
 }
@@ -357,9 +331,9 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 && version != 4 && version != 5 {
+    if version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
             version
         )));
     }
@@ -369,32 +343,17 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version >= 4 {
-        FOOTER_SIZE_V4
-    } else {
-        FOOTER_SIZE_V3
-    };
-
-    if file_len < HEADER_SIZE + footer_size {
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
         return Err(Status::internal("SSTable file too small"));
     }
 
     // Read footer to get index offset
-    let index_offset = if version >= 4 {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut footer = [0u8; 24];
-        file.read_exact(&mut footer)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(footer[0..8].try_into().unwrap())
-    } else {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut index_offset_bytes = [0u8; 8];
-        file.read_exact(&mut index_offset_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(index_offset_bytes)
-    };
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut footer = [0u8; 24];
+    file.read_exact(&mut footer)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
 
     // Read index (V5 uses prefix compression)
     let index = if version >= 5 {
@@ -642,9 +601,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 && version != 4 && version != 5 {
+    if version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
             version
         )));
     }
@@ -654,32 +613,17 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version >= 4 {
-        FOOTER_SIZE_V4
-    } else {
-        FOOTER_SIZE_V3
-    };
-
-    if file_len < HEADER_SIZE + footer_size {
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
         return Err(Status::internal("SSTable file too small"));
     }
 
     // Read footer to get index offset
-    let index_offset = if version >= 4 {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut footer = [0u8; 24];
-        file.read_exact(&mut footer)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(footer[0..8].try_into().unwrap())
-    } else {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut index_offset_bytes = [0u8; 8];
-        file.read_exact(&mut index_offset_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(index_offset_bytes)
-    };
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut footer = [0u8; 24];
+    file.read_exact(&mut footer)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
 
     // Read and decompress index (V5 uses prefix compression)
     let index = if version >= 5 {
@@ -820,6 +764,7 @@ fn search_in_parsed_block(
 
 /// Read only keys from an SSTable file
 #[allow(clippy::result_large_err)]
+#[allow(dead_code)]
 pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -837,9 +782,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if version != 3 && version != 4 && version != 5 {
+    if version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
             version
         )));
     }
@@ -849,32 +794,17 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version >= 4 {
-        FOOTER_SIZE_V4
-    } else {
-        FOOTER_SIZE_V3
-    };
-
-    if file_len < HEADER_SIZE + footer_size {
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
         return Ok(Vec::new());
     }
 
     // Read footer to get index offset (marks end of data blocks)
-    let end_offset = if version >= 4 {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut footer = [0u8; 24];
-        file.read_exact(&mut footer)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(footer[0..8].try_into().unwrap())
-    } else {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut index_offset_bytes = [0u8; 8];
-        file.read_exact(&mut index_offset_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(index_offset_bytes)
-    };
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut footer = [0u8; 24];
+    file.read_exact(&mut footer)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let end_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
 
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -962,9 +892,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 && version != 4 && version != 5 {
+    if version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
             version
         )));
     }
@@ -974,39 +904,22 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version >= 4 {
-        FOOTER_SIZE_V4
-    } else {
-        FOOTER_SIZE_V3
-    };
-
-    if file_len < HEADER_SIZE + footer_size {
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
         return Ok(BTreeMap::new()); // Corrupt or empty?
     }
 
     // Read footer to get index offset (which marks end of data blocks)
-    let end_offset = if version >= 4 {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut footer = [0u8; 24];
-        file.read_exact(&mut footer)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(footer[0..8].try_into().unwrap())
-    } else {
-        file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V3))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut index_offset_bytes = [0u8; 8];
-        file.read_exact(&mut index_offset_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        u64::from_le_bytes(index_offset_bytes)
-    };
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut footer = [0u8; 24];
+    file.read_exact(&mut footer)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let end_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
 
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
 
     let mut entries = BTreeMap::new();
-
-    // V3: Block Compressed
     loop {
         // Check if we reached end of data
         if file
@@ -1362,15 +1275,14 @@ pub fn generate_path(data_dir: &Path, sst_id: u64, wal_id: u64) -> PathBuf {
     data_dir.join(generate_filename(sst_id, wal_id))
 }
 
-/// Read Bloom filter from SSTable file (V4 format)
-/// Returns None for V3 format (Bloom filter not embedded)
+/// Read Bloom filter from SSTable file
 #[allow(clippy::result_large_err)]
 #[allow(dead_code)]
-pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
+pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
+            return Err(Status::not_found("SSTable file not found"));
         }
         Err(e) => return Err(Status::internal(e.to_string())),
     };
@@ -1385,10 +1297,11 @@ pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-
-    if version < 4 {
-        // V3 or earlier: no embedded Bloom filter
-        return Ok(None);
+    if version != 4 && version != 5 {
+        return Err(Status::internal(format!(
+            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+            version
+        )));
     }
 
     let file_len = file
@@ -1396,19 +1309,18 @@ pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    if file_len < HEADER_SIZE + FOOTER_SIZE_V4 {
-        return Err(Status::internal("SSTable file too small for V4 format"));
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
+        return Err(Status::internal("SSTable file too small"));
     }
 
     // Read footer
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
 
     let mut footer = [0u8; 24];
     file.read_exact(&mut footer)
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    let _index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
     let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
     let footer_magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
 
@@ -1432,7 +1344,6 @@ pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
 
     BloomFilter::deserialize(&bloom_data)
-        .map(Some)
         .ok_or_else(|| Status::internal("Failed to deserialize Bloom filter"))
 }
 
@@ -1802,9 +1713,7 @@ mod tests {
         create_from_memtable(&sst_path, &memtable).unwrap();
 
         // Read the Bloom filter from the SSTable
-        let bloom = read_bloom_filter(&sst_path)
-            .expect("should read successfully")
-            .expect("should have Bloom filter (V4)");
+        let bloom = read_bloom_filter(&sst_path).expect("should read successfully");
 
         // Verify the Bloom filter contains the keys
         assert!(bloom.contains("apple"));
