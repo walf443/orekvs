@@ -13,7 +13,14 @@ use super::memtable::MemTable;
 use super::mmap::MappedFile;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 5;
+pub const DATA_VERSION: u32 = 6;
+
+/// Compute CRC32C checksum
+fn crc32(data: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
+}
 
 // Header size: 6 bytes magic + 4 bytes version
 pub const HEADER_SIZE: u64 = 10;
@@ -79,9 +86,9 @@ impl MappedSSTable {
         }
 
         let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if version != 4 && version != 5 {
+        if !(4..=6).contains(&version) {
             return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+                "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
                 version
             )));
         }
@@ -139,6 +146,22 @@ impl MappedSSTable {
             .mmap
             .read_at(offset + 8, len)
             .ok_or_else(|| Status::internal("Failed to read index data"))?;
+
+        // Verify checksum for v6+
+        if self.version >= 6 {
+            let stored_crc_bytes = self
+                .mmap
+                .read_at(offset + 8 + len, 4)
+                .ok_or_else(|| Status::internal("Failed to read index checksum"))?;
+            let stored_crc = u32::from_le_bytes(stored_crc_bytes.try_into().unwrap());
+            let computed_crc = crc32(compressed);
+            if stored_crc != computed_crc {
+                return Err(Status::data_loss(format!(
+                    "Index checksum mismatch: expected {:08x}, got {:08x}",
+                    stored_crc, computed_crc
+                )));
+            }
+        }
 
         let decompressed = zstd::decode_all(Cursor::new(compressed))
             .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
@@ -264,6 +287,22 @@ impl MappedSSTable {
             .read_at(offset + 4, len)
             .ok_or_else(|| Status::internal("Failed to read block data"))?;
 
+        // Verify checksum for v6+
+        if self.version >= 6 {
+            let stored_crc_bytes = self
+                .mmap
+                .read_at(offset + 4 + len, 4)
+                .ok_or_else(|| Status::internal("Failed to read block checksum"))?;
+            let stored_crc = u32::from_le_bytes(stored_crc_bytes.try_into().unwrap());
+            let computed_crc = crc32(compressed);
+            if stored_crc != computed_crc {
+                return Err(Status::data_loss(format!(
+                    "Block checksum mismatch: expected {:08x}, got {:08x}",
+                    stored_crc, computed_crc
+                )));
+            }
+        }
+
         zstd::decode_all(Cursor::new(compressed))
             .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))
     }
@@ -336,9 +375,9 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 4 && version != 5 {
+    if !(4..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
             version
         )));
     }
@@ -393,6 +432,21 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
     file.read_exact(&mut compressed_block)
         .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Verify checksum for v6+
+    if version >= 6 {
+        let mut checksum_bytes = [0u8; 4];
+        file.read_exact(&mut checksum_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let stored_checksum = u32::from_le_bytes(checksum_bytes);
+        let computed_checksum = crc32(&compressed_block);
+        if stored_checksum != computed_checksum {
+            return Err(Status::data_loss(format!(
+                "Block checksum mismatch: expected {:08x}, got {:08x}",
+                stored_checksum, computed_checksum
+            )));
+        }
+    }
 
     let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
         .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
@@ -606,9 +660,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 4 && version != 5 {
+    if !(4..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
             version
         )));
     }
@@ -787,9 +841,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if version != 4 && version != 5 {
+    if !(4..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
             version
         )));
     }
@@ -834,6 +888,14 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
         let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
         file.read_exact(&mut compressed_block)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Skip checksum for v6+
+        if version >= 6 {
+            let mut checksum_bytes = [0u8; 4];
+            file.read_exact(&mut checksum_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            // Checksum verification is optional for read_keys since it's not critical
+        }
 
         let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
             .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
@@ -897,9 +959,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 4 && version != 5 {
+    if !(4..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
             version
         )));
     }
@@ -944,6 +1006,21 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
         file.read_exact(&mut compressed_block)
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Verify and skip checksum for v6+
+        if version >= 6 {
+            let mut checksum_bytes = [0u8; 4];
+            file.read_exact(&mut checksum_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let stored_checksum = u32::from_le_bytes(checksum_bytes);
+            let computed_checksum = crc32(&compressed_block);
+            if stored_checksum != computed_checksum {
+                return Err(Status::data_loss(format!(
+                    "Block checksum mismatch: expected {:08x}, got {:08x}",
+                    stored_checksum, computed_checksum
+                )));
+            }
+        }
 
         let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
             .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
@@ -1036,19 +1113,22 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         write_entry(&mut block_buffer, key, value_opt, None)?;
 
         if block_buffer.len() >= BLOCK_SIZE {
-            // Compress and write block
+            // Compress and write block with checksum
             index.push((first_key_in_block.clone(), current_offset));
 
             let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_FLUSH)
                 .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
             let len = compressed.len() as u32;
+            let checksum = crc32(&compressed);
             file.write_all(&len.to_le_bytes())
                 .map_err(|e| Status::internal(e.to_string()))?;
             file.write_all(&compressed)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            file.write_all(&checksum.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
 
-            current_offset += 4 + len as u64;
+            current_offset += 4 + len as u64 + 4; // len + data + checksum
             block_buffer.clear();
         }
     }
@@ -1061,17 +1141,20 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
             .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
         let len = compressed.len() as u32;
+        let checksum = crc32(&compressed);
         file.write_all(&len.to_le_bytes())
             .map_err(|e| Status::internal(e.to_string()))?;
         file.write_all(&compressed)
             .map_err(|e| Status::internal(e.to_string()))?;
+        file.write_all(&checksum.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
 
-        current_offset += 4 + len as u64;
+        current_offset += 4 + len as u64 + 4;
     }
 
-    // Write index with prefix compression (V5)
+    // Write index with prefix compression (V6 with checksum)
     let index_offset = current_offset;
-    let index_size = write_index_prefix_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = write_index_prefix_compressed_v6(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
     current_offset += index_size;
 
     // Write Bloom filter
@@ -1152,12 +1235,15 @@ pub fn write_timestamped_entries(
                     .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
             let len = compressed.len() as u32;
+            let checksum = crc32(&compressed);
             file.write_all(&len.to_le_bytes())
                 .map_err(|e| Status::internal(e.to_string()))?;
             file.write_all(&compressed)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            file.write_all(&checksum.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
 
-            current_offset += 4 + len as u64;
+            current_offset += 4 + len as u64 + 4; // len + data + checksum
             block_buffer.clear();
         }
     }
@@ -1170,17 +1256,20 @@ pub fn write_timestamped_entries(
             .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
 
         let len = compressed.len() as u32;
+        let checksum = crc32(&compressed);
         file.write_all(&len.to_le_bytes())
             .map_err(|e| Status::internal(e.to_string()))?;
         file.write_all(&compressed)
             .map_err(|e| Status::internal(e.to_string()))?;
+        file.write_all(&checksum.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
 
-        current_offset += 4 + len as u64;
+        current_offset += 4 + len as u64 + 4;
     }
 
-    // Write index with prefix compression (V5)
+    // Write index with prefix compression (V6 with checksum)
     let index_offset = current_offset;
-    let index_size = write_index_prefix_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = write_index_prefix_compressed_v6(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
     current_offset += index_size;
 
     // Write Bloom filter
@@ -1302,9 +1391,9 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if version != 4 && version != 5 {
+    if !(4..=6).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 4 and 5 are supported.",
+            "Unsupported SSTable version: {}. Only versions 4-6 are supported.",
             version
         )));
     }
@@ -1407,6 +1496,7 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 ///   - prefix_len (u16) + suffix_len (u16) + suffix + offset (u64)
 ///   - Restart points have prefix_len = 0, suffix = full key
 #[allow(clippy::result_large_err)]
+#[allow(dead_code)]
 fn write_index_prefix_compressed(
     file: &mut File,
     index: &[(String, u64)],
@@ -1463,6 +1553,67 @@ fn write_index_prefix_compressed(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     Ok(8 + len)
+}
+
+/// Write index with prefix compression and checksum (V6 format)
+#[allow(clippy::result_large_err)]
+fn write_index_prefix_compressed_v6(
+    file: &mut File,
+    index: &[(String, u64)],
+    compression_level: i32,
+) -> Result<u64, Status> {
+    let mut buffer = Vec::new();
+    let num_entries = index.len() as u64;
+
+    buffer
+        .write_all(&num_entries.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    buffer
+        .write_all(&INDEX_RESTART_INTERVAL.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut prev_key: &[u8] = &[];
+
+    for (i, (key, offset)) in index.iter().enumerate() {
+        let key_bytes = key.as_bytes();
+
+        let prefix_len = if (i as u32).is_multiple_of(INDEX_RESTART_INTERVAL) {
+            0
+        } else {
+            common_prefix_len(prev_key, key_bytes)
+        };
+        let suffix = &key_bytes[prefix_len..];
+
+        buffer
+            .write_all(&(prefix_len as u16).to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        buffer
+            .write_all(&(suffix.len() as u16).to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        buffer
+            .write_all(suffix)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        buffer
+            .write_all(&offset.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        prev_key = key_bytes;
+    }
+
+    let compressed = zstd::encode_all(Cursor::new(&buffer), compression_level)
+        .map_err(|e| Status::internal(format!("Index compression error: {}", e)))?;
+
+    // Write compressed size, data, and checksum
+    let len = compressed.len() as u64;
+    let checksum = crc32(&compressed);
+    file.write_all(&len.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&compressed)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&checksum.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok(8 + len + 4) // size + data + checksum
 }
 
 /// Read index with prefix compression (V5 format)
@@ -1793,11 +1944,12 @@ mod tests {
 
         let result = search_key(&sst_path, "key1");
         assert!(result.is_err());
+        // With v6 format, we now detect corruption via checksum
+        let err_msg = result.unwrap_err().message().to_string();
         assert!(
-            result
-                .unwrap_err()
-                .message()
-                .contains("decompression error")
+            err_msg.contains("checksum mismatch") || err_msg.contains("decompression error"),
+            "Expected checksum or decompression error, got: {}",
+            err_msg
         );
     }
 

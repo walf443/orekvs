@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
 crossbeam-skiplist = "0.1"
 lru = "0.12"
 memmap2 = "0.9"

@@ -171,24 +171,19 @@ impl ReplicationService {
             .map_err(|e| Status::internal(e.to_string()))?
             .len();
 
-        // Read WAL version from header
-        let version = if offset == 0 {
-            // Read header
-            let mut magic = [0u8; 9];
-            file.read_exact(&mut magic)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            if &magic != b"ORELSMWAL" {
-                return Err(Status::internal("Invalid WAL magic bytes"));
-            }
-            let mut version_bytes = [0u8; 4];
-            file.read_exact(&mut version_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            u32::from_le_bytes(version_bytes)
-        } else {
-            // Already past header, assume v2 (current version)
-            2
-        };
+        // Always read WAL version from header
+        let mut magic = [0u8; 9];
+        file.read_exact(&mut magic)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if &magic != b"ORELSMWAL" {
+            return Err(Status::internal("Invalid WAL magic bytes"));
+        }
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let version = u32::from_le_bytes(version_bytes);
 
+        // If offset is 0, start after header (13 bytes); otherwise use provided offset
         let start_offset = if offset == 0 { 13 } else { offset };
 
         if start_offset >= file_len {
@@ -221,6 +216,17 @@ impl ReplicationService {
                 max_entries,
                 max_bytes,
                 &wal_files,
+                false, // no checksum
+            ),
+            3 => self.read_wal_entries_v2(
+                &mut file,
+                wal_id,
+                start_offset,
+                file_len,
+                max_entries,
+                max_bytes,
+                &wal_files,
+                true, // with checksum
             ),
             _ => Err(Status::internal(format!(
                 "Unsupported WAL version: {}",
@@ -341,7 +347,8 @@ impl ReplicationService {
         Ok((entries, wal_id, current_offset, has_more))
     }
 
-    /// Read WAL entries in v2 format (block-based with optional compression)
+    /// Read WAL entries in v2/v3 format (block-based with optional compression)
+    /// v3 adds a 4-byte checksum after each block
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
     fn read_wal_entries_v2(
         &self,
@@ -352,6 +359,7 @@ impl ReplicationService {
         max_entries: usize,
         max_bytes: usize,
         wal_files: &[(u64, PathBuf)],
+        has_checksum: bool,
     ) -> Result<(Vec<WalEntry>, u64, u64, bool), Status> {
         const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
         const MIN_TIMESTAMP: u64 = 1577836800; // 2020-01-01
@@ -387,6 +395,14 @@ impl ReplicationService {
                 break;
             }
 
+            // Skip checksum for v3
+            if has_checksum {
+                let mut _checksum_bytes = [0u8; 4];
+                if file.read_exact(&mut _checksum_bytes).is_err() {
+                    break;
+                }
+            }
+
             // Decompress if needed
             let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
                 zstd::decode_all(Cursor::new(&data))
@@ -396,7 +412,7 @@ impl ReplicationService {
             };
 
             // Update offset to point to next block
-            let block_size = 9 + data_size;
+            let block_size = 9 + data_size + if has_checksum { 4 } else { 0 };
             current_offset += block_size as u64;
             bytes_read += block_size;
 
