@@ -17,7 +17,7 @@ use kv::{
 use crate::engine::{
     Engine,
     log::LogEngine,
-    lsm_tree::{DEFAULT_WAL_BATCH_INTERVAL_MICROS, LsmTreeEngine, WalArchiveConfig},
+    lsm_tree::{DEFAULT_WAL_BATCH_INTERVAL_MICROS, LsmTreeEngine, SnapshotLock, WalArchiveConfig},
     memory::MemoryEngine,
 };
 use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationService};
@@ -318,10 +318,20 @@ pub async fn run_server(
 
     println!("Server listening on {}", addr);
 
+    // Get snapshot lock from LSM engine if available
+    let snapshot_lock: Option<SnapshotLock> = lsm_holder
+        .engine
+        .as_ref()
+        .map(|engine| engine.snapshot_lock());
+
     // Start replication service if enabled
     let replication_handle = if let Some(repl_addr) = replication_addr {
         println!("Replication service listening on {}", repl_addr);
-        let replication_service = ReplicationService::new(PathBuf::from(&data_dir));
+        let replication_service = if let Some(lock) = snapshot_lock {
+            ReplicationService::new(PathBuf::from(&data_dir), lock)
+        } else {
+            ReplicationService::new_without_lock(PathBuf::from(&data_dir))
+        };
         let handle = tokio::spawn(async move {
             if let Err(e) = Server::builder()
                 .add_service(ReplicationServer::new(replication_service))
@@ -624,9 +634,13 @@ impl FollowerState {
         }
     }
 
-    async fn start_replication_service(&self, port: u16) -> Result<(), Status> {
+    async fn start_replication_service(
+        &self,
+        port: u16,
+        snapshot_lock: SnapshotLock,
+    ) -> Result<(), Status> {
         let repl_addr = std::net::SocketAddr::new(self.server_addr.ip(), port);
-        let replication_service = ReplicationService::new(self.data_dir.clone());
+        let replication_service = ReplicationService::new(self.data_dir.clone(), snapshot_lock);
 
         println!("Starting replication service on {}", repl_addr);
 
@@ -831,7 +845,17 @@ impl KeyValue for SwappableFollowerKeyValue {
                 self.state.server_addr.port() + 1
             };
 
-            if let Err(e) = self.state.start_replication_service(port).await {
+            // Get snapshot lock from engine
+            let snapshot_lock = {
+                let engine = self.engine_holder.read().unwrap();
+                engine.snapshot_lock()
+            };
+
+            if let Err(e) = self
+                .state
+                .start_replication_service(port, snapshot_lock)
+                .await
+            {
                 return Ok(Response::new(PromoteResponse {
                     success: true,
                     message: format!(

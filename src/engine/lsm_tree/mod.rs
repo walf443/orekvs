@@ -17,9 +17,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
 use wal::GroupCommitWalWriter;
+
+/// Lock to prevent SSTable deletion during snapshot transfer.
+/// Snapshot transfer holds a read lock; compaction deletion requires a write lock.
+pub type SnapshotLock = Arc<RwLock<()>>;
 
 /// Handle to an SSTable with mmap reader and its Bloom filter
 struct SstableHandle {
@@ -83,6 +87,8 @@ pub struct LsmTreeEngine {
     metrics: Arc<EngineMetrics>,
     // WAL archive configuration
     wal_archive_config: WalArchiveConfig,
+    // Lock to prevent SSTable deletion during snapshot transfer
+    snapshot_lock: SnapshotLock,
 }
 
 impl Clone for LsmTreeEngine {
@@ -98,6 +104,7 @@ impl Clone for LsmTreeEngine {
             block_cache: Arc::clone(&self.block_cache),
             metrics: Arc::clone(&self.metrics),
             wal_archive_config: self.wal_archive_config.clone(),
+            snapshot_lock: Arc::clone(&self.snapshot_lock),
         }
     }
 }
@@ -283,6 +290,7 @@ impl LsmTreeEngine {
             block_cache: Arc::new(BlockCache::new(DEFAULT_BLOCK_CACHE_SIZE_BYTES)),
             metrics: Arc::new(EngineMetrics::new()),
             wal_archive_config,
+            snapshot_lock: Arc::new(RwLock::new(())),
         }
     }
 
@@ -492,6 +500,12 @@ impl LsmTreeEngine {
         self.block_cache.reset_stats();
     }
 
+    /// Get the snapshot lock for use by ReplicationService.
+    /// Hold a read lock during snapshot transfer to prevent SSTable deletion.
+    pub fn snapshot_lock(&self) -> SnapshotLock {
+        Arc::clone(&self.snapshot_lock)
+    }
+
     /// Run compaction: merge all SSTables into a single new SSTable and delete old ones
     async fn run_compaction(&self) -> Result<(), Status> {
         println!("Starting compaction...");
@@ -581,15 +595,19 @@ impl LsmTreeEngine {
             *sstables = new_list;
         }
 
-        // Delete old SSTable files after updating the list
-        for handle in &sst_handles {
-            let path = handle.mmap.path();
-            if let Err(e) = fs::remove_file(path) {
-                eprintln!("Failed to delete old SSTable {:?}: {}", path, e);
-            } else {
-                println!("Deleted old SSTable: {:?}", path);
-                // Invalidate cache entries for deleted file
-                self.block_cache.invalidate_file(path);
+        // Delete old SSTable files after updating the list.
+        // Acquire write lock to ensure no snapshot transfer is in progress.
+        {
+            let _lock = self.snapshot_lock.write().unwrap();
+            for handle in &sst_handles {
+                let path = handle.mmap.path();
+                if let Err(e) = fs::remove_file(path) {
+                    eprintln!("Failed to delete old SSTable {:?}: {}", path, e);
+                } else {
+                    println!("Deleted old SSTable: {:?}", path);
+                    // Invalidate cache entries for deleted file
+                    self.block_cache.invalidate_file(path);
+                }
             }
         }
 
@@ -1770,5 +1788,103 @@ mod tests {
             "Expected multiple WAL files when archiving is disabled, got {}",
             wal_count
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_snapshot_lock_prevents_sstable_deletion_during_compaction() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        // Create engine with compaction trigger of 2
+        let engine = LsmTreeEngine::new(data_dir.clone(), 50, 2);
+
+        // Helper to count SSTable files
+        let count_sstables = || -> usize {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name.starts_with("sst_") && name.ends_with(".data"))
+                })
+                .count()
+        };
+
+        // Acquire read lock BEFORE creating SSTables (simulating ongoing snapshot transfer)
+        let snapshot_lock = engine.snapshot_lock();
+        let read_guard = snapshot_lock.read().unwrap();
+        println!("Acquired snapshot read lock before writing data");
+
+        // Track if compaction tried to delete files (it should be blocked)
+        let sstable_count_before_compaction = Arc::new(AtomicUsize::new(0));
+
+        // Write data to create multiple SSTables and trigger compaction
+        for i in 0..6 {
+            engine
+                .set(format!("key{}", i), format!("value{}", i))
+                .unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        // Wait for SSTables to be created and compaction to be triggered
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let count_while_locked = count_sstables();
+        sstable_count_before_compaction.store(count_while_locked, Ordering::SeqCst);
+        println!(
+            "SSTable count while holding lock: {} (compaction should be blocked)",
+            count_while_locked
+        );
+
+        // Should have multiple SSTables because compaction can't delete old ones
+        // (merged SSTable is created but old ones are not deleted yet)
+        assert!(
+            count_while_locked >= 2,
+            "Expected at least 2 SSTables while lock is held (old ones not deleted), got {}",
+            count_while_locked
+        );
+
+        // Verify data is accessible even with pending compaction
+        for i in 0..6 {
+            assert_eq!(
+                engine.get(format!("key{}", i)).unwrap(),
+                format!("value{}", i)
+            );
+        }
+        println!("Data verified while holding lock");
+
+        // Release the lock - now compaction can delete old SSTables
+        drop(read_guard);
+        println!("Released snapshot read lock");
+
+        // Wait for compaction to complete deletion
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+        let final_count = count_sstables();
+        println!(
+            "Final SSTable count after lock released: {} (was {})",
+            final_count, count_while_locked
+        );
+
+        // After lock is released, old SSTables should be deleted
+        // Final count should be less than or equal to count while locked
+        // (compaction merges multiple SSTables into one)
+        assert!(
+            final_count <= count_while_locked,
+            "Expected fewer SSTables after compaction completed"
+        );
+
+        // Verify all data is still accessible after compaction
+        for i in 0..6 {
+            assert_eq!(
+                engine.get(format!("key{}", i)).unwrap(),
+                format!("value{}", i)
+            );
+        }
+        println!("All data verified after compaction completed");
     }
 }

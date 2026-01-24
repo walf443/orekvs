@@ -9,10 +9,12 @@ pub use proto::{
     StreamWalRequest, WalBatch,
 };
 
+use crate::engine::lsm_tree::SnapshotLock;
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
@@ -43,11 +45,25 @@ const SNAPSHOT_CHUNK_SIZE: usize = 64 * 1024;
 /// Leader-side replication service
 pub struct ReplicationService {
     data_dir: PathBuf,
+    /// Lock to prevent SSTable deletion during snapshot transfer
+    snapshot_lock: SnapshotLock,
 }
 
 impl ReplicationService {
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+    pub fn new(data_dir: PathBuf, snapshot_lock: SnapshotLock) -> Self {
+        Self {
+            data_dir,
+            snapshot_lock,
+        }
+    }
+
+    /// Create a new ReplicationService without snapshot lock protection.
+    /// Use this only when snapshot transfer is not needed (e.g., WAL-only streaming).
+    pub fn new_without_lock(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            snapshot_lock: Arc::new(RwLock::new(())),
+        }
     }
 
     /// Get list of WAL files sorted by ID
@@ -406,7 +422,8 @@ impl Replication for ReplicationService {
 
         let peer_addr_str = peer_addr.map(|a| a.to_string()).unwrap_or_default();
         tokio::spawn(async move {
-            let service = ReplicationService::new(data_dir);
+            // This service is only for WAL streaming, doesn't need snapshot lock
+            let service = ReplicationService::new_without_lock(data_dir);
 
             loop {
                 // Check how far behind we are
@@ -555,9 +572,16 @@ impl Replication for ReplicationService {
             return Err(Status::invalid_argument("Invalid filename"));
         }
 
-        // Check file exists
-        if !file_path.exists() {
-            return Err(Status::not_found(format!("File not found: {}", filename)));
+        // Acquire read lock to prevent SSTable deletion during transfer.
+        // This lock is held by the spawned task until the transfer completes.
+        let snapshot_lock = Arc::clone(&self.snapshot_lock);
+
+        // Check file exists while holding the lock
+        {
+            let _lock = snapshot_lock.read().unwrap();
+            if !file_path.exists() {
+                return Err(Status::not_found(format!("File not found: {}", filename)));
+            }
         }
 
         let (tx, rx) = mpsc::channel(16);
@@ -566,6 +590,9 @@ impl Replication for ReplicationService {
         println!("Starting snapshot transfer for file: {}", filename);
 
         tokio::spawn(async move {
+            // Hold read lock for the entire transfer duration
+            let _lock = snapshot_lock.read().unwrap();
+
             let result = (|| -> Result<(), Status> {
                 let mut file =
                     File::open(&file_path).map_err(|e| Status::internal(e.to_string()))?;
