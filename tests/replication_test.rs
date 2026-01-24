@@ -131,18 +131,23 @@ async fn test_leader_follower_replication() {
     );
     println!("Leader started on {}", leader.addr);
 
-    // Write initial data to leader before followers connect
-    println!("Writing initial data to leader...");
-    for i in 0..5 {
+    // Write enough initial data to trigger SSTable flush before followers connect
+    // memtable capacity is 64KB, so we write enough data to exceed that
+    println!("Writing initial data to leader (enough to trigger SSTable flush)...");
+    let large_value = "x".repeat(1024); // 1KB value
+    for i in 0..100 {
+        // 100 * ~1KB = ~100KB > 64KB memtable capacity
         set_key(
             &leader_addr,
             &format!("initial_key{}", i),
-            &format!("initial_value{}", i),
+            &format!("{}_{}", large_value, i),
         )
         .await
         .expect("Failed to write initial data to leader");
     }
-    println!("Wrote 5 initial key-value pairs to leader");
+    // Wait for flush to complete
+    sleep(Duration::from_millis(500)).await;
+    println!("Wrote 100 initial key-value pairs to leader (SSTable should be created)");
 
     // Start follower1
     let follower1_data = follower1.data_path();
@@ -205,10 +210,11 @@ async fn test_leader_follower_replication() {
     // Verify data on followers (including initial data written before followers started)
     println!("Verifying data on followers...");
 
-    // Verify initial data (written before followers connected)
-    for i in 0..5 {
+    // Verify initial data (written before followers connected, includes SSTable data)
+    let large_value = "x".repeat(1024);
+    for i in 0..100 {
         let key = format!("initial_key{}", i);
-        let expected = format!("initial_value{}", i);
+        let expected = format!("{}_{}", large_value, i);
 
         let value1 = get_key(&follower1_addr, &key)
             .await
@@ -228,7 +234,7 @@ async fn test_leader_follower_replication() {
             key
         );
     }
-    println!("Initial data verified on both followers");
+    println!("Initial data (including SSTable data) verified on both followers");
 
     // Verify live data (written after followers connected)
     for i in 0..10 {
@@ -321,17 +327,21 @@ async fn test_follower_failover() {
     );
     println!("[Failover] Leader started");
 
-    // Write initial data before follower starts
-    for i in 0..3 {
+    // Write enough initial data to trigger SSTable flush before follower starts
+    let large_value = "x".repeat(1024); // 1KB value
+    for i in 0..100 {
+        // 100 * ~1KB = ~100KB > 64KB memtable capacity
         set_key(
             &leader_addr,
             &format!("initial_failover_key{}", i),
-            &format!("initial_failover_value{}", i),
+            &format!("{}_{}", large_value, i),
         )
         .await
         .expect("Failed to write initial data to leader");
     }
-    println!("[Failover] Wrote 3 initial keys to leader");
+    // Wait for flush to complete
+    sleep(Duration::from_millis(500)).await;
+    println!("[Failover] Wrote 100 initial keys to leader (SSTable should be created)");
 
     // Start follower
     let follower_data = follower.data_path();
@@ -370,14 +380,15 @@ async fn test_follower_failover() {
     // Wait for replication
     sleep(Duration::from_secs(1)).await;
 
-    // Verify follower has the data (including initial data written before follower started)
-    for i in 0..3 {
+    // Verify follower has the data (including initial SSTable data written before follower started)
+    let large_value = "x".repeat(1024);
+    for i in 0..100 {
         let value = get_key(&follower_addr, &format!("initial_failover_key{}", i))
             .await
             .expect("Failed to read initial data from follower");
-        assert_eq!(value, format!("initial_failover_value{}", i));
+        assert_eq!(value, format!("{}_{}", large_value, i));
     }
-    println!("[Failover] Initial data verified on follower");
+    println!("[Failover] Initial data (including SSTable data) verified on follower");
 
     for i in 0..5 {
         let value = get_key(&follower_addr, &format!("failover_key{}", i))
@@ -399,12 +410,12 @@ async fn test_follower_failover() {
     assert!(promote_result.is_ok(), "Failed to promote follower");
     println!("[Failover] Follower promoted to leader");
 
-    // Verify new leader has all the data (including initial data)
-    for i in 0..3 {
+    // Verify new leader has all the data (including initial SSTable data)
+    for i in 0..100 {
         let value = get_key(&follower_addr, &format!("initial_failover_key{}", i))
             .await
             .expect("Failed to read initial data from new leader");
-        assert_eq!(value, format!("initial_failover_value{}", i));
+        assert_eq!(value, format!("{}_{}", large_value, i));
     }
     for i in 0..5 {
         let value = get_key(&follower_addr, &format!("failover_key{}", i))
