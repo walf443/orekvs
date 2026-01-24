@@ -50,6 +50,11 @@ enum Commands {
         #[arg(long = "lsm-engine-compaction-trigger-file-count", default_value_t = 4)]
         lsm_compaction_trigger_file_count: usize,
 
+        /// WAL group commit batch interval in microseconds for LSM-tree engine
+        /// Higher values increase throughput but also increase latency
+        #[arg(long = "lsm-engine-wal-batch-interval-micros", default_value_t = 100)]
+        lsm_wal_batch_interval_micros: u64,
+
         /// Enable replication service for followers to connect (leader mode)
         #[arg(long)]
         enable_replication: bool,
@@ -175,6 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_capacity_bytes,
             lsm_memtable_capacity_bytes,
             lsm_compaction_trigger_file_count,
+            lsm_wal_batch_interval_micros,
             enable_replication,
             replication_port,
             leader_addr,
@@ -209,6 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     data_dir.clone(),
                     *lsm_memtable_capacity_bytes,
                     *lsm_compaction_trigger_file_count,
+                    *lsm_wal_batch_interval_micros,
                     addr,
                     wal_archive_config,
                 )
@@ -228,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *log_capacity_bytes,
                     *lsm_memtable_capacity_bytes,
                     *lsm_compaction_trigger_file_count,
+                    *lsm_wal_batch_interval_micros,
                     repl_addr,
                     wal_archive_config,
                 )

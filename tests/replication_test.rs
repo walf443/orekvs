@@ -120,6 +120,7 @@ async fn test_leader_follower_replication() {
             1024 * 1024, // log capacity
             64 * 1024,   // memtable capacity (small for testing)
             2,           // compaction trigger
+            100,         // wal batch interval micros
             Some(format!("127.0.0.1:{}", leader_repl_port).parse().unwrap()),
             WalArchiveConfig::disabled(), // Keep all WAL for replication
         )
@@ -161,6 +162,7 @@ async fn test_leader_follower_replication() {
             follower1_data,
             64 * 1024, // memtable capacity
             2,         // compaction trigger
+            100,       // wal batch interval micros
             follower1_socket,
             WalArchiveConfig::disabled(),
         )
@@ -175,8 +177,9 @@ async fn test_leader_follower_replication() {
         orelsm::server::run_follower(
             leader_repl_clone2,
             follower2_data,
-            64 * 1024,
-            2,
+            64 * 1024, // memtable capacity
+            2,         // compaction trigger
+            100,       // wal batch interval micros
             follower2_socket,
             WalArchiveConfig::disabled(),
         )
@@ -317,9 +320,10 @@ async fn test_follower_failover() {
             leader_socket,
             orelsm::server::EngineType::LsmTree,
             leader_data,
-            1024 * 1024,
-            64 * 1024,
-            2,
+            1024 * 1024, // log capacity
+            64 * 1024,   // memtable capacity
+            2,           // compaction trigger
+            100,         // wal batch interval micros
             Some(format!("127.0.0.1:{}", leader_repl_port).parse().unwrap()),
             WalArchiveConfig::disabled(),
         )
@@ -355,8 +359,9 @@ async fn test_follower_failover() {
         orelsm::server::run_follower(
             leader_repl_addr,
             follower_data,
-            64 * 1024,
-            2,
+            64 * 1024, // memtable capacity
+            2,         // compaction trigger
+            100,       // wal batch interval micros
             follower_socket,
             WalArchiveConfig::disabled(),
         )

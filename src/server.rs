@@ -17,7 +17,7 @@ use kv::{
 use crate::engine::{
     Engine,
     log::LogEngine,
-    lsm_tree::{DEFAULT_WAL_BATCH_INTERVAL_MICROS, LsmTreeEngine, SnapshotLock, WalArchiveConfig},
+    lsm_tree::{LsmTreeEngine, SnapshotLock, WalArchiveConfig},
     memory::MemoryEngine,
 };
 use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationService};
@@ -79,6 +79,7 @@ impl MyKeyValue {
         log_capacity_bytes: u64,
         lsm_memtable_capacity_bytes: u64,
         lsm_compaction_trigger_file_count: usize,
+        lsm_wal_batch_interval_micros: u64,
         lsm_holder: &mut LsmEngineHolder,
         log_holder: &mut LogEngineHolder,
         wal_archive_config: WalArchiveConfig,
@@ -96,7 +97,7 @@ impl MyKeyValue {
                     data_dir,
                     lsm_memtable_capacity_bytes,
                     lsm_compaction_trigger_file_count,
-                    DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+                    lsm_wal_batch_interval_micros,
                     wal_archive_config,
                 ));
                 lsm_holder.set(Arc::clone(&lsm_engine));
@@ -299,6 +300,7 @@ pub async fn run_server(
     log_capacity_bytes: u64,
     lsm_memtable_capacity_bytes: u64,
     lsm_compaction_trigger_file_count: usize,
+    lsm_wal_batch_interval_micros: u64,
     replication_addr: Option<std::net::SocketAddr>,
     wal_archive_config: WalArchiveConfig,
 ) {
@@ -311,6 +313,7 @@ pub async fn run_server(
         log_capacity_bytes,
         lsm_memtable_capacity_bytes,
         lsm_compaction_trigger_file_count,
+        lsm_wal_batch_interval_micros,
         &mut lsm_holder,
         &mut log_holder,
         wal_archive_config,
@@ -399,6 +402,7 @@ pub async fn run_follower(
     data_dir: String,
     lsm_memtable_capacity_bytes: u64,
     lsm_compaction_trigger_file_count: usize,
+    lsm_wal_batch_interval_micros: u64,
     addr: std::net::SocketAddr,
     wal_archive_config: WalArchiveConfig,
 ) {
@@ -419,6 +423,7 @@ pub async fn run_follower(
 
     // Store config for engine reloads
     let wal_archive_config_for_reload = wal_archive_config.clone();
+    let batch_interval_for_reload = lsm_wal_batch_interval_micros;
 
     // Create swappable engine holder (using std::sync::RwLock for sync access in replication closure)
     let engine_holder: Arc<RwLock<Arc<LsmTreeEngine>>> =
@@ -426,7 +431,7 @@ pub async fn run_follower(
             data_dir.clone(),
             lsm_memtable_capacity_bytes,
             lsm_compaction_trigger_file_count,
-            DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            lsm_wal_batch_interval_micros,
             wal_archive_config,
         ))));
     let engine_holder_for_server = Arc::clone(&engine_holder);
@@ -549,7 +554,7 @@ pub async fn run_follower(
                     data_dir.clone(),
                     lsm_memtable_capacity_bytes,
                     lsm_compaction_trigger_file_count,
-                    DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+                    batch_interval_for_reload,
                     wal_archive_config_for_reload.clone(),
                 ));
 
