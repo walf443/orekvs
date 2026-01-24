@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
+use super::direct_io;
 use super::memtable::MemTable;
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
@@ -153,6 +154,17 @@ impl GroupCommitWalWriter {
             .truncate(true)
             .open(&wal_path)
             .map_err(|e| Status::internal(format!("Failed to create WAL: {}", e)))?;
+
+        // Disable page cache for WAL to reduce memory pressure
+        // and avoid double-buffering (we have our own write batching)
+        if let Err(e) = direct_io::disable_page_cache(&file) {
+            // Log warning but don't fail - this is an optimization
+            eprintln!(
+                "Warning: Failed to disable page cache for WAL: {} (using {})",
+                e,
+                direct_io::method_name()
+            );
+        }
 
         // Write header
         file.write_all(WAL_MAGIC_BYTES)

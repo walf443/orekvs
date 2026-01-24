@@ -1,6 +1,6 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -136,7 +136,7 @@ impl BlockCache {
     }
 
     /// Invalidate all cache entries for a specific file
-    pub fn invalidate_file(&self, file_path: &PathBuf) {
+    pub fn invalidate_file(&self, file_path: &Path) {
         let Ok(mut inner) = self.inner.write() else {
             return;
         };
@@ -145,7 +145,7 @@ impl BlockCache {
         let keys_to_remove: Vec<BlockCacheKey> = inner
             .cache
             .iter()
-            .filter(|(k, _)| &k.file_path == file_path)
+            .filter(|(k, _)| k.file_path.as_path() == file_path)
             .map(|(k, _)| k.clone())
             .collect();
 
