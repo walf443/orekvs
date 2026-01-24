@@ -29,6 +29,39 @@ struct SstableHandle {
     bloom: BloomFilter,
 }
 
+/// Configuration for WAL archiving
+#[derive(Clone)]
+pub struct WalArchiveConfig {
+    /// Retention period in seconds (None = keep forever)
+    pub retention_secs: Option<u64>,
+    /// Maximum total WAL size in bytes (None = no limit)
+    pub max_size_bytes: Option<u64>,
+}
+
+/// Default WAL retention period: 7 days
+pub const DEFAULT_WAL_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default maximum WAL size: 1GB
+pub const DEFAULT_WAL_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
+impl Default for WalArchiveConfig {
+    fn default() -> Self {
+        Self {
+            retention_secs: Some(DEFAULT_WAL_RETENTION_SECS),
+            max_size_bytes: Some(DEFAULT_WAL_MAX_SIZE_BYTES),
+        }
+    }
+}
+
+impl WalArchiveConfig {
+    /// Create a config that disables WAL archiving (keep all WAL files)
+    pub fn disabled() -> Self {
+        Self {
+            retention_secs: None,
+            max_size_bytes: None,
+        }
+    }
+}
+
 pub struct LsmTreeEngine {
     // MemTable management state
     mem_state: MemTableState,
@@ -48,6 +81,8 @@ pub struct LsmTreeEngine {
     block_cache: Arc<BlockCache>,
     // Centralized metrics collection
     metrics: Arc<EngineMetrics>,
+    // WAL archive configuration
+    wal_archive_config: WalArchiveConfig,
 }
 
 impl Clone for LsmTreeEngine {
@@ -62,6 +97,7 @@ impl Clone for LsmTreeEngine {
             wal: self.wal.clone(),
             block_cache: Arc::clone(&self.block_cache),
             metrics: Arc::clone(&self.metrics),
+            wal_archive_config: self.wal_archive_config.clone(),
         }
     }
 }
@@ -75,11 +111,12 @@ impl LsmTreeEngine {
         memtable_capacity_bytes: u64,
         compaction_trigger_file_count: usize,
     ) -> Self {
-        Self::new_with_wal_config(
+        Self::new_with_config(
             data_dir_str,
             memtable_capacity_bytes,
             compaction_trigger_file_count,
             DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            WalArchiveConfig::default(),
         )
     }
 
@@ -88,6 +125,22 @@ impl LsmTreeEngine {
         memtable_capacity_bytes: u64,
         compaction_trigger_file_count: usize,
         wal_batch_interval_micros: u64,
+    ) -> Self {
+        Self::new_with_config(
+            data_dir_str,
+            memtable_capacity_bytes,
+            compaction_trigger_file_count,
+            wal_batch_interval_micros,
+            WalArchiveConfig::default(),
+        )
+    }
+
+    pub fn new_with_config(
+        data_dir_str: String,
+        memtable_capacity_bytes: u64,
+        compaction_trigger_file_count: usize,
+        wal_batch_interval_micros: u64,
+        wal_archive_config: WalArchiveConfig,
     ) -> Self {
         let data_dir = PathBuf::from(&data_dir_str);
 
@@ -229,6 +282,7 @@ impl LsmTreeEngine {
             wal,
             block_cache: Arc::new(BlockCache::new(DEFAULT_BLOCK_CACHE_SIZE_BYTES)),
             metrics: Arc::new(EngineMetrics::new()),
+            wal_archive_config,
         }
     }
 
@@ -272,10 +326,13 @@ impl LsmTreeEngine {
 
         self.mem_state.remove_immutable(&memtable);
 
-        // Rotate WAL: create a new WAL file (old WAL preserved for replication)
+        // Rotate WAL: create a new WAL file
         if let Err(e) = self.wal.rotate() {
             eprintln!("Warning: Failed to rotate WAL: {}", e);
         }
+
+        // Archive old WAL files if configured
+        self.archive_old_wal_files();
 
         println!("Flush finished.");
 
@@ -312,6 +369,110 @@ impl LsmTreeEngine {
     /// Shutdown the engine gracefully, flushing all pending WAL writes
     pub async fn shutdown(&self) {
         self.wal.shutdown().await;
+    }
+
+    /// Archive old WAL files based on retention period and size limits.
+    /// Only archives WAL files that have been flushed to SSTables.
+    fn archive_old_wal_files(&self) {
+        // Skip if archiving is disabled
+        if self.wal_archive_config.retention_secs.is_none()
+            && self.wal_archive_config.max_size_bytes.is_none()
+        {
+            return;
+        }
+
+        // Get the maximum WAL ID that has been flushed to SSTable
+        let max_flushed_wal_id = self.get_max_flushed_wal_id();
+
+        // Collect WAL files with their metadata
+        let mut wal_files: Vec<(u64, PathBuf, u64, std::time::SystemTime)> = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&self.data_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                    && let Some(wal_id) = GroupCommitWalWriter::parse_wal_filename(filename)
+                {
+                    // Only consider WAL files that have been flushed (wal_id <= max_flushed_wal_id)
+                    if wal_id <= max_flushed_wal_id
+                        && let Ok(metadata) = fs::metadata(&path)
+                    {
+                        let size = metadata.len();
+                        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                        wal_files.push((wal_id, path, size, modified));
+                    }
+                }
+            }
+        }
+
+        if wal_files.is_empty() {
+            return;
+        }
+
+        // Sort by WAL ID (oldest first)
+        wal_files.sort_by_key(|(id, _, _, _)| *id);
+
+        // Calculate total size
+        let total_size: u64 = wal_files.iter().map(|(_, _, size, _)| size).sum();
+        let now = std::time::SystemTime::now();
+
+        let mut files_to_delete: Vec<(u64, PathBuf)> = Vec::new();
+        let mut remaining_size = total_size;
+
+        for (wal_id, path, size, modified) in &wal_files {
+            let mut should_delete = false;
+
+            // Check retention period
+            if let Some(retention_secs) = self.wal_archive_config.retention_secs
+                && let Ok(age) = now.duration_since(*modified)
+                && age.as_secs() > retention_secs
+            {
+                should_delete = true;
+            }
+
+            // Check size limit (delete oldest files first to get under limit)
+            if let Some(max_size) = self.wal_archive_config.max_size_bytes
+                && remaining_size > max_size
+            {
+                should_delete = true;
+            }
+
+            if should_delete {
+                files_to_delete.push((*wal_id, path.clone()));
+                remaining_size = remaining_size.saturating_sub(*size);
+            }
+        }
+
+        // Delete the files
+        for (wal_id, path) in files_to_delete {
+            match fs::remove_file(&path) {
+                Ok(_) => {
+                    println!(
+                        "Archived (deleted) old WAL file: {:?} (id={})",
+                        path, wal_id
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to archive WAL file {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    /// Get the maximum WAL ID that has been flushed to SSTables
+    fn get_max_flushed_wal_id(&self) -> u64 {
+        let sstables = self.sstables.lock().unwrap();
+        let mut max_wal_id = 0u64;
+
+        for handle in sstables.iter() {
+            if let Some(wal_id) = sstable::extract_wal_id_from_sstable(handle.mmap.path())
+                && wal_id > max_wal_id
+            {
+                max_wal_id = wal_id;
+            }
+        }
+
+        max_wal_id
     }
 
     /// Get a snapshot of engine metrics
