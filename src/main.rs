@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use orelsm::engine::lsm_tree::WalArchiveConfig;
 use orelsm::server;
 use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
@@ -61,6 +62,18 @@ enum Commands {
         /// When set, this server becomes a read-only follower
         #[arg(long)]
         leader_addr: Option<String>,
+
+        /// WAL retention period in seconds (default: 604800 = 7 days, 0 = disabled)
+        #[arg(long = "wal-retention-secs")]
+        wal_retention_secs: Option<u64>,
+
+        /// Maximum total WAL size in bytes (default: 1073741824 = 1GB, 0 = disabled)
+        #[arg(long = "wal-max-size-bytes")]
+        wal_max_size_bytes: Option<u64>,
+
+        /// Disable WAL archiving (keep all WAL files for replication)
+        #[arg(long = "disable-wal-archive")]
+        disable_wal_archive: bool,
     },
     /// Test commands
     Test {
@@ -162,8 +175,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_replication,
             replication_port,
             leader_addr,
+            wal_retention_secs,
+            wal_max_size_bytes,
+            disable_wal_archive,
         } => {
             let addr: std::net::SocketAddr = addr.parse()?;
+
+            // Build WAL archive config
+            let wal_archive_config = if *disable_wal_archive {
+                WalArchiveConfig::disabled()
+            } else {
+                WalArchiveConfig {
+                    retention_secs: match wal_retention_secs {
+                        Some(0) => None,
+                        Some(secs) => Some(*secs),
+                        None => Some(orelsm::engine::lsm_tree::DEFAULT_WAL_RETENTION_SECS),
+                    },
+                    max_size_bytes: match wal_max_size_bytes {
+                        Some(0) => None,
+                        Some(bytes) => Some(*bytes),
+                        None => Some(orelsm::engine::lsm_tree::DEFAULT_WAL_MAX_SIZE_BYTES),
+                    },
+                }
+            };
 
             // If leader_addr is set, run as follower
             if let Some(leader) = leader_addr {
@@ -173,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *lsm_memtable_capacity_bytes,
                     *lsm_compaction_trigger_file_count,
                     addr,
+                    wal_archive_config,
                 )
                 .await;
             } else {
@@ -191,6 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *lsm_memtable_capacity_bytes,
                     *lsm_compaction_trigger_file_count,
                     repl_addr,
+                    wal_archive_config,
                 )
                 .await;
             }

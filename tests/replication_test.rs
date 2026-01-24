@@ -3,6 +3,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
+use orelsm::engine::lsm_tree::WalArchiveConfig;
 use orelsm::server::kv::key_value_client::KeyValueClient;
 use orelsm::server::kv::{GetRequest, PromoteRequest, SetRequest};
 
@@ -120,6 +121,7 @@ async fn test_leader_follower_replication() {
             64 * 1024,   // memtable capacity (small for testing)
             2,           // compaction trigger
             Some(format!("127.0.0.1:{}", leader_repl_port).parse().unwrap()),
+            WalArchiveConfig::disabled(), // Keep all WAL for replication
         )
         .await;
     });
@@ -160,6 +162,7 @@ async fn test_leader_follower_replication() {
             64 * 1024, // memtable capacity
             2,         // compaction trigger
             follower1_socket,
+            WalArchiveConfig::disabled(),
         )
         .await;
     });
@@ -175,6 +178,7 @@ async fn test_leader_follower_replication() {
             64 * 1024,
             2,
             follower2_socket,
+            WalArchiveConfig::disabled(),
         )
         .await;
     });
@@ -317,6 +321,7 @@ async fn test_follower_failover() {
             64 * 1024,
             2,
             Some(format!("127.0.0.1:{}", leader_repl_port).parse().unwrap()),
+            WalArchiveConfig::disabled(),
         )
         .await;
     });
@@ -353,6 +358,7 @@ async fn test_follower_failover() {
             64 * 1024,
             2,
             follower_socket,
+            WalArchiveConfig::disabled(),
         )
         .await;
     });

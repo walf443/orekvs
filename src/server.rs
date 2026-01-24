@@ -14,7 +14,12 @@ use kv::{
     SetResponse,
 };
 
-use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine};
+use crate::engine::{
+    Engine,
+    log::LogEngine,
+    lsm_tree::{DEFAULT_WAL_BATCH_INTERVAL_MICROS, LsmTreeEngine, WalArchiveConfig},
+    memory::MemoryEngine,
+};
 use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationService};
 
 // --- gRPC Service ---
@@ -76,6 +81,7 @@ impl MyKeyValue {
         lsm_compaction_trigger_file_count: usize,
         lsm_holder: &mut LsmEngineHolder,
         log_holder: &mut LogEngineHolder,
+        wal_archive_config: WalArchiveConfig,
     ) -> Self {
         let mut lsm_engine_ref = None;
         let engine: Box<dyn Engine> = match engine_type {
@@ -86,10 +92,12 @@ impl MyKeyValue {
                 Box::new(LogEngineWrapper(log_engine))
             }
             EngineType::LsmTree => {
-                let lsm_engine = Arc::new(LsmTreeEngine::new(
+                let lsm_engine = Arc::new(LsmTreeEngine::new_with_config(
                     data_dir,
                     lsm_memtable_capacity_bytes,
                     lsm_compaction_trigger_file_count,
+                    DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+                    wal_archive_config,
                 ));
                 lsm_holder.set(Arc::clone(&lsm_engine));
                 lsm_engine_ref = Some(Arc::clone(&lsm_engine));
@@ -292,6 +300,7 @@ pub async fn run_server(
     lsm_memtable_capacity_bytes: u64,
     lsm_compaction_trigger_file_count: usize,
     replication_addr: Option<std::net::SocketAddr>,
+    wal_archive_config: WalArchiveConfig,
 ) {
     let mut lsm_holder = LsmEngineHolder::new();
     let mut log_holder = LogEngineHolder::new();
@@ -304,6 +313,7 @@ pub async fn run_server(
         lsm_compaction_trigger_file_count,
         &mut lsm_holder,
         &mut log_holder,
+        wal_archive_config,
     );
 
     println!("Server listening on {}", addr);
@@ -380,6 +390,7 @@ pub async fn run_follower(
     lsm_memtable_capacity_bytes: u64,
     lsm_compaction_trigger_file_count: usize,
     addr: std::net::SocketAddr,
+    wal_archive_config: WalArchiveConfig,
 ) {
     use std::fs;
     use std::sync::RwLock;
@@ -396,12 +407,17 @@ pub async fn run_follower(
     let follower_state_for_server = Arc::clone(&follower_state);
     let follower_state_for_repl = Arc::clone(&follower_state);
 
+    // Store config for engine reloads
+    let wal_archive_config_for_reload = wal_archive_config.clone();
+
     // Create swappable engine holder (using std::sync::RwLock for sync access in replication closure)
     let engine_holder: Arc<RwLock<Arc<LsmTreeEngine>>> =
-        Arc::new(RwLock::new(Arc::new(LsmTreeEngine::new(
+        Arc::new(RwLock::new(Arc::new(LsmTreeEngine::new_with_config(
             data_dir.clone(),
             lsm_memtable_capacity_bytes,
             lsm_compaction_trigger_file_count,
+            DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            wal_archive_config,
         ))));
     let engine_holder_for_server = Arc::clone(&engine_holder);
 
@@ -519,10 +535,12 @@ pub async fn run_follower(
                 old_engine.shutdown().await;
 
                 // Create new engine (will load the downloaded SSTables)
-                let new_engine = Arc::new(LsmTreeEngine::new(
+                let new_engine = Arc::new(LsmTreeEngine::new_with_config(
                     data_dir.clone(),
                     lsm_memtable_capacity_bytes,
                     lsm_compaction_trigger_file_count,
+                    DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+                    wal_archive_config_for_reload.clone(),
                 ));
 
                 // Swap engine
