@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
 
@@ -13,6 +14,7 @@ use kv::{
 };
 
 use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine};
+use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationService};
 
 // --- gRPC Service ---
 
@@ -277,13 +279,14 @@ pub async fn run_server(
     log_capacity_bytes: u64,
     lsm_memtable_capacity_bytes: u64,
     lsm_compaction_trigger_file_count: usize,
+    replication_addr: Option<std::net::SocketAddr>,
 ) {
     let mut lsm_holder = LsmEngineHolder::new();
     let mut log_holder = LogEngineHolder::new();
 
     let key_value = MyKeyValue::new(
         engine_type,
-        data_dir,
+        data_dir.clone(),
         log_capacity_bytes,
         lsm_memtable_capacity_bytes,
         lsm_compaction_trigger_file_count,
@@ -292,6 +295,24 @@ pub async fn run_server(
     );
 
     println!("Server listening on {}", addr);
+
+    // Start replication service if enabled
+    let replication_handle = if let Some(repl_addr) = replication_addr {
+        println!("Replication service listening on {}", repl_addr);
+        let replication_service = ReplicationService::new(PathBuf::from(&data_dir));
+        let handle = tokio::spawn(async move {
+            if let Err(e) = Server::builder()
+                .add_service(ReplicationServer::new(replication_service))
+                .serve(repl_addr)
+                .await
+            {
+                eprintln!("Replication server error: {}", e);
+            }
+        });
+        Some(handle)
+    } else {
+        None
+    };
 
     // Build the server with graceful shutdown
     let server = Server::builder()
@@ -328,9 +349,198 @@ pub async fn run_server(
         eprintln!("Server error: {}", e);
     }
 
+    // Abort replication service
+    if let Some(handle) = replication_handle {
+        handle.abort();
+    }
+
     // Gracefully shutdown the engines (flush pending writes)
     lsm_holder.shutdown().await;
     log_holder.shutdown().await;
 
     println!("Server stopped.");
+}
+
+/// Run as a follower, replicating from a leader
+pub async fn run_follower(
+    leader_addr: String,
+    data_dir: String,
+    lsm_memtable_capacity_bytes: u64,
+    lsm_compaction_trigger_file_count: usize,
+    addr: std::net::SocketAddr,
+) {
+    use std::fs;
+
+    // Create data directory
+    let data_path = PathBuf::from(&data_dir);
+    if !data_path.exists() {
+        fs::create_dir_all(&data_path).expect("Failed to create data directory");
+    }
+
+    // Create LSM engine for the follower
+    let engine = Arc::new(LsmTreeEngine::new(
+        data_dir.clone(),
+        lsm_memtable_capacity_bytes,
+        lsm_compaction_trigger_file_count,
+    ));
+    let engine_for_replication = Arc::clone(&engine);
+    let engine_for_server = Arc::clone(&engine);
+
+    println!("Starting follower, replicating from {}", leader_addr);
+    println!("Follower serving read requests on {}", addr);
+
+    // Start read-only server
+    let server_handle = tokio::spawn(async move {
+        let key_value = FollowerKeyValue {
+            engine: engine_for_server,
+        };
+        if let Err(e) = Server::builder()
+            .add_service(KeyValueServer::new(key_value))
+            .serve_with_shutdown(addr, async {
+                let ctrl_c = tokio::signal::ctrl_c();
+
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut sigterm =
+                        signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
+
+                    tokio::select! {
+                        _ = ctrl_c => {
+                            println!("\nReceived SIGINT (Ctrl+C)...");
+                        }
+                        _ = sigterm.recv() => {
+                            println!("\nReceived SIGTERM...");
+                        }
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    ctrl_c.await.expect("Failed to listen for ctrl+c signal");
+                    println!("\nReceived shutdown signal...");
+                }
+            })
+            .await
+        {
+            eprintln!("Follower server error: {}", e);
+        }
+    });
+
+    // Start replication
+    let replicator = FollowerReplicator::new(leader_addr, data_path);
+
+    // Apply WAL entries to the engine
+    if let Err(e) = replicator
+        .start(move |entry| {
+            if let Some(value) = entry.value {
+                engine_for_replication.set(entry.key, value)
+            } else {
+                engine_for_replication.delete(entry.key)
+            }
+        })
+        .await
+    {
+        eprintln!("Replication error: {}", e);
+    }
+
+    // Wait for server to finish
+    let _ = server_handle.await;
+
+    engine.shutdown().await;
+    println!("Follower stopped.");
+}
+
+/// Read-only key-value service for followers
+struct FollowerKeyValue {
+    engine: Arc<LsmTreeEngine>,
+}
+
+#[tonic::async_trait]
+impl KeyValue for FollowerKeyValue {
+    async fn set(&self, _request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
+        Err(Status::failed_precondition(
+            "This is a read-only follower. Writes must go to the leader.",
+        ))
+    }
+
+    async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let req = request.into_inner();
+        let value = self.engine.get(req.key)?;
+        Ok(Response::new(GetResponse { value }))
+    }
+
+    async fn delete(
+        &self,
+        _request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        Err(Status::failed_precondition(
+            "This is a read-only follower. Writes must go to the leader.",
+        ))
+    }
+
+    async fn batch_set(
+        &self,
+        _request: Request<BatchSetRequest>,
+    ) -> Result<Response<BatchSetResponse>, Status> {
+        Err(Status::failed_precondition(
+            "This is a read-only follower. Writes must go to the leader.",
+        ))
+    }
+
+    async fn batch_get(
+        &self,
+        request: Request<BatchGetRequest>,
+    ) -> Result<Response<BatchGetResponse>, Status> {
+        let req = request.into_inner();
+        let results = self.engine.batch_get(req.keys);
+        let items = results
+            .into_iter()
+            .map(|(key, value)| KeyValuePair { key, value })
+            .collect();
+
+        Ok(Response::new(BatchGetResponse { items }))
+    }
+
+    async fn batch_delete(
+        &self,
+        _request: Request<BatchDeleteRequest>,
+    ) -> Result<Response<BatchDeleteResponse>, Status> {
+        Err(Status::failed_precondition(
+            "This is a read-only follower. Writes must go to the leader.",
+        ))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<GetMetricsRequest>,
+    ) -> Result<Response<GetMetricsResponse>, Status> {
+        let metrics = self.engine.metrics();
+        let cache_stats = self.engine.cache_stats();
+
+        Ok(Response::new(GetMetricsResponse {
+            get_count: metrics.get_count,
+            set_count: metrics.set_count,
+            delete_count: metrics.delete_count,
+            batch_get_count: metrics.batch_get_count,
+            batch_set_count: metrics.batch_set_count,
+            batch_delete_count: metrics.batch_delete_count,
+            sstable_searches: metrics.sstable_searches,
+            bloom_filter_hits: metrics.bloom_filter_hits,
+            bloom_filter_false_positives: metrics.bloom_filter_false_positives,
+            bloom_effectiveness: metrics.bloom_effectiveness,
+            memtable_flushes: metrics.memtable_flushes,
+            memtable_flush_bytes: metrics.memtable_flush_bytes,
+            compaction_count: metrics.compaction_count,
+            compaction_bytes_read: metrics.compaction_bytes_read,
+            compaction_bytes_written: metrics.compaction_bytes_written,
+            blockcache_entries: cache_stats.entries as u64,
+            blockcache_size_bytes: cache_stats.size_bytes as u64,
+            blockcache_max_size_bytes: cache_stats.max_size_bytes as u64,
+            blockcache_hits: cache_stats.hits,
+            blockcache_misses: cache_stats.misses,
+            blockcache_evictions: cache_stats.evictions,
+            blockcache_hit_ratio: cache_stats.hit_ratio,
+        }))
+    }
 }

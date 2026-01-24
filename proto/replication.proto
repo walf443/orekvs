@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package replication;
+
+service Replication {
+  // ストリーミングでWALエントリを継続取得
+  rpc StreamWALEntries(StreamWALRequest) returns (stream WALBatch);
+
+  // Leader情報を取得
+  rpc GetLeaderInfo(Empty) returns (LeaderInfo);
+}
+
+message Empty {}
+
+message StreamWALRequest {
+  uint64 from_wal_id = 1;
+  uint64 from_offset = 2;
+}
+
+message WALBatch {
+  uint64 wal_id = 1;
+  uint64 start_offset = 2;
+  uint64 end_offset = 3;
+  bytes compressed_data = 4;  // zstd圧縮されたWALエントリ群
+  uint32 entry_count = 5;
+}
+
+message LeaderInfo {
+  uint64 current_wal_id = 1;
+  uint64 current_offset = 2;
+}
