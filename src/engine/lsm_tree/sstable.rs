@@ -9,7 +9,6 @@ use tonic::Status;
 use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry, ParsedBlockEntry};
 use super::bloom::BloomFilter;
 use super::memtable::MemTable;
-use super::mmap::MappedFile;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
 pub const DATA_VERSION: u32 = 4;
@@ -34,209 +33,7 @@ const COMPRESSION_LEVEL_COMPACTION: i32 = 6;
 const COMPRESSION_LEVEL_INDEX: i32 = 6;
 
 // Entry with timestamp for merge-sorting during compaction
-pub type TimestampedEntry = (u64, Option<String>);
-
-/// Memory-mapped SSTable reader
-///
-/// Provides zero-copy access to SSTable data via mmap.
-/// The SSTable file must not be modified while this struct exists.
-pub struct MappedSSTable {
-    mmap: MappedFile,
-    path: PathBuf,
-    #[allow(dead_code)]
-    version: u32,
-    #[allow(dead_code)]
-    index_offset: u64,
-    bloom_offset: Option<u64>, // None for V3 format
-}
-
-impl MappedSSTable {
-    /// Open an SSTable file with memory mapping
-    #[allow(clippy::result_large_err)]
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Status> {
-        let path = path.as_ref();
-        let mmap = MappedFile::open(path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Status::not_found("SSTable file not found")
-            } else {
-                Status::internal(e.to_string())
-            }
-        })?;
-
-        // Validate header
-        if mmap.len() < HEADER_SIZE as usize {
-            return Err(Status::internal("SSTable file too small"));
-        }
-
-        let magic = mmap.slice(0, 6);
-        if magic != MAGIC_BYTES {
-            return Err(Status::internal("Invalid SSTable magic"));
-        }
-
-        let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if version != 3 && version != 4 {
-            return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
-                version
-            )));
-        }
-
-        let file_len = mmap.len();
-        let footer_size = if version == 4 {
-            FOOTER_SIZE_V4 as usize
-        } else {
-            FOOTER_SIZE_V3 as usize
-        };
-
-        if file_len < HEADER_SIZE as usize + footer_size {
-            return Err(Status::internal("SSTable file too small for footer"));
-        }
-
-        // Read footer
-        let (index_offset, bloom_offset) = if version == 4 {
-            let footer_start = file_len - FOOTER_SIZE_V4 as usize;
-            let footer = mmap.slice(footer_start, footer_start + 24);
-            let idx_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-            let bloom_off = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-            let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-            if magic != FOOTER_MAGIC {
-                return Err(Status::internal("Invalid footer magic"));
-            }
-            (idx_off, Some(bloom_off))
-        } else {
-            let footer_start = file_len - FOOTER_SIZE_V3 as usize;
-            let idx_off = u64::from_le_bytes(
-                mmap.slice(footer_start, footer_start + 8)
-                    .try_into()
-                    .unwrap(),
-            );
-            (idx_off, None)
-        };
-
-        Ok(Self {
-            mmap,
-            path: path.to_path_buf(),
-            version,
-            index_offset,
-            bloom_offset,
-        })
-    }
-
-    /// Get the file path
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Get canonical path for cache keys
-    pub fn canonical_path(&self) -> PathBuf {
-        self.path
-            .canonicalize()
-            .unwrap_or_else(|_| self.path.clone())
-    }
-
-    /// Read and decompress the index
-    #[allow(clippy::result_large_err)]
-    pub fn read_index(&self) -> Result<Vec<(String, u64)>, Status> {
-        let offset = self.index_offset as usize;
-
-        // Read compressed size
-        let len_bytes = self
-            .mmap
-            .read_at(offset, 8)
-            .ok_or_else(|| Status::internal("Failed to read index length"))?;
-        let len = u64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-
-        // Read compressed data
-        let compressed = self
-            .mmap
-            .read_at(offset + 8, len)
-            .ok_or_else(|| Status::internal("Failed to read index data"))?;
-
-        let decompressed = zstd::decode_all(Cursor::new(compressed))
-            .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
-
-        // Parse index entries
-        let mut cursor = Cursor::new(decompressed);
-        let mut num_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut num_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let num_entries = u64::from_le_bytes(num_bytes);
-
-        let mut index = Vec::with_capacity(num_entries as usize);
-        for _ in 0..num_entries {
-            let mut klen_bytes = [0u8; 8];
-            cursor
-                .read_exact(&mut klen_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let key_len = u64::from_le_bytes(klen_bytes);
-
-            let mut key_buf = vec![0u8; key_len as usize];
-            cursor
-                .read_exact(&mut key_buf)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let key = String::from_utf8_lossy(&key_buf).to_string();
-
-            let mut off_bytes = [0u8; 8];
-            cursor
-                .read_exact(&mut off_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let offset = u64::from_le_bytes(off_bytes);
-
-            index.push((key, offset));
-        }
-
-        Ok(index)
-    }
-
-    /// Read and decompress a block at the given offset
-    #[allow(clippy::result_large_err)]
-    pub fn read_block(&self, block_offset: u64) -> Result<Vec<u8>, Status> {
-        let offset = block_offset as usize;
-
-        // Read block length
-        let len_bytes = self
-            .mmap
-            .read_at(offset, 4)
-            .ok_or_else(|| Status::internal("Failed to read block length"))?;
-        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-
-        // Read compressed block
-        let compressed = self
-            .mmap
-            .read_at(offset + 4, len)
-            .ok_or_else(|| Status::internal("Failed to read block data"))?;
-
-        zstd::decode_all(Cursor::new(compressed))
-            .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))
-    }
-
-    /// Read and deserialize the Bloom filter (V4 only)
-    #[allow(clippy::result_large_err)]
-    pub fn read_bloom_filter(&self) -> Result<Option<BloomFilter>, Status> {
-        let bloom_offset = match self.bloom_offset {
-            Some(off) => off as usize,
-            None => return Ok(None), // V3 format
-        };
-
-        // Read bloom filter size
-        let size_bytes = self
-            .mmap
-            .read_at(bloom_offset, 8)
-            .ok_or_else(|| Status::internal("Failed to read Bloom filter size"))?;
-        let bloom_size = u64::from_le_bytes(size_bytes.try_into().unwrap()) as usize;
-
-        // Read bloom filter data
-        let bloom_data = self
-            .mmap
-            .read_at(bloom_offset + 8, bloom_size)
-            .ok_or_else(|| Status::internal("Failed to read Bloom filter data"))?;
-
-        BloomFilter::deserialize(bloom_data)
-            .map(Some)
-            .ok_or_else(|| Status::internal("Failed to deserialize Bloom filter"))
-    }
-} // (timestamp, value)
+pub type TimestampedEntry = (u64, Option<String>); // (timestamp, value)
 
 /// Extract WAL ID from SSTable filename (sst_{sst_id}_{wal_id}.data)
 pub fn extract_wal_id_from_sstable(path: &Path) -> Option<u64> {
@@ -414,7 +211,6 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
 /// Search for a key in an SSTable file with block cache support
 /// Uses binary search on parsed block entries for O(log n) lookup within blocks
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 pub fn search_key_cached(
     path: &Path,
     key: &str,
@@ -445,93 +241,8 @@ pub fn search_key_cached(
     search_in_parsed_block(&parsed_entries, key)
 }
 
-/// Search for a key using a memory-mapped SSTable with block cache support
-/// This is more efficient than search_key_cached as it avoids file open overhead
-#[allow(clippy::result_large_err)]
-pub fn search_key_mmap(
-    sst: &MappedSSTable,
-    key: &str,
-    cache: &BlockCache,
-) -> Result<Option<String>, Status> {
-    let canonical_path = sst.canonical_path();
-
-    // Get or load index from cache
-    let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
-
-    // Binary search in index to find the right block
-    let block_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
-        Ok(idx) => index[idx].1,
-        Err(idx) => {
-            if idx == 0 {
-                index[0].1
-            } else {
-                index[idx - 1].1
-            }
-        }
-    };
-
-    // Get or load parsed block from cache
-    let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
-
-    // Binary search within parsed block entries
-    search_in_parsed_block(&parsed_entries, key)
-}
-
-/// Get index from cache or load from mmap
-#[allow(clippy::result_large_err)]
-fn get_or_load_index_mmap(
-    sst: &MappedSSTable,
-    canonical_path: &Path,
-    cache: &BlockCache,
-) -> Result<Arc<Vec<(String, u64)>>, Status> {
-    let cache_key = BlockCacheKey::for_index(canonical_path.to_path_buf());
-
-    // Check cache first
-    if let Some(CacheEntry::Index(index)) = cache.get(&cache_key) {
-        return Ok(index);
-    }
-
-    // Load from mmap
-    let index = sst.read_index()?;
-    let arc_index = Arc::new(index);
-
-    // Cache it
-    cache.insert(cache_key, CacheEntry::Index(Arc::clone(&arc_index)));
-
-    Ok(arc_index)
-}
-
-/// Get parsed block from cache or load from mmap
-#[allow(clippy::result_large_err)]
-fn get_or_load_parsed_block_mmap(
-    sst: &MappedSSTable,
-    canonical_path: &Path,
-    block_offset: u64,
-    cache: &BlockCache,
-) -> Result<Arc<Vec<ParsedBlockEntry>>, Status> {
-    let cache_key = BlockCacheKey::for_block(canonical_path.to_path_buf(), block_offset);
-
-    // Check cache first
-    if let Some(CacheEntry::ParsedBlock(entries)) = cache.get(&cache_key) {
-        return Ok(entries);
-    }
-
-    // Load and decompress block from mmap
-    let decompressed = sst.read_block(block_offset)?;
-
-    // Parse entries
-    let entries = parse_block_entries(&decompressed)?;
-    let arc_entries = Arc::new(entries);
-
-    // Cache parsed entries
-    cache.insert(cache_key, CacheEntry::ParsedBlock(Arc::clone(&arc_entries)));
-
-    Ok(arc_entries)
-}
-
 /// Get index from cache or load from file
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn get_or_load_index(
     path: &Path,
     canonical_path: &Path,
@@ -616,7 +327,6 @@ fn get_or_load_index(
 /// Get parsed block from cache or load and parse from file
 /// Returns parsed entries sorted by key for binary search
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn get_or_load_parsed_block(
     path: &Path,
     canonical_path: &Path,
@@ -1283,7 +993,6 @@ pub fn generate_path(data_dir: &Path, sst_id: u64, wal_id: u64) -> PathBuf {
 /// Read Bloom filter from SSTable file (V4 format)
 /// Returns None for V3 format (Bloom filter not embedded)
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
     let mut file = match File::open(path) {
         Ok(f) => f,

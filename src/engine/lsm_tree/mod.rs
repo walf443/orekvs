@@ -1,9 +1,7 @@
 mod block_cache;
 mod bloom;
-mod direct_io;
 mod memtable;
 mod metrics;
-mod mmap;
 mod sstable;
 mod wal;
 
@@ -13,7 +11,7 @@ use bloom::BloomFilter;
 use memtable::{MemTable, MemTableState};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
-use sstable::{MappedSSTable, TimestampedEntry};
+use sstable::TimestampedEntry;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -22,11 +20,9 @@ use std::sync::{Arc, Mutex};
 use tonic::Status;
 use wal::GroupCommitWalWriter;
 
-/// Handle to an SSTable with mmap reader and its Bloom filter
+/// Handle to an SSTable with its Bloom filter
 struct SstableHandle {
-    /// Memory-mapped SSTable reader for zero-copy access
-    mmap: MappedSSTable,
-    /// Bloom filter for fast negative lookups
+    path: PathBuf,
     bloom: BloomFilter,
 }
 
@@ -142,20 +138,11 @@ impl LsmTreeEngine {
         sst_files.sort_by(|a, b| b.cmp(a));
         wal_files.sort_by_key(|(id, _)| *id);
 
-        // Build SstableHandles with mmap readers and Bloom filters for existing SSTables
+        // Build SstableHandles with Bloom filters for existing SSTables
         let mut sst_handles = Vec::new();
         for p in &sst_files {
-            // Open mmap for the SSTable
-            let mmap = match MappedSSTable::open(p) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Warning: Failed to mmap SSTable {:?}: {}", p, e);
-                    continue;
-                }
-            };
-
             // Try to read embedded Bloom filter (V4 format), fall back to building from keys
-            let bloom = match mmap.read_bloom_filter() {
+            let bloom = match sstable::read_bloom_filter(p) {
                 Ok(Some(bf)) => bf,
                 Ok(None) | Err(_) => {
                     // V3 format or error: build Bloom filter from keys
@@ -168,7 +155,10 @@ impl LsmTreeEngine {
                     bf
                 }
             };
-            sst_handles.push(Arc::new(SstableHandle { mmap, bloom }));
+            sst_handles.push(Arc::new(SstableHandle {
+                path: p.clone(),
+                bloom,
+            }));
         }
 
         // Recover MemTable from WAL files that are newer than the latest SSTable
@@ -271,10 +261,10 @@ impl LsmTreeEngine {
             self.metrics.record_flush(metadata.len());
         }
 
-        // Open mmap for the newly created SSTable
-        let mmap = MappedSSTable::open(&sst_path)?;
-
-        let handle = Arc::new(SstableHandle { mmap, bloom });
+        let handle = Arc::new(SstableHandle {
+            path: sst_path,
+            bloom,
+        });
 
         {
             let mut sstables = self.sstables.lock().unwrap();
@@ -360,7 +350,7 @@ impl LsmTreeEngine {
         // Calculate bytes read from input SSTables
         let bytes_read: u64 = sst_handles
             .iter()
-            .filter_map(|h| std::fs::metadata(h.mmap.path()).ok())
+            .filter_map(|h| std::fs::metadata(&h.path).ok())
             .map(|m| m.len())
             .sum();
 
@@ -368,7 +358,7 @@ impl LsmTreeEngine {
         let mut merged: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
 
         for handle in &sst_handles {
-            let entries = sstable::read_entries(handle.mmap.path())?;
+            let entries = sstable::read_entries(&handle.path)?;
             for (key, (timestamp, value)) in entries {
                 match merged.get(&key) {
                     Some((existing_ts, _)) if *existing_ts >= timestamp => {
@@ -389,7 +379,7 @@ impl LsmTreeEngine {
         // Use the max WAL ID from compacted SSTables
         let max_wal_id = sst_handles
             .iter()
-            .filter_map(|h| sstable::extract_wal_id_from_sstable(h.mmap.path()))
+            .filter_map(|h| sstable::extract_wal_id_from_sstable(&h.path))
             .max()
             .unwrap_or(0);
         let new_sst_path = sstable::generate_path(&self.data_dir, new_sst_id, max_wal_id);
@@ -405,41 +395,38 @@ impl LsmTreeEngine {
             .unwrap_or(0);
         self.metrics.record_compaction(bytes_read, bytes_written);
 
-        // Open mmap for the newly created SSTable
-        let mmap = MappedSSTable::open(&new_sst_path)?;
-
-        let new_handle = Arc::new(SstableHandle { mmap, bloom });
+        let new_handle = Arc::new(SstableHandle {
+            path: new_sst_path.clone(),
+            bloom,
+        });
 
         // Update sstables list: remove compacted SSTables and add new one
         // Keep any SSTables that were added during compaction (by flush)
-        let compacted_paths: std::collections::HashSet<_> = sst_handles
-            .iter()
-            .map(|h| h.mmap.path().to_path_buf())
-            .collect();
+        let compacted_paths: std::collections::HashSet<_> =
+            sst_handles.iter().map(|h| h.path.clone()).collect();
         {
             let mut sstables = self.sstables.lock().unwrap();
             // Keep SSTables that were not part of this compaction
             let mut new_list: Vec<Arc<SstableHandle>> = sstables
                 .iter()
-                .filter(|h| !compacted_paths.contains(h.mmap.path()))
+                .filter(|h| !compacted_paths.contains(&h.path))
                 .cloned()
                 .collect();
             // Add the new compacted SSTable
             new_list.push(new_handle);
             // Sort by path (descending) to maintain newest-first order
-            new_list.sort_by(|a, b| b.mmap.path().cmp(a.mmap.path()));
+            new_list.sort_by(|a, b| b.path.cmp(&a.path));
             *sstables = new_list;
         }
 
         // Delete old SSTable files after updating the list
         for handle in &sst_handles {
-            let path = handle.mmap.path();
-            if let Err(e) = fs::remove_file(path) {
-                eprintln!("Failed to delete old SSTable {:?}: {}", path, e);
+            if let Err(e) = fs::remove_file(&handle.path) {
+                eprintln!("Failed to delete old SSTable {:?}: {}", handle.path, e);
             } else {
-                println!("Deleted old SSTable: {:?}", path);
+                println!("Deleted old SSTable: {:?}", handle.path);
                 // Invalidate cache entries for deleted file
-                self.block_cache.invalidate_file(path);
+                self.block_cache.invalidate_file(&handle.path);
             }
         }
 
@@ -502,7 +489,7 @@ impl Engine for LsmTreeEngine {
             }
             // Bloom filter says key might be in this SSTable, need to search
             self.metrics.record_sstable_search();
-            match sstable::search_key_mmap(&handle.mmap, &key, &self.block_cache) {
+            match sstable::search_key_cached(&handle.path, &key, &self.block_cache) {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => return Err(Status::not_found("Key deleted")),
                 Err(e) if e.code() == tonic::Code::NotFound => {
@@ -629,7 +616,7 @@ impl Engine for LsmTreeEngine {
                             continue;
                         }
 
-                        match sstable::search_key_mmap(&handle.mmap, key, &self.block_cache) {
+                        match sstable::search_key_cached(&handle.path, key, &self.block_cache) {
                             Ok(Some(v)) => {
                                 return Some((key.clone(), v));
                             }
@@ -1288,41 +1275,41 @@ mod tests {
         let sst_handles: Vec<Arc<SstableHandle>> = engine.sstables.lock().unwrap().clone();
         println!("Created {} SSTables", sst_handles.len());
 
-        // Phase 2: Compare non-mmap vs mmap reads directly on SSTable
+        // Phase 2: Compare cached vs non-cached reads directly on SSTable
         println!("\n--- Direct SSTable Read Comparison ---");
 
         // Test key that should be in SSTable
         let test_key = "key00100";
 
-        // Non-mmap reads (using search_key with file path)
+        // Non-cached reads (using search_key directly)
         let iterations = 1000;
         let start = Instant::now();
         for _ in 0..iterations {
             for handle in &sst_handles {
-                let _ = sstable::search_key(handle.mmap.path(), test_key);
+                let _ = sstable::search_key(&handle.path, test_key);
             }
         }
-        let no_mmap_duration = start.elapsed();
+        let no_cache_duration = start.elapsed();
         println!(
-            "Without mmap: {} SSTable searches in {:?} ({:.2}/sec)",
+            "Without cache: {} SSTable searches in {:?} ({:.2}/sec)",
             iterations * sst_handles.len(),
-            no_mmap_duration,
-            (iterations * sst_handles.len()) as f64 / no_mmap_duration.as_secs_f64()
+            no_cache_duration,
+            (iterations * sst_handles.len()) as f64 / no_cache_duration.as_secs_f64()
         );
 
-        // Mmap-based reads (using search_key_mmap)
+        // Cached reads (using search_key_cached)
         let start = Instant::now();
         for _ in 0..iterations {
             for handle in &sst_handles {
-                let _ = sstable::search_key_mmap(&handle.mmap, test_key, &engine.block_cache);
+                let _ = sstable::search_key_cached(&handle.path, test_key, &engine.block_cache);
             }
         }
-        let mmap_duration = start.elapsed();
+        let cache_duration = start.elapsed();
         println!(
-            "With mmap:    {} SSTable searches in {:?} ({:.2}/sec)",
+            "With cache:    {} SSTable searches in {:?} ({:.2}/sec)",
             iterations * sst_handles.len(),
-            mmap_duration,
-            (iterations * sst_handles.len()) as f64 / mmap_duration.as_secs_f64()
+            cache_duration,
+            (iterations * sst_handles.len()) as f64 / cache_duration.as_secs_f64()
         );
 
         let stats = engine.block_cache.stats();
@@ -1331,12 +1318,9 @@ mod tests {
             stats.entries, stats.size_bytes
         );
 
-        let improvement = no_mmap_duration.as_secs_f64() / mmap_duration.as_secs_f64();
+        let improvement = no_cache_duration.as_secs_f64() / cache_duration.as_secs_f64();
         println!("\n=== Results ===");
-        println!(
-            "Mmap speedup: {:.2}x faster with mmap + block cache",
-            improvement
-        );
+        println!("Cache speedup: {:.2}x faster with block cache", improvement);
         println!("================================\n");
     }
 
