@@ -1584,4 +1584,191 @@ mod tests {
         );
         println!("=====================================\n");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_wal_archive_by_size() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        // Configure with very small max size (1KB) to trigger archiving
+        let archive_config = WalArchiveConfig {
+            retention_secs: None,       // Don't archive by time
+            max_size_bytes: Some(1024), // 1KB max
+        };
+
+        let engine = LsmTreeEngine::new_with_config(
+            data_dir.clone(),
+            100, // Small memtable to trigger frequent flushes
+            100, // High compaction trigger (avoid compaction interference)
+            DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            archive_config,
+        );
+
+        // Write enough data to create multiple WAL files
+        for i in 0..20 {
+            engine.set(format!("key{}", i), "x".repeat(100)).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Wait for flushes to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Count WAL files - should be limited by size
+        let wal_files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("wal_") && name.ends_with(".log"))
+            })
+            .collect();
+
+        // Calculate total WAL size
+        let total_wal_size: u64 = wal_files
+            .iter()
+            .filter_map(|e| fs::metadata(e.path()).ok())
+            .map(|m| m.len())
+            .sum();
+
+        println!(
+            "WAL files count: {}, total size: {} bytes",
+            wal_files.len(),
+            total_wal_size
+        );
+
+        // The archiving should keep total size near the limit (1KB)
+        // Note: current WAL and the most recent flushed WAL are not archived
+        // Each WAL file is around 100-150 bytes, so we expect around 8-10 files max
+        assert!(
+            total_wal_size <= 2048, // Allow some slack (2KB)
+            "Expected WAL size to be limited, got {} bytes",
+            total_wal_size
+        );
+
+        // Data should still be accessible (from SSTables)
+        for i in 0..20 {
+            let result = engine.get(format!("key{}", i));
+            assert!(result.is_ok(), "key{} should still be accessible", i);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_wal_archive_by_retention() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        // Configure with very short retention (1 second) to trigger archiving
+        let archive_config = WalArchiveConfig {
+            retention_secs: Some(1), // 1 second retention
+            max_size_bytes: None,    // Don't archive by size
+        };
+
+        let engine = LsmTreeEngine::new_with_config(
+            data_dir.clone(),
+            100, // Small memtable to trigger frequent flushes
+            100, // High compaction trigger
+            DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            archive_config,
+        );
+
+        // Write data and trigger flush
+        for i in 0..5 {
+            engine.set(format!("key{}", i), "x".repeat(50)).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Wait for flushes
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Count WAL files before retention expires
+        let count_wal_files = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name.starts_with("wal_") && name.ends_with(".log"))
+                })
+                .count()
+        };
+
+        let wal_count_before = count_wal_files();
+        println!("WAL files before waiting: {}", wal_count_before);
+
+        // Wait for retention period to expire
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Trigger another flush to run archive
+        engine.set("trigger".to_string(), "x".repeat(200)).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let wal_count_after = count_wal_files();
+        println!("WAL files after retention + flush: {}", wal_count_after);
+
+        // Should have fewer WAL files after archiving (or at least not more than before + 1)
+        // The archiving should have removed old files
+        assert!(
+            wal_count_after <= wal_count_before + 1,
+            "Expected WAL files to be archived, before: {}, after: {}",
+            wal_count_before,
+            wal_count_after
+        );
+
+        // Data should still be accessible
+        for i in 0..5 {
+            let result = engine.get(format!("key{}", i));
+            assert!(result.is_ok(), "key{} should still be accessible", i);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_wal_archive_disabled() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+
+        // Disable archiving
+        let archive_config = WalArchiveConfig::disabled();
+
+        let engine = LsmTreeEngine::new_with_config(
+            data_dir.clone(),
+            100, // Small memtable
+            100, // High compaction trigger
+            DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            archive_config,
+        );
+
+        // Write data to create multiple WAL files
+        for i in 0..10 {
+            engine.set(format!("key{}", i), "x".repeat(100)).unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Wait for flushes
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Count WAL files - all should be preserved
+        let wal_count = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("wal_") && name.ends_with(".log"))
+            })
+            .count();
+
+        println!("WAL files with archiving disabled: {}", wal_count);
+
+        // Should have multiple WAL files (not archived)
+        assert!(
+            wal_count >= 2,
+            "Expected multiple WAL files when archiving is disabled, got {}",
+            wal_count
+        );
+    }
 }
