@@ -382,8 +382,8 @@ pub async fn run_follower(
     addr: std::net::SocketAddr,
 ) {
     use std::fs;
+    use std::sync::RwLock;
     use std::sync::atomic::Ordering;
-    use tokio::sync::RwLock;
 
     // Create data directory
     let data_path = PathBuf::from(&data_dir);
@@ -396,7 +396,7 @@ pub async fn run_follower(
     let follower_state_for_server = Arc::clone(&follower_state);
     let follower_state_for_repl = Arc::clone(&follower_state);
 
-    // Create swappable engine holder
+    // Create swappable engine holder (using std::sync::RwLock for sync access in replication closure)
     let engine_holder: Arc<RwLock<Arc<LsmTreeEngine>>> =
         Arc::new(RwLock::new(Arc::new(LsmTreeEngine::new(
             data_dir.clone(),
@@ -488,9 +488,9 @@ pub async fn run_follower(
         // Apply WAL entries to the engine
         let result = replicator
             .start(move |entry| {
-                // Get current engine reference
+                // Get current engine reference (using std::sync::RwLock)
                 let engine = {
-                    let guard = engine_holder_clone.blocking_read();
+                    let guard = engine_holder_clone.read().unwrap();
                     Arc::clone(&*guard)
                 };
 
@@ -512,10 +512,11 @@ pub async fn run_follower(
                 println!("Reloading engine after snapshot...");
 
                 // Shutdown old engine
-                {
-                    let old_engine = engine_holder_for_repl.read().await;
-                    old_engine.shutdown().await;
-                }
+                let old_engine = {
+                    let guard = engine_holder_for_repl.read().unwrap();
+                    Arc::clone(&*guard)
+                };
+                old_engine.shutdown().await;
 
                 // Create new engine (will load the downloaded SSTables)
                 let new_engine = Arc::new(LsmTreeEngine::new(
@@ -526,7 +527,7 @@ pub async fn run_follower(
 
                 // Swap engine
                 {
-                    let mut guard = engine_holder_for_repl.write().await;
+                    let mut guard = engine_holder_for_repl.write().unwrap();
                     *guard = new_engine;
                 }
 
@@ -551,7 +552,10 @@ pub async fn run_follower(
 
     // Shutdown final engine
     {
-        let engine = engine_holder.read().await;
+        let engine = {
+            let guard = engine_holder.read().unwrap();
+            Arc::clone(&*guard)
+        };
         engine.shutdown().await;
     }
 
@@ -627,7 +631,7 @@ impl FollowerState {
 
 /// Key-value service for followers with swappable engine and promotion support
 struct SwappableFollowerKeyValue {
-    engine_holder: Arc<tokio::sync::RwLock<Arc<LsmTreeEngine>>>,
+    engine_holder: Arc<std::sync::RwLock<Arc<LsmTreeEngine>>>,
     state: Arc<FollowerState>,
 }
 
@@ -641,7 +645,7 @@ impl KeyValue for SwappableFollowerKeyValue {
         }
         let req = request.into_inner();
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         engine.set(req.key, req.value)?;
@@ -651,7 +655,7 @@ impl KeyValue for SwappableFollowerKeyValue {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         let value = engine.get(req.key)?;
@@ -669,7 +673,7 @@ impl KeyValue for SwappableFollowerKeyValue {
         }
         let req = request.into_inner();
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         engine.delete(req.key)?;
@@ -687,7 +691,7 @@ impl KeyValue for SwappableFollowerKeyValue {
         }
         let req = request.into_inner();
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         let items: Vec<(String, String)> = req
@@ -708,7 +712,7 @@ impl KeyValue for SwappableFollowerKeyValue {
     ) -> Result<Response<BatchGetResponse>, Status> {
         let req = request.into_inner();
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         let results = engine.batch_get(req.keys);
@@ -731,7 +735,7 @@ impl KeyValue for SwappableFollowerKeyValue {
         }
         let req = request.into_inner();
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         let count = engine.batch_delete(req.keys)? as i32;
@@ -746,7 +750,7 @@ impl KeyValue for SwappableFollowerKeyValue {
         _request: Request<GetMetricsRequest>,
     ) -> Result<Response<GetMetricsResponse>, Status> {
         let engine = {
-            let guard = self.engine_holder.read().await;
+            let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
         let metrics = engine.metrics();

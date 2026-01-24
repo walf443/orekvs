@@ -1,8 +1,5 @@
-mod engine;
-mod replication;
-mod server;
-
 use clap::{Parser, Subcommand};
+use orelsm::server;
 use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use serde::Serialize;
