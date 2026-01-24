@@ -12,14 +12,21 @@ use super::memtable::MemTable;
 use super::mmap::MappedFile;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 4;
+pub const DATA_VERSION: u32 = 5;
 
 // Header size: 6 bytes magic + 4 bytes version
 pub const HEADER_SIZE: u64 = 10;
+// Footer size for V5: index_offset(8) + bloom_offset(8) + footer_magic(8)
+#[allow(dead_code)]
+pub const FOOTER_SIZE_V5: u64 = 24;
 // Footer size for V4: index_offset(8) + bloom_offset(8) + footer_magic(8)
 pub const FOOTER_SIZE_V4: u64 = 24;
 // Footer size for V3 (legacy): index_offset(8)
 pub const FOOTER_SIZE_V3: u64 = 8;
+
+// Prefix compression restart interval for index
+// Every N entries, store full key for random access
+const INDEX_RESTART_INTERVAL: u32 = 16;
 // Footer magic bytes
 pub const FOOTER_MAGIC: u64 = 0x4F52454C534D4654; // "ORELSMFT" in hex
 // Target block size for compression (bytes)
@@ -43,9 +50,7 @@ pub type TimestampedEntry = (u64, Option<String>); // (timestamp, value)
 pub struct MappedSSTable {
     mmap: MappedFile,
     path: PathBuf,
-    #[allow(dead_code)]
     version: u32,
-    #[allow(dead_code)]
     index_offset: u64,
     bloom_offset: Option<u64>, // None for V3 format
 }
@@ -74,16 +79,16 @@ impl MappedSSTable {
         }
 
         let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if version != 3 && version != 4 {
+        if version != 3 && version != 4 && version != 5 {
             return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
+                "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
                 version
             )));
         }
 
         let file_len = mmap.len();
-        let footer_size = if version == 4 {
-            FOOTER_SIZE_V4 as usize
+        let footer_size = if version >= 4 {
+            FOOTER_SIZE_V4 as usize // V4 and V5 have same footer size
         } else {
             FOOTER_SIZE_V3 as usize
         };
@@ -93,7 +98,7 @@ impl MappedSSTable {
         }
 
         // Read footer
-        let (index_offset, bloom_offset) = if version == 4 {
+        let (index_offset, bloom_offset) = if version >= 4 {
             let footer_start = file_len - FOOTER_SIZE_V4 as usize;
             let footer = mmap.slice(footer_start, footer_start + 24);
             let idx_off = u64::from_le_bytes(footer[0..8].try_into().unwrap());
@@ -155,7 +160,17 @@ impl MappedSSTable {
         let decompressed = zstd::decode_all(Cursor::new(compressed))
             .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
 
-        // Parse index entries
+        // Parse index entries based on version
+        if self.version >= 5 {
+            self.parse_index_v5(&decompressed)
+        } else {
+            self.parse_index_v4(&decompressed)
+        }
+    }
+
+    /// Parse V4 index format (no prefix compression)
+    #[allow(clippy::result_large_err)]
+    fn parse_index_v4(&self, decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
         let mut cursor = Cursor::new(decompressed);
         let mut num_bytes = [0u8; 8];
         cursor
@@ -184,6 +199,65 @@ impl MappedSSTable {
             let offset = u64::from_le_bytes(off_bytes);
 
             index.push((key, offset));
+        }
+
+        Ok(index)
+    }
+
+    /// Parse V5 index format (with prefix compression)
+    /// Unified format: every entry uses prefix_len (u16) + suffix_len (u16) + suffix
+    #[allow(clippy::result_large_err)]
+    fn parse_index_v5(&self, decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
+        let mut cursor = Cursor::new(decompressed);
+
+        // Read header
+        let mut num_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut num_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let num_entries = u64::from_le_bytes(num_bytes);
+
+        // Read restart_interval (stored but not needed for reading with unified format)
+        let mut interval_bytes = [0u8; 4];
+        cursor
+            .read_exact(&mut interval_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut index = Vec::with_capacity(num_entries as usize);
+        let mut prev_key = Vec::new();
+
+        for _ in 0..num_entries {
+            // Unified format: prefix_len (u16) + suffix_len (u16) + suffix
+            let mut prefix_len_bytes = [0u8; 2];
+            cursor
+                .read_exact(&mut prefix_len_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let prefix_len = u16::from_le_bytes(prefix_len_bytes) as usize;
+
+            let mut suffix_len_bytes = [0u8; 2];
+            cursor
+                .read_exact(&mut suffix_len_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let suffix_len = u16::from_le_bytes(suffix_len_bytes) as usize;
+
+            let mut suffix = vec![0u8; suffix_len];
+            cursor
+                .read_exact(&mut suffix)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Reconstruct key from prefix + suffix
+            let mut key_buf = prev_key[..prefix_len].to_vec();
+            key_buf.extend_from_slice(&suffix);
+
+            let mut off_bytes = [0u8; 8];
+            cursor
+                .read_exact(&mut off_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let offset = u64::from_le_bytes(off_bytes);
+
+            let key_string = String::from_utf8_lossy(&key_buf).to_string();
+            prev_key = key_buf;
+            index.push((key_string, offset));
         }
 
         Ok(index)
@@ -283,9 +357,9 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 && version != 4 {
+    if version != 3 && version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
+            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
             version
         )));
     }
@@ -295,7 +369,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version == 4 {
+    let footer_size = if version >= 4 {
         FOOTER_SIZE_V4
     } else {
         FOOTER_SIZE_V3
@@ -306,7 +380,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     }
 
     // Read footer to get index offset
-    let index_offset = if version == 4 {
+    let index_offset = if version >= 4 {
         file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut footer = [0u8; 24];
@@ -322,8 +396,12 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         u64::from_le_bytes(index_offset_bytes)
     };
 
-    // Read index
-    let index = read_index_compressed(&mut file, index_offset)?;
+    // Read index (V5 uses prefix compression)
+    let index = if version >= 5 {
+        read_index_prefix_compressed(&mut file, index_offset)?
+    } else {
+        read_index_compressed(&mut file, index_offset)?
+    };
 
     // Binary search in index
     let start_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
@@ -564,9 +642,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 && version != 4 {
+    if version != 3 && version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
+            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
             version
         )));
     }
@@ -576,7 +654,7 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version == 4 {
+    let footer_size = if version >= 4 {
         FOOTER_SIZE_V4
     } else {
         FOOTER_SIZE_V3
@@ -587,7 +665,7 @@ fn get_or_load_index(
     }
 
     // Read footer to get index offset
-    let index_offset = if version == 4 {
+    let index_offset = if version >= 4 {
         file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut footer = [0u8; 24];
@@ -603,8 +681,12 @@ fn get_or_load_index(
         u64::from_le_bytes(index_offset_bytes)
     };
 
-    // Read and decompress index
-    let index = read_index_compressed(&mut file, index_offset)?;
+    // Read and decompress index (V5 uses prefix compression)
+    let index = if version >= 5 {
+        read_index_prefix_compressed(&mut file, index_offset)?
+    } else {
+        read_index_compressed(&mut file, index_offset)?
+    };
     let arc_index = Arc::new(index);
 
     // Cache it
@@ -755,9 +837,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if version != 3 && version != 4 {
+    if version != 3 && version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
+            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
             version
         )));
     }
@@ -767,7 +849,7 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version == 4 {
+    let footer_size = if version >= 4 {
         FOOTER_SIZE_V4
     } else {
         FOOTER_SIZE_V3
@@ -778,7 +860,7 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     // Read footer to get index offset (marks end of data blocks)
-    let end_offset = if version == 4 {
+    let end_offset = if version >= 4 {
         file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut footer = [0u8; 24];
@@ -880,9 +962,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if version != 3 && version != 4 {
+    if version != 3 && version != 4 && version != 5 {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 3 and 4 are supported.",
+            "Unsupported SSTable version: {}. Only versions 3, 4, and 5 are supported.",
             version
         )));
     }
@@ -892,7 +974,7 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    let footer_size = if version == 4 {
+    let footer_size = if version >= 4 {
         FOOTER_SIZE_V4
     } else {
         FOOTER_SIZE_V3
@@ -903,7 +985,7 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
     }
 
     // Read footer to get index offset (which marks end of data blocks)
-    let end_offset = if version == 4 {
+    let end_offset = if version >= 4 {
         file.seek(SeekFrom::Start(file_len - FOOTER_SIZE_V4))
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut footer = [0u8; 24];
@@ -1069,9 +1151,9 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         current_offset += 4 + len as u64;
     }
 
-    // Write index
+    // Write index with prefix compression (V5)
     let index_offset = current_offset;
-    let index_size = write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = write_index_prefix_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
     current_offset += index_size;
 
     // Write Bloom filter
@@ -1083,7 +1165,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
     file.write_all(&bloom_data)
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // Write V4 footer: index_offset + bloom_offset + magic
+    // Write V5 footer: index_offset + bloom_offset + magic
     file.write_all(&index_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_offset.to_le_bytes())
@@ -1178,9 +1260,9 @@ pub fn write_timestamped_entries(
         current_offset += 4 + len as u64;
     }
 
-    // Write index
+    // Write index with prefix compression (V5)
     let index_offset = current_offset;
-    let index_size = write_index_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = write_index_prefix_compressed(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
     current_offset += index_size;
 
     // Write Bloom filter
@@ -1192,7 +1274,7 @@ pub fn write_timestamped_entries(
     file.write_all(&bloom_data)
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // Write V4 footer: index_offset + bloom_offset + magic
+    // Write V5 footer: index_offset + bloom_offset + magic
     file.write_all(&index_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_offset.to_le_bytes())
@@ -1355,6 +1437,7 @@ pub fn read_bloom_filter(path: &Path) -> Result<Option<BloomFilter>, Status> {
 }
 
 #[allow(clippy::result_large_err)]
+#[allow(dead_code)]
 fn write_index_compressed(
     file: &mut File,
     index: &[(String, u64)],
@@ -1395,7 +1478,157 @@ fn write_index_compressed(
     Ok(8 + len)
 }
 
+/// Compute the length of the common prefix between two byte slices
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Write index with prefix compression (V5 format)
+/// Format:
+/// - num_entries: u64
+/// - restart_interval: u32
+/// - For each entry (unified format):
+///   - prefix_len (u16) + suffix_len (u16) + suffix + offset (u64)
+///   - Restart points have prefix_len = 0, suffix = full key
 #[allow(clippy::result_large_err)]
+fn write_index_prefix_compressed(
+    file: &mut File,
+    index: &[(String, u64)],
+    compression_level: i32,
+) -> Result<u64, Status> {
+    let mut buffer = Vec::new();
+    let num_entries = index.len() as u64;
+
+    buffer
+        .write_all(&num_entries.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    buffer
+        .write_all(&INDEX_RESTART_INTERVAL.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut prev_key: &[u8] = &[];
+
+    for (i, (key, offset)) in index.iter().enumerate() {
+        let key_bytes = key.as_bytes();
+
+        // Unified format: prefix_len (u16) + suffix_len (u16) + suffix
+        // Restart points use prefix_len = 0
+        let prefix_len = if (i as u32).is_multiple_of(INDEX_RESTART_INTERVAL) {
+            0
+        } else {
+            common_prefix_len(prev_key, key_bytes)
+        };
+        let suffix = &key_bytes[prefix_len..];
+
+        buffer
+            .write_all(&(prefix_len as u16).to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        buffer
+            .write_all(&(suffix.len() as u16).to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        buffer
+            .write_all(suffix)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        buffer
+            .write_all(&offset.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        prev_key = key_bytes;
+    }
+
+    let compressed = zstd::encode_all(Cursor::new(&buffer), compression_level)
+        .map_err(|e| Status::internal(format!("Index compression error: {}", e)))?;
+
+    // Write compressed size then data
+    let len = compressed.len() as u64;
+    file.write_all(&len.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&compressed)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok(8 + len)
+}
+
+/// Read index with prefix compression (V5 format)
+/// Unified format: every entry uses prefix_len (u16) + suffix_len (u16) + suffix
+#[allow(clippy::result_large_err)]
+#[allow(dead_code)]
+fn read_index_prefix_compressed(
+    file: &mut File,
+    index_offset: u64,
+) -> Result<Vec<(String, u64)>, Status> {
+    file.seek(SeekFrom::Start(index_offset))
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut len_bytes = [0u8; 8];
+    file.read_exact(&mut len_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let len = u64::from_le_bytes(len_bytes);
+
+    let mut compressed = vec![0u8; len as usize];
+    file.read_exact(&mut compressed)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let decompressed = zstd::decode_all(Cursor::new(&compressed))
+        .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
+
+    let mut cursor = Cursor::new(decompressed);
+
+    // Read header
+    let mut num_bytes = [0u8; 8];
+    cursor
+        .read_exact(&mut num_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let num_entries = u64::from_le_bytes(num_bytes);
+
+    // Read restart_interval (stored but not needed for reading with unified format)
+    let mut interval_bytes = [0u8; 4];
+    cursor
+        .read_exact(&mut interval_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut index = Vec::with_capacity(num_entries as usize);
+    let mut prev_key = Vec::new();
+
+    for _ in 0..num_entries {
+        // Unified format: prefix_len (u16) + suffix_len (u16) + suffix
+        let mut prefix_len_bytes = [0u8; 2];
+        cursor
+            .read_exact(&mut prefix_len_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let prefix_len = u16::from_le_bytes(prefix_len_bytes) as usize;
+
+        let mut suffix_len_bytes = [0u8; 2];
+        cursor
+            .read_exact(&mut suffix_len_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let suffix_len = u16::from_le_bytes(suffix_len_bytes) as usize;
+
+        let mut suffix = vec![0u8; suffix_len];
+        cursor
+            .read_exact(&mut suffix)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Reconstruct key from prefix + suffix
+        let mut key_buf = prev_key[..prefix_len].to_vec();
+        key_buf.extend_from_slice(&suffix);
+
+        let mut off_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut off_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let offset = u64::from_le_bytes(off_bytes);
+
+        let key_string = String::from_utf8_lossy(&key_buf).to_string();
+        prev_key = key_buf;
+        index.push((key_string, offset));
+    }
+
+    Ok(index)
+}
+
+#[allow(clippy::result_large_err)]
+#[allow(dead_code)]
 fn read_index_compressed(file: &mut File, index_offset: u64) -> Result<Vec<(String, u64)>, Status> {
     file.seek(SeekFrom::Start(index_offset))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -1676,5 +1909,107 @@ mod tests {
 
         let result = search_key(&sst_path, "key1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_prefix_compression_roundtrip() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("index_test.data");
+
+        // Create index with keys that have common prefixes
+        let index: Vec<(String, u64)> = (0..50)
+            .map(|i| (format!("user:profile:{:05}", i), i * 100))
+            .collect();
+
+        // Write index with prefix compression
+        {
+            let mut file = File::create(&index_path).unwrap();
+            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
+        }
+
+        // Read it back
+        let read_index = {
+            let mut file = File::open(&index_path).unwrap();
+            read_index_prefix_compressed(&mut file, 0).unwrap()
+        };
+
+        // Verify all entries match
+        assert_eq!(index.len(), read_index.len());
+        for (original, read) in index.iter().zip(read_index.iter()) {
+            assert_eq!(original.0, read.0, "Key mismatch");
+            assert_eq!(original.1, read.1, "Offset mismatch");
+        }
+    }
+
+    #[test]
+    fn test_prefix_compression_restart_points() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("restart_test.data");
+
+        // Create index with 20 entries (more than restart interval of 16)
+        // to verify restart points work correctly
+        let index: Vec<(String, u64)> =
+            (0..20).map(|i| (format!("key:{:03}", i), i * 50)).collect();
+
+        {
+            let mut file = File::create(&index_path).unwrap();
+            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
+        }
+
+        let read_index = {
+            let mut file = File::open(&index_path).unwrap();
+            read_index_prefix_compressed(&mut file, 0).unwrap()
+        };
+
+        // Entry 0 and 16 are restart points (prefix_len = 0)
+        // Verify they are correctly reconstructed
+        assert_eq!(read_index[0].0, "key:000");
+        assert_eq!(read_index[16].0, "key:016");
+        assert_eq!(read_index.len(), 20);
+    }
+
+    #[test]
+    fn test_prefix_compression_no_common_prefix() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("no_prefix_test.data");
+
+        // Keys with no common prefix
+        let index: Vec<(String, u64)> = vec![
+            ("apple".to_string(), 100),
+            ("banana".to_string(), 200),
+            ("cherry".to_string(), 300),
+        ];
+
+        {
+            let mut file = File::create(&index_path).unwrap();
+            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
+        }
+
+        let read_index = {
+            let mut file = File::open(&index_path).unwrap();
+            read_index_prefix_compressed(&mut file, 0).unwrap()
+        };
+
+        assert_eq!(read_index, index);
+    }
+
+    #[test]
+    fn test_prefix_compression_empty_index() {
+        let dir = tempdir().unwrap();
+        let index_path = dir.path().join("empty_index_test.data");
+
+        let index: Vec<(String, u64)> = vec![];
+
+        {
+            let mut file = File::create(&index_path).unwrap();
+            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
+        }
+
+        let read_index = {
+            let mut file = File::open(&index_path).unwrap();
+            read_index_prefix_compressed(&mut file, 0).unwrap()
+        };
+
+        assert!(read_index.is_empty());
     }
 }
