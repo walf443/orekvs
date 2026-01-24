@@ -383,16 +383,6 @@ impl GroupCommitWalWriter {
         Ok((written_rx, synced_rx))
     }
 
-    /// Append an entry to the WAL asynchronously (group commit)
-    #[allow(dead_code)]
-    pub async fn append_async(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
-        let (_written_rx, synced_rx) = self.append_pipelined(key, value).await?;
-
-        synced_rx
-            .await
-            .map_err(|_| Status::internal("WAL response channel closed"))?
-    }
-
     /// Write multiple entries to the WAL (used for recovery re-write)
     #[allow(clippy::result_large_err)]
     pub fn write_entries(&self, entries: &MemTable) -> Result<(), Status> {

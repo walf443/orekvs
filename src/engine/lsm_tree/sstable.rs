@@ -446,65 +446,6 @@ fn search_in_parsed_block(
     }
 }
 
-/// Search for a key within a decompressed block (linear scan - legacy)
-#[allow(clippy::result_large_err)]
-#[allow(dead_code)]
-fn search_in_block(block_data: &[u8], key: &str) -> Result<Option<String>, Status> {
-    let mut cursor = Cursor::new(block_data);
-
-    loop {
-        if cursor.position() == block_data.len() as u64 {
-            break;
-        }
-
-        let mut ts_bytes = [0u8; 8];
-        if cursor.read_exact(&mut ts_bytes).is_err() {
-            break;
-        }
-
-        let mut klen_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut klen_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut vlen_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut vlen_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let key_len = u64::from_le_bytes(klen_bytes);
-        let val_len = u64::from_le_bytes(vlen_bytes);
-
-        let mut key_buf = vec![0u8; key_len as usize];
-        cursor
-            .read_exact(&mut key_buf)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let current_key = String::from_utf8_lossy(&key_buf);
-
-        if current_key == key {
-            if val_len == u64::MAX {
-                return Ok(None);
-            }
-            let mut val_buf = vec![0u8; val_len as usize];
-            cursor
-                .read_exact(&mut val_buf)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            return Ok(Some(String::from_utf8_lossy(&val_buf).to_string()));
-        }
-
-        // Optimization: If current_key > key, we can stop (entries are sorted)
-        if current_key.as_ref() > key {
-            return Err(Status::not_found("Key not found in SSTable (sorted check)"));
-        }
-
-        if val_len != u64::MAX {
-            cursor
-                .seek(SeekFrom::Current(val_len as i64))
-                .map_err(|e| Status::internal(e.to_string()))?;
-        }
-    }
-    Err(Status::not_found("Key not found in SSTable"))
-}
-
 /// Read only keys from an SSTable file
 #[allow(clippy::result_large_err)]
 pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {

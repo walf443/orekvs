@@ -28,11 +28,6 @@ impl BlockCacheKey {
             block_offset: u64::MAX,
         }
     }
-
-    #[allow(dead_code)]
-    pub fn is_index(&self) -> bool {
-        self.block_offset == u64::MAX
-    }
 }
 
 /// Parsed block entry: (key, value_option)
@@ -42,9 +37,6 @@ pub type ParsedBlockEntry = (String, Option<String>);
 /// Cached entry types
 #[derive(Clone)]
 pub enum CacheEntry {
-    /// Decompressed data block (raw bytes) - kept for potential future use
-    #[allow(dead_code)]
-    DataBlock(Arc<Vec<u8>>),
     /// Decompressed and parsed index
     Index(Arc<Vec<(String, u64)>>),
     /// Parsed block entries (sorted by key for binary search)
@@ -54,7 +46,6 @@ pub enum CacheEntry {
 impl CacheEntry {
     pub fn size_bytes(&self) -> usize {
         match self {
-            CacheEntry::DataBlock(data) => data.len(),
             CacheEntry::Index(index) => index.iter().map(|(k, _)| k.len() + 8).sum::<usize>(),
             CacheEntry::ParsedBlock(entries) => entries
                 .iter()
@@ -179,22 +170,26 @@ mod tests {
         let cache = BlockCache::new(1024);
 
         let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), 0);
-        let data = Arc::new(vec![1u8; 100]);
+        let entries = Arc::new(vec![
+            ("key1".to_string(), Some("value1".to_string())),
+            ("key2".to_string(), Some("value2".to_string())),
+        ]);
 
         // Insert
-        cache.insert(key.clone(), CacheEntry::DataBlock(Arc::clone(&data)));
+        cache.insert(key.clone(), CacheEntry::ParsedBlock(Arc::clone(&entries)));
 
         // Get
         let result = cache.get(&key);
         assert!(result.is_some());
-        if let Some(CacheEntry::DataBlock(retrieved)) = result {
-            assert_eq!(retrieved.len(), 100);
+        if let Some(CacheEntry::ParsedBlock(retrieved)) = result {
+            assert_eq!(retrieved.len(), 2);
         }
 
         // Stats
         let stats = cache.stats();
         assert_eq!(stats.entries, 1);
-        assert_eq!(stats.size_bytes, 100);
+        // key1(4) + value1(6) + key2(4) + value2(6) = 20
+        assert_eq!(stats.size_bytes, 20);
     }
 
     #[test]
@@ -204,8 +199,12 @@ mod tests {
         // Insert entries that exceed cache size
         for i in 0..5 {
             let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), i * 100);
-            let data = Arc::new(vec![i as u8; 100]);
-            cache.insert(key, CacheEntry::DataBlock(data));
+            // Create entries with predictable sizes
+            let entries = Arc::new(vec![(
+                "x".repeat(50),
+                Some("y".repeat(50)),
+            )]);
+            cache.insert(key, CacheEntry::ParsedBlock(entries));
         }
 
         // Cache should have evicted older entries
@@ -223,15 +222,15 @@ mod tests {
 
         cache.insert(
             BlockCacheKey::for_block(file1.clone(), 0),
-            CacheEntry::DataBlock(Arc::new(vec![1u8; 50])),
+            CacheEntry::ParsedBlock(Arc::new(vec![("k1".to_string(), Some("v1".to_string()))])),
         );
         cache.insert(
             BlockCacheKey::for_block(file1.clone(), 100),
-            CacheEntry::DataBlock(Arc::new(vec![2u8; 50])),
+            CacheEntry::ParsedBlock(Arc::new(vec![("k2".to_string(), Some("v2".to_string()))])),
         );
         cache.insert(
             BlockCacheKey::for_block(file2.clone(), 0),
-            CacheEntry::DataBlock(Arc::new(vec![3u8; 50])),
+            CacheEntry::ParsedBlock(Arc::new(vec![("k3".to_string(), Some("v3".to_string()))])),
         );
 
         assert_eq!(cache.stats().entries, 3);
@@ -249,8 +248,11 @@ mod tests {
         let index_key = BlockCacheKey::for_index(file.clone());
         let block_key = BlockCacheKey::for_block(file, 0);
 
-        assert!(index_key.is_index());
-        assert!(!block_key.is_index());
+        // Index key uses u64::MAX as block_offset, so it's different from any block key
         assert_ne!(index_key, block_key);
+
+        // Two index keys for the same file should be equal
+        let index_key2 = BlockCacheKey::for_index(PathBuf::from("/test/file.data"));
+        assert_eq!(index_key, index_key2);
     }
 }
