@@ -1,6 +1,7 @@
 mod block_cache;
 mod bloom;
 mod memtable;
+mod metrics;
 mod sstable;
 mod wal;
 
@@ -8,6 +9,7 @@ use super::Engine;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use bloom::BloomFilter;
 use memtable::{MemTable, MemTableState};
+pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
 use sstable::TimestampedEntry;
 use std::collections::BTreeMap;
@@ -41,6 +43,8 @@ pub struct LsmTreeEngine {
     wal: GroupCommitWalWriter,
     // Block cache for SSTable reads
     block_cache: Arc<BlockCache>,
+    // Centralized metrics collection
+    metrics: Arc<EngineMetrics>,
 }
 
 impl Clone for LsmTreeEngine {
@@ -54,6 +58,7 @@ impl Clone for LsmTreeEngine {
             compaction_in_progress: Arc::clone(&self.compaction_in_progress),
             wal: self.wal.clone(),
             block_cache: Arc::clone(&self.block_cache),
+            metrics: Arc::clone(&self.metrics),
         }
     }
 }
@@ -224,6 +229,7 @@ impl LsmTreeEngine {
             compaction_in_progress: Arc::new(Mutex::new(false)),
             wal,
             block_cache: Arc::new(BlockCache::new(DEFAULT_BLOCK_CACHE_SIZE_BYTES)),
+            metrics: Arc::new(EngineMetrics::new()),
         }
     }
 
@@ -249,6 +255,11 @@ impl LsmTreeEngine {
 
         // create_from_memtable returns the embedded Bloom filter
         let bloom = sstable::create_from_memtable(&sst_path, &memtable)?;
+
+        // Record flush metrics (estimate bytes from SSTable file size)
+        if let Ok(metadata) = std::fs::metadata(&sst_path) {
+            self.metrics.record_flush(metadata.len());
+        }
 
         let handle = Arc::new(SstableHandle {
             path: sst_path,
@@ -304,6 +315,23 @@ impl LsmTreeEngine {
         self.wal.shutdown().await;
     }
 
+    /// Get a snapshot of engine metrics
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Get block cache statistics
+    pub fn cache_stats(&self) -> block_cache::CacheStats {
+        self.block_cache.stats()
+    }
+
+    /// Reset all metrics counters (for testing)
+    #[allow(dead_code)]
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
+        self.block_cache.reset_stats();
+    }
+
     /// Run compaction: merge all SSTables into a single new SSTable and delete old ones
     async fn run_compaction(&self) -> Result<(), Status> {
         println!("Starting compaction...");
@@ -318,6 +346,13 @@ impl LsmTreeEngine {
             println!("Not enough SSTables to compact");
             return Ok(());
         }
+
+        // Calculate bytes read from input SSTables
+        let bytes_read: u64 = sst_handles
+            .iter()
+            .filter_map(|h| std::fs::metadata(&h.path).ok())
+            .map(|m| m.len())
+            .sum();
 
         // Merge all SSTables, keeping only the latest value for each key
         let mut merged: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
@@ -353,6 +388,12 @@ impl LsmTreeEngine {
 
         // write_timestamped_entries returns the embedded Bloom filter
         let bloom = sstable::write_timestamped_entries(&new_sst_path, &merged)?;
+
+        // Record compaction metrics
+        let bytes_written = std::fs::metadata(&new_sst_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.metrics.record_compaction(bytes_read, bytes_written);
 
         let new_handle = Arc::new(SstableHandle {
             path: new_sst_path.clone(),
@@ -399,6 +440,7 @@ impl LsmTreeEngine {
 
 impl Engine for LsmTreeEngine {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.metrics.record_set();
         let new_val_opt = Some(value);
 
         // 1. Start writing to WAL
@@ -426,6 +468,8 @@ impl Engine for LsmTreeEngine {
     }
 
     fn get(&self, key: String) -> Result<String, Status> {
+        self.metrics.record_get();
+
         if let Some(val_opt) = self.mem_state.get(&key) {
             return val_opt
                 .as_ref()
@@ -439,12 +483,20 @@ impl Engine for LsmTreeEngine {
         };
         for handle in handles {
             if !handle.bloom.contains(&key) {
+                // Bloom filter says key is definitely not in this SSTable
+                self.metrics.record_bloom_filter_hit();
                 continue;
             }
+            // Bloom filter says key might be in this SSTable, need to search
+            self.metrics.record_sstable_search();
             match sstable::search_key_cached(&handle.path, &key, &self.block_cache) {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => return Err(Status::not_found("Key deleted")),
-                Err(e) if e.code() == tonic::Code::NotFound => continue,
+                Err(e) if e.code() == tonic::Code::NotFound => {
+                    // Key wasn't actually in SSTable - this was a false positive
+                    self.metrics.record_bloom_filter_false_positive();
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -452,6 +504,8 @@ impl Engine for LsmTreeEngine {
     }
 
     fn delete(&self, key: String) -> Result<(), Status> {
+        self.metrics.record_delete();
+
         // 1. Start writing tombstone to WAL
         let wal = self.wal.clone();
         let key_clone = key.clone();
@@ -481,6 +535,7 @@ impl Engine for LsmTreeEngine {
         }
 
         let count = items.len();
+        self.metrics.record_batch_set(count as u64);
 
         // Convert to WAL format (key, Some(value))
         let entries: Vec<(String, Option<String>)> = items
@@ -523,6 +578,8 @@ impl Engine for LsmTreeEngine {
         keys.sort();
         // Remove duplicates to avoid redundant lookups
         keys.dedup();
+
+        self.metrics.record_batch_get(keys.len() as u64);
 
         let mut results = Vec::with_capacity(keys.len());
 
@@ -593,6 +650,7 @@ impl Engine for LsmTreeEngine {
         }
 
         let count = keys.len();
+        self.metrics.record_batch_delete(count as u64);
 
         // Convert to WAL format (key, None for tombstone)
         let entries: Vec<(String, Option<String>)> =

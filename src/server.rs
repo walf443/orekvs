@@ -8,8 +8,8 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, DeleteRequest, DeleteResponse, GetRequest, GetResponse, KeyValuePair,
-    SetRequest, SetResponse,
+    BatchSetResponse, DeleteRequest, DeleteResponse, GetMetricsRequest, GetMetricsResponse,
+    GetRequest, GetResponse, KeyValuePair, SetRequest, SetResponse,
 };
 
 use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine};
@@ -18,6 +18,8 @@ use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::Mem
 
 pub struct MyKeyValue {
     engine: Box<dyn Engine>,
+    // Optional reference to LsmTreeEngine for metrics access
+    lsm_engine: Option<Arc<LsmTreeEngine>>,
 }
 
 /// Wrapper to hold LSM engine reference for graceful shutdown
@@ -72,6 +74,7 @@ impl MyKeyValue {
         lsm_holder: &mut LsmEngineHolder,
         log_holder: &mut LogEngineHolder,
     ) -> Self {
+        let mut lsm_engine_ref = None;
         let engine: Box<dyn Engine> = match engine_type {
             EngineType::Memory => Box::new(MemoryEngine::new()),
             EngineType::Log => {
@@ -86,10 +89,14 @@ impl MyKeyValue {
                     lsm_compaction_trigger_file_count,
                 ));
                 lsm_holder.set(Arc::clone(&lsm_engine));
+                lsm_engine_ref = Some(Arc::clone(&lsm_engine));
                 Box::new(LsmTreeEngineWrapper(lsm_engine))
             }
         };
-        MyKeyValue { engine }
+        MyKeyValue {
+            engine,
+            lsm_engine: lsm_engine_ref,
+        }
     }
 }
 
@@ -206,6 +213,53 @@ impl KeyValue for MyKeyValue {
             success: true,
             count,
         }))
+    }
+
+    async fn get_metrics(
+        &self,
+        _request: Request<GetMetricsRequest>,
+    ) -> Result<Response<GetMetricsResponse>, Status> {
+        if let Some(ref lsm_engine) = self.lsm_engine {
+            let metrics = lsm_engine.metrics();
+            let cache_stats = lsm_engine.cache_stats();
+
+            Ok(Response::new(GetMetricsResponse {
+                // Operation counts
+                get_count: metrics.get_count,
+                set_count: metrics.set_count,
+                delete_count: metrics.delete_count,
+                batch_get_count: metrics.batch_get_count,
+                batch_set_count: metrics.batch_set_count,
+                batch_delete_count: metrics.batch_delete_count,
+
+                // SSTable metrics
+                sstable_searches: metrics.sstable_searches,
+                bloom_filter_hits: metrics.bloom_filter_hits,
+                bloom_filter_false_positives: metrics.bloom_filter_false_positives,
+                bloom_effectiveness: metrics.bloom_effectiveness,
+
+                // MemTable metrics
+                memtable_flushes: metrics.memtable_flushes,
+                memtable_flush_bytes: metrics.memtable_flush_bytes,
+
+                // Compaction metrics
+                compaction_count: metrics.compaction_count,
+                compaction_bytes_read: metrics.compaction_bytes_read,
+                compaction_bytes_written: metrics.compaction_bytes_written,
+
+                // Block cache metrics
+                blockcache_entries: cache_stats.entries as u64,
+                blockcache_size_bytes: cache_stats.size_bytes as u64,
+                blockcache_max_size_bytes: cache_stats.max_size_bytes as u64,
+                blockcache_hits: cache_stats.hits,
+                blockcache_misses: cache_stats.misses,
+                blockcache_evictions: cache_stats.evictions,
+                blockcache_hit_ratio: cache_stats.hit_ratio,
+            }))
+        } else {
+            // Return empty metrics for non-LSM engines
+            Ok(Response::new(GetMetricsResponse::default()))
+        }
     }
 }
 

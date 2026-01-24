@@ -1,6 +1,7 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Default block cache size: 64 MB
@@ -58,6 +59,10 @@ impl CacheEntry {
 /// Thread-safe block cache with LRU eviction
 pub struct BlockCache {
     inner: RwLock<BlockCacheInner>,
+    // Metrics (atomic for lock-free access)
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
 }
 
 struct BlockCacheInner {
@@ -77,13 +82,25 @@ impl BlockCache {
                 current_size_bytes: 0,
                 max_size_bytes,
             }),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
     /// Get an entry from the cache, promoting it to most-recently-used
     pub fn get(&self, key: &BlockCacheKey) -> Option<CacheEntry> {
         let mut inner = self.inner.write().ok()?;
-        inner.cache.get(key).cloned()
+        match inner.cache.get(key).cloned() {
+            Some(entry) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// Insert an entry into the cache, evicting old entries if necessary
@@ -107,6 +124,7 @@ impl BlockCache {
                 inner.current_size_bytes = inner
                     .current_size_bytes
                     .saturating_sub(evicted.size_bytes());
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             } else {
                 break;
             }
@@ -141,24 +159,45 @@ impl BlockCache {
     }
 
     /// Get cache statistics
-    #[allow(dead_code)]
     pub fn stats(&self) -> CacheStats {
         let inner = self.inner.read().unwrap();
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let total = hits + misses;
         CacheStats {
             entries: inner.cache.len(),
             size_bytes: inner.current_size_bytes,
             max_size_bytes: inner.max_size_bytes,
+            hits,
+            misses,
+            evictions: self.evictions.load(Ordering::Relaxed),
+            hit_ratio: if total > 0 {
+                hits as f64 / total as f64
+            } else {
+                0.0
+            },
         }
+    }
+
+    /// Reset cache statistics counters (for testing)
+    #[allow(dead_code)]
+    pub fn reset_stats(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
+        self.evictions.store(0, Ordering::Relaxed);
     }
 }
 
 /// Cache statistics
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CacheStats {
     pub entries: usize,
     pub size_bytes: usize,
     pub max_size_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub hit_ratio: f64,
 }
 
 #[cfg(test)]
@@ -200,10 +239,7 @@ mod tests {
         for i in 0..5 {
             let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), i * 100);
             // Create entries with predictable sizes
-            let entries = Arc::new(vec![(
-                "x".repeat(50),
-                Some("y".repeat(50)),
-            )]);
+            let entries = Arc::new(vec![("x".repeat(50), Some("y".repeat(50)))]);
             cache.insert(key, CacheEntry::ParsedBlock(entries));
         }
 

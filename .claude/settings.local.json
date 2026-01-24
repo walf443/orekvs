@@ -8,7 +8,8 @@
       "Bash(./target/release/orelsm:*)",
       "Bash(time cargo nextest run:*)",
       "Bash(cargo nextest run:*)",
-      "Bash(lsof:*)"
+      "Bash(lsof:*)",
+      "Bash(./target/debug/orelsm test:*)"
     ]
   }
 }

@@ -9,6 +9,7 @@ service KeyValue {
   rpc BatchSet (BatchSetRequest) returns (BatchSetResponse);
   rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
   rpc BatchDelete (BatchDeleteRequest) returns (BatchDeleteResponse);
+  rpc GetMetrics (GetMetricsRequest) returns (GetMetricsResponse);
 }
 
 message SetRequest {
@@ -65,4 +66,41 @@ message BatchDeleteRequest {
 message BatchDeleteResponse {
   bool success = 1;
   int32 count = 2;
+}
+
+message GetMetricsRequest {
+}
+
+message GetMetricsResponse {
+  // Operation counts
+  uint64 get_count = 1;
+  uint64 set_count = 2;
+  uint64 delete_count = 3;
+  uint64 batch_get_count = 4;
+  uint64 batch_set_count = 5;
+  uint64 batch_delete_count = 6;
+
+  // SSTable metrics
+  uint64 sstable_searches = 10;
+  uint64 bloom_filter_hits = 11;
+  uint64 bloom_filter_false_positives = 12;
+  double bloom_effectiveness = 13;
+
+  // MemTable metrics
+  uint64 memtable_flushes = 20;
+  uint64 memtable_flush_bytes = 21;
+
+  // Compaction metrics
+  uint64 compaction_count = 30;
+  uint64 compaction_bytes_read = 31;
+  uint64 compaction_bytes_written = 32;
+
+  // Block cache metrics
+  uint64 blockcache_entries = 40;
+  uint64 blockcache_size_bytes = 41;
+  uint64 blockcache_max_size_bytes = 42;
+  uint64 blockcache_hits = 43;
+  uint64 blockcache_misses = 44;
+  uint64 blockcache_evictions = 45;
+  double blockcache_hit_ratio = 46;
 }
