@@ -3,6 +3,7 @@
 //! This module encapsulates all unsafe mmap operations and provides a safe public API.
 //! The underlying mmap is read-only and the file must not be modified while mapped.
 
+use memmap2::Advice;
 use std::fs::File;
 use std::io;
 use std::ops::Deref;
@@ -86,6 +87,35 @@ impl MappedFile {
     pub fn read_at(&self, offset: usize, len: usize) -> Option<&[u8]> {
         let end = offset.checked_add(len)?;
         self.get_slice(offset, end)
+    }
+
+    /// Advise the OS that this file will be accessed sequentially.
+    /// This enables read-ahead optimization for operations like compaction.
+    ///
+    /// Returns `Ok(())` on success, or an error if the advise call fails.
+    pub fn advise_sequential(&self) -> io::Result<()> {
+        self.inner.advise(Advice::Sequential)
+    }
+
+    /// Advise the OS that the specified range will be needed soon.
+    /// This triggers prefetching of the data into the page cache.
+    ///
+    /// Returns `Ok(())` on success, or an error if the advise call fails.
+    /// If the range is out of bounds, returns Ok(()) without advising.
+    pub fn prefetch(&self, offset: usize, len: usize) -> io::Result<()> {
+        if offset + len <= self.inner.len() {
+            self.inner.advise_range(Advice::WillNeed, offset, len)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Advise the OS that the file will be accessed randomly.
+    /// This disables read-ahead which may be wasteful for point lookups.
+    ///
+    /// Returns `Ok(())` on success, or an error if the advise call fails.
+    pub fn advise_random(&self) -> io::Result<()> {
+        self.inner.advise(Advice::Random)
     }
 }
 

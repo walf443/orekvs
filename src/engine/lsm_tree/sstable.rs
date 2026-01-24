@@ -64,6 +64,10 @@ impl MappedSSTable {
             }
         })?;
 
+        // Advise OS that we'll access this file randomly (point lookups)
+        // This disables read-ahead which would be wasteful for random access
+        let _ = mmap.advise_random();
+
         // Validate header
         if mmap.len() < HEADER_SIZE as usize {
             return Err(Status::internal("SSTable file too small"));
