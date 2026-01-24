@@ -7,7 +7,8 @@ use rand::{Rng, thread_rng};
 use server::EngineType;
 use server::kv::key_value_client::KeyValueClient;
 use server::kv::{
-    BatchGetRequest, BatchSetRequest, DeleteRequest, GetRequest, KeyValuePair, SetRequest,
+    BatchDeleteRequest, BatchGetRequest, BatchSetRequest, DeleteRequest, GetRequest, KeyValuePair,
+    SetRequest,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -109,6 +110,17 @@ enum TestCommands {
         #[arg(long, default_value_t = 0.0)]
         duplicate_rate: f64,
     },
+    /// Batch delete multiple random keys
+    BatchDelete {
+        /// Total number of keys to delete
+        count: usize,
+        /// Number of keys per batch
+        #[arg(short, long, default_value_t = 100)]
+        batch_size: usize,
+        /// Maximum key value (1..N)
+        #[arg(long, default_value_t = 1000000)]
+        key_range: u32,
+    },
     /// Set a key-value pair
     Set { key: String, value: String },
     /// Get the value of a key
@@ -173,6 +185,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await
             }
+            TestCommands::BatchDelete {
+                count,
+                batch_size,
+                key_range,
+            } => run_test_batch_delete(addr.clone(), *count, *batch_size, *key_range).await,
             TestCommands::Set { key, value } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(SetRequest {
@@ -498,6 +515,64 @@ async fn run_test_batch_get(
     println!("Total found: {}", total_found);
     println!("Batch size: {}", batch_size);
     println!("Duplicate rate: {:.0}%", duplicate_rate * 100.0);
+    println!("Number of batches: {}", num_batches);
+    println!("Total elapsed time: {:?}", total_elapsed);
+    println!(
+        "Throughput: {:.2} keys/sec",
+        count as f64 / total_elapsed.as_secs_f64()
+    );
+
+    Ok(())
+}
+
+async fn run_test_batch_delete(
+    addr: String,
+    count: usize,
+    batch_size: usize,
+    key_range: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let num_batches = count.div_ceil(batch_size);
+    println!(
+        "Batch deleting {} keys (range 1..={}) in {} batches of {} from {}...",
+        count, key_range, num_batches, batch_size, addr
+    );
+
+    let mut client = KeyValueClient::connect(addr).await?;
+    let start_time = Instant::now();
+    let mut total_deleted = 0usize;
+
+    for batch_num in 0..num_batches {
+        let keys_in_batch = std::cmp::min(batch_size, count - batch_num * batch_size);
+        let mut keys = Vec::with_capacity(keys_in_batch);
+
+        for _ in 0..keys_in_batch {
+            let mut rng = thread_rng();
+            let key = rng.gen_range(1..=key_range).to_string();
+            keys.push(key);
+        }
+
+        let request = tonic::Request::new(BatchDeleteRequest { keys });
+        let response = client.batch_delete(request).await?;
+        total_deleted += response.into_inner().count as usize;
+
+        if num_batches <= 10 || batch_num < 3 || batch_num >= num_batches - 3 {
+            println!(
+                "[Batch {}/{}] Deleted {} keys",
+                batch_num + 1,
+                num_batches,
+                keys_in_batch
+            );
+        } else if batch_num == 3 {
+            println!("...");
+        }
+    }
+
+    let total_elapsed = start_time.elapsed();
+
+    println!("\nSummary:");
+    println!("Total requested: {}", count);
+    println!("Total deleted: {}", total_deleted);
+    println!("Batch size: {}", batch_size);
     println!("Number of batches: {}", num_batches);
     println!("Total elapsed time: {:?}", total_elapsed);
     println!(

@@ -586,6 +586,43 @@ impl Engine for LsmTreeEngine {
 
         results
     }
+
+    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+
+        let count = keys.len();
+
+        // Convert to WAL format (key, None for tombstone)
+        let entries: Vec<(String, Option<String>)> =
+            keys.iter().map(|k| (k.clone(), None)).collect();
+
+        // 1. Start writing batch of tombstones to WAL
+        let wal = self.wal.clone();
+        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined(entries))
+        })?;
+
+        // 2. Wait for WAL to be written to OS buffer
+        let _ =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
+
+        // 3. Update MemTable with tombstones
+        for key in keys {
+            self.mem_state.insert(key, None);
+        }
+        self.trigger_flush_if_needed();
+
+        // 4. Wait for disk sync for durability
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(synced_rx)
+                .map_err(|_| Status::internal("WAL synced channel closed"))?
+        })?;
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
@@ -1036,6 +1073,111 @@ mod tests {
         let result_map: std::collections::HashMap<_, _> = results.into_iter().collect();
         assert_eq!(result_map.get("key1"), Some(&"value1".to_string()));
         assert_eq!(result_map.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_delete_basic() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+        // Set some values
+        engine.set("a".to_string(), "va".to_string()).unwrap();
+        engine.set("b".to_string(), "vb".to_string()).unwrap();
+        engine.set("c".to_string(), "vc".to_string()).unwrap();
+        engine.set("d".to_string(), "vd".to_string()).unwrap();
+
+        // Batch delete some keys
+        let keys = vec!["a".to_string(), "c".to_string()];
+        let deleted = engine.batch_delete(keys).unwrap();
+        assert_eq!(deleted, 2);
+
+        // Verify deleted keys are gone
+        assert!(engine.get("a".to_string()).is_err());
+        assert!(engine.get("c".to_string()).is_err());
+
+        // Verify remaining keys still exist
+        assert_eq!(engine.get("b".to_string()).unwrap(), "vb");
+        assert_eq!(engine.get("d".to_string()).unwrap(), "vd");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_batch_delete_empty() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap().to_string();
+        let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+        // Batch delete with empty list should return 0
+        let deleted = engine.batch_delete(vec![]).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    /// Benchmark test to compare batch_delete vs individual delete
+    /// Run with: cargo test bench_batch_delete --release -- --nocapture --ignored
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_batch_delete() {
+        use std::time::Instant;
+
+        let num_keys = 1000;
+
+        // Benchmark individual delete
+        {
+            let dir = tempdir().unwrap();
+            let data_dir = dir.path().to_str().unwrap().to_string();
+            let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 100);
+
+            // Setup: create keys
+            for i in 0..num_keys {
+                engine
+                    .set(format!("key{:05}", i), format!("value{:05}", i))
+                    .unwrap();
+            }
+
+            // Benchmark individual deletes
+            let start = Instant::now();
+            for i in 0..num_keys {
+                engine.delete(format!("key{:05}", i)).unwrap();
+            }
+            let individual_duration = start.elapsed();
+
+            println!("\n=== Batch Delete Benchmark ===");
+            println!(
+                "Individual delete: {} keys in {:?} ({:.2} keys/sec)",
+                num_keys,
+                individual_duration,
+                num_keys as f64 / individual_duration.as_secs_f64()
+            );
+        }
+
+        // Benchmark batch delete
+        {
+            let dir = tempdir().unwrap();
+            let data_dir = dir.path().to_str().unwrap().to_string();
+            let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 100);
+
+            // Setup: create keys
+            for i in 0..num_keys {
+                engine
+                    .set(format!("key{:05}", i), format!("value{:05}", i))
+                    .unwrap();
+            }
+
+            // Benchmark batch delete
+            let keys: Vec<String> = (0..num_keys).map(|i| format!("key{:05}", i)).collect();
+            let start = Instant::now();
+            engine.batch_delete(keys).unwrap();
+            let batch_duration = start.elapsed();
+
+            println!(
+                "Batch delete:      {} keys in {:?} ({:.2} keys/sec)",
+                num_keys,
+                batch_duration,
+                num_keys as f64 / batch_duration.as_secs_f64()
+            );
+
+            println!("=====================================\n");
+        }
     }
 
     /// Benchmark test to measure block cache effectiveness

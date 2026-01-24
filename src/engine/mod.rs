@@ -30,4 +30,16 @@ pub trait Engine: Send + Sync + 'static {
             .filter_map(|key| self.get(key.clone()).ok().map(|value| (key, value)))
             .collect()
     }
+
+    /// Batch delete multiple keys.
+    /// Default implementation calls delete() for each key.
+    /// Engines can override this for optimized batch processing.
+    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
+        let mut count = 0;
+        for key in keys {
+            self.delete(key)?;
+            count += 1;
+        }
+        Ok(count)
+    }
 }

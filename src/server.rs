@@ -7,8 +7,9 @@ pub mod kv {
 
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{
-    BatchGetRequest, BatchGetResponse, BatchSetRequest, BatchSetResponse, DeleteRequest,
-    DeleteResponse, GetRequest, GetResponse, KeyValuePair, SetRequest, SetResponse,
+    BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
+    BatchSetResponse, DeleteRequest, DeleteResponse, GetRequest, GetResponse, KeyValuePair,
+    SetRequest, SetResponse,
 };
 
 use crate::engine::{Engine, log::LogEngine, lsm_tree::LsmTreeEngine, memory::MemoryEngine};
@@ -132,6 +133,10 @@ impl Engine for LsmTreeEngineWrapper {
     fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
         self.0.batch_get(keys)
     }
+
+    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
+        self.0.batch_delete(keys)
+    }
 }
 
 #[tonic::async_trait]
@@ -188,6 +193,19 @@ impl KeyValue for MyKeyValue {
             .collect();
 
         Ok(Response::new(BatchGetResponse { items }))
+    }
+
+    async fn batch_delete(
+        &self,
+        request: Request<BatchDeleteRequest>,
+    ) -> Result<Response<BatchDeleteResponse>, Status> {
+        let req = request.into_inner();
+        let count = self.engine.batch_delete(req.keys)? as i32;
+
+        Ok(Response::new(BatchDeleteResponse {
+            success: true,
+            count,
+        }))
     }
 }
 
