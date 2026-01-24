@@ -525,56 +525,13 @@ impl GroupCommitWalWriter {
         let version = u32::from_le_bytes(version_bytes);
 
         match version {
-            1 => Self::read_entries_v1(&mut file),
             2 => Self::read_entries_v2(&mut file),
             3 => Self::read_entries_v3(&mut file),
             _ => Err(Status::internal(format!(
-                "Unsupported WAL version: {}",
+                "Unsupported WAL version: {}. Only versions 2-3 are supported.",
                 version
             ))),
         }
-    }
-
-    /// Read entries from WAL v1 format (uncompressed, entry-by-entry)
-    #[allow(clippy::result_large_err)]
-    fn read_entries_v1(file: &mut File) -> Result<MemTable, Status> {
-        let mut memtable = BTreeMap::new();
-
-        loop {
-            let mut ts_bytes = [0u8; 8];
-            if file.read_exact(&mut ts_bytes).is_err() {
-                break; // End of file
-            }
-
-            let mut klen_bytes = [0u8; 8];
-            let mut vlen_bytes = [0u8; 8];
-
-            file.read_exact(&mut klen_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.read_exact(&mut vlen_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let key_len = u64::from_le_bytes(klen_bytes);
-            let val_len = u64::from_le_bytes(vlen_bytes);
-
-            let mut key_buf = vec![0u8; key_len as usize];
-            file.read_exact(&mut key_buf)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let key = String::from_utf8_lossy(&key_buf).to_string();
-
-            let value = if val_len == u64::MAX {
-                None // Tombstone
-            } else {
-                let mut val_buf = vec![0u8; val_len as usize];
-                file.read_exact(&mut val_buf)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                Some(String::from_utf8_lossy(&val_buf).to_string())
-            };
-
-            memtable.insert(key, value);
-        }
-
-        Ok(memtable)
     }
 
     /// Read entries from WAL v2 format (block-based with optional compression)

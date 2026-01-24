@@ -199,15 +199,6 @@ impl ReplicationService {
             .map_err(|e| Status::internal(e.to_string()))?;
 
         match version {
-            1 => self.read_wal_entries_v1(
-                &mut file,
-                wal_id,
-                start_offset,
-                file_len,
-                max_entries,
-                max_bytes,
-                &wal_files,
-            ),
             2 => self.read_wal_entries_v2(
                 &mut file,
                 wal_id,
@@ -229,122 +220,10 @@ impl ReplicationService {
                 true, // with checksum
             ),
             _ => Err(Status::internal(format!(
-                "Unsupported WAL version: {}",
+                "Unsupported WAL version: {}. Only versions 2-3 are supported.",
                 version
             ))),
         }
-    }
-
-    /// Read WAL entries in v1 format (entry-by-entry)
-    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-    fn read_wal_entries_v1(
-        &self,
-        file: &mut File,
-        wal_id: u64,
-        start_offset: u64,
-        file_len: u64,
-        max_entries: usize,
-        max_bytes: usize,
-        wal_files: &[(u64, PathBuf)],
-    ) -> Result<(Vec<WalEntry>, u64, u64, bool), Status> {
-        let mut entries = Vec::new();
-        let mut current_offset = start_offset;
-        let mut bytes_read = 0usize;
-
-        // Reasonable timestamp bounds (year 2020 to 2100)
-        const MIN_TIMESTAMP: u64 = 1577836800; // 2020-01-01
-        const MAX_TIMESTAMP: u64 = 4102444800; // 2100-01-01
-
-        while entries.len() < max_entries && bytes_read < max_bytes {
-            // Read timestamp
-            let mut ts_bytes = [0u8; 8];
-            if file.read_exact(&mut ts_bytes).is_err() {
-                break;
-            }
-            let timestamp = u64::from_le_bytes(ts_bytes);
-
-            // Validate timestamp to detect corrupt data early
-            if !(MIN_TIMESTAMP..=MAX_TIMESTAMP).contains(&timestamp) {
-                return Err(Status::internal(format!(
-                    "Invalid timestamp {} at offset {}, likely corrupted WAL or wrong file format",
-                    timestamp, current_offset
-                )));
-            }
-
-            // Read key length
-            let mut klen_bytes = [0u8; 8];
-            if file.read_exact(&mut klen_bytes).is_err() {
-                break;
-            }
-            let key_len = u64::from_le_bytes(klen_bytes);
-
-            // Read value length
-            let mut vlen_bytes = [0u8; 8];
-            if file.read_exact(&mut vlen_bytes).is_err() {
-                break;
-            }
-            let val_len = u64::from_le_bytes(vlen_bytes);
-
-            // Validate lengths to prevent memory allocation attacks
-            if key_len > MAX_ENTRY_SIZE {
-                return Err(Status::internal(format!(
-                    "Invalid key length {} at offset {}, likely corrupted WAL",
-                    key_len, current_offset
-                )));
-            }
-            if val_len != u64::MAX && val_len > MAX_ENTRY_SIZE {
-                return Err(Status::internal(format!(
-                    "Invalid value length {} at offset {}, likely corrupted WAL",
-                    val_len, current_offset
-                )));
-            }
-
-            // Calculate expected entry size and validate against file bounds
-            let expected_entry_size = 24 + key_len + if val_len == u64::MAX { 0 } else { val_len };
-            if current_offset + expected_entry_size > file_len {
-                // Incomplete entry at end of file
-                break;
-            }
-
-            // Read key
-            let mut key_buf = vec![0u8; key_len as usize];
-            if file.read_exact(&mut key_buf).is_err() {
-                break;
-            }
-            let key = String::from_utf8_lossy(&key_buf).to_string();
-
-            // Read value
-            let value = if val_len == u64::MAX {
-                None // Tombstone
-            } else {
-                let mut val_buf = vec![0u8; val_len as usize];
-                if file.read_exact(&mut val_buf).is_err() {
-                    break;
-                }
-                Some(String::from_utf8_lossy(&val_buf).to_string())
-            };
-
-            let entry_size = 24
-                + key_len as usize
-                + if val_len == u64::MAX {
-                    0
-                } else {
-                    val_len as usize
-                };
-            current_offset += entry_size as u64;
-            bytes_read += entry_size;
-
-            entries.push(WalEntry {
-                timestamp,
-                key,
-                value,
-            });
-        }
-
-        // Check if there are more entries
-        let has_more = current_offset < file_len || wal_files.iter().any(|(id, _)| *id > wal_id);
-
-        Ok((entries, wal_id, current_offset, has_more))
     }
 
     /// Read WAL entries in v2/v3 format (block-based with optional compression)
