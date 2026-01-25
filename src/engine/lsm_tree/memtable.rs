@@ -1,8 +1,8 @@
 use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Lock-free SkipList-based MemTable
 /// Allows concurrent reads and writes without mutex
@@ -10,6 +10,9 @@ pub type SkipMemTable = SkipMap<String, Option<String>>;
 
 /// Legacy BTreeMap-based MemTable (used for WAL recovery and SSTable creation)
 pub type MemTable = BTreeMap<String, Option<String>>;
+
+/// Default maximum number of immutable memtables before write stall
+pub const DEFAULT_MAX_IMMUTABLE_MEMTABLES: usize = 4;
 
 /// Estimate the size of a MemTable entry in bytes
 pub fn estimate_entry_size(key: &str, value: &Option<String>) -> u64 {
@@ -24,17 +27,48 @@ pub fn skip_to_btree(skip: &SkipMemTable) -> MemTable {
         .collect()
 }
 
+/// Write stall state for coordinating backpressure
+struct WriteStallState {
+    /// Condition variable for waiting on flush completion
+    condvar: Condvar,
+    /// Mutex for the condition variable (holds stall count)
+    mutex: Mutex<usize>,
+}
+
+impl WriteStallState {
+    fn new() -> Self {
+        Self {
+            condvar: Condvar::new(),
+            mutex: Mutex::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for WriteStallState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteStallState")
+            .field("stall_count", &*self.mutex.lock().unwrap())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct MemTableState {
     /// Current in-memory write buffer (lock-free SkipList with atomic swap)
     /// Uses ArcSwap for lock-free atomic replacement during flush
     pub active_memtable: ArcSwap<SkipMemTable>,
     /// MemTables currently being flushed to disk (converted to BTreeMap for ordered iteration)
-    pub immutable_memtables: Arc<std::sync::Mutex<Vec<Arc<MemTable>>>>,
+    pub immutable_memtables: Arc<Mutex<Vec<Arc<MemTable>>>>,
     /// Max size for MemTable in bytes
     pub capacity_bytes: u64,
     /// Approximate size of current active MemTable
     pub current_size: Arc<AtomicU64>,
+    /// Maximum number of immutable memtables before write stall
+    max_immutable_memtables: usize,
+    /// Write stall coordination
+    write_stall: Arc<WriteStallState>,
+    /// Count of stalled writes (for metrics)
+    stall_count: Arc<AtomicUsize>,
 }
 
 impl Clone for MemTableState {
@@ -44,12 +78,29 @@ impl Clone for MemTableState {
             immutable_memtables: Arc::clone(&self.immutable_memtables),
             capacity_bytes: self.capacity_bytes,
             current_size: Arc::clone(&self.current_size),
+            max_immutable_memtables: self.max_immutable_memtables,
+            write_stall: Arc::clone(&self.write_stall),
+            stall_count: Arc::clone(&self.stall_count),
         }
     }
 }
 
 impl MemTableState {
     pub fn new(capacity_bytes: u64, recovered_memtable: MemTable, recovered_size: u64) -> Self {
+        Self::new_with_config(
+            capacity_bytes,
+            recovered_memtable,
+            recovered_size,
+            DEFAULT_MAX_IMMUTABLE_MEMTABLES,
+        )
+    }
+
+    pub fn new_with_config(
+        capacity_bytes: u64,
+        recovered_memtable: MemTable,
+        recovered_size: u64,
+        max_immutable_memtables: usize,
+    ) -> Self {
         // Convert recovered BTreeMap to SkipMap
         let skip_map = SkipMap::new();
         for (key, value) in recovered_memtable {
@@ -58,10 +109,60 @@ impl MemTableState {
 
         MemTableState {
             active_memtable: ArcSwap::new(Arc::new(skip_map)),
-            immutable_memtables: Arc::new(std::sync::Mutex::new(Vec::new())),
+            immutable_memtables: Arc::new(Mutex::new(Vec::new())),
             capacity_bytes,
             current_size: Arc::new(AtomicU64::new(recovered_size)),
+            max_immutable_memtables,
+            write_stall: Arc::new(WriteStallState::new()),
+            stall_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Wait if too many immutable memtables are pending flush.
+    /// Returns true if we had to wait (write was stalled).
+    pub fn wait_if_stalled(&self) -> bool {
+        let immutables = self.immutable_memtables.lock().unwrap();
+        if immutables.len() < self.max_immutable_memtables {
+            return false;
+        }
+        drop(immutables); // Release lock before waiting
+
+        // Increment stall count for metrics
+        self.stall_count.fetch_add(1, Ordering::Relaxed);
+
+        // Wait for a flush to complete
+        let mut guard = self.write_stall.mutex.lock().unwrap();
+        *guard += 1; // Track number of waiters
+
+        loop {
+            let immutables = self.immutable_memtables.lock().unwrap();
+            if immutables.len() < self.max_immutable_memtables {
+                drop(immutables);
+                *guard -= 1;
+                return true;
+            }
+            drop(immutables);
+
+            // Wait with timeout to avoid deadlock on spurious wakeups
+            guard = self
+                .write_stall
+                .condvar
+                .wait_timeout(guard, std::time::Duration::from_millis(10))
+                .unwrap()
+                .0;
+        }
+    }
+
+    /// Get the number of times writes were stalled
+    #[cfg(test)]
+    pub fn stall_count(&self) -> usize {
+        self.stall_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the current number of immutable memtables
+    #[cfg(test)]
+    pub fn immutable_count(&self) -> usize {
+        self.immutable_memtables.lock().unwrap().len()
     }
 
     /// Insert a key-value pair into the active MemTable (lock-free)
@@ -116,8 +217,12 @@ impl MemTableState {
     }
 
     pub fn remove_immutable(&self, memtable: &Arc<MemTable>) {
-        let mut immutables = self.immutable_memtables.lock().unwrap();
-        immutables.retain(|m| !Arc::ptr_eq(m, memtable));
+        {
+            let mut immutables = self.immutable_memtables.lock().unwrap();
+            immutables.retain(|m| !Arc::ptr_eq(m, memtable));
+        }
+        // Notify any waiting writers that a flush completed
+        self.write_stall.condvar.notify_all();
     }
 
     /// Get a value from MemTable (lock-free for active memtable)
@@ -392,6 +497,87 @@ mod tests {
             10000,
             "Some keys were lost during atomic swap"
         );
+    }
+
+    /// Test write stall prevention
+    #[test]
+    fn test_write_stall_prevention() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        // Create state with max 2 immutable memtables
+        let state = Arc::new(MemTableState::new_with_config(
+            u64::MAX, // Large capacity
+            BTreeMap::new(),
+            0,
+            2, // Max 2 immutable memtables
+        ));
+
+        // Create 2 immutable memtables (at the limit)
+        state.insert("k1".to_string(), Some("v1".to_string()));
+        let imm1 = state.needs_flush_manual();
+        state.insert("k2".to_string(), Some("v2".to_string()));
+        let imm2 = state.needs_flush_manual();
+
+        assert_eq!(state.immutable_count(), 2);
+
+        // Start a writer thread that should stall
+        let state_writer = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            let start = Instant::now();
+            state_writer.wait_if_stalled();
+            start.elapsed()
+        });
+
+        // Give the writer time to start waiting
+        thread::sleep(Duration::from_millis(50));
+
+        // Verify no stalls have completed yet
+        assert_eq!(state.stall_count(), 1);
+
+        // Remove one immutable to allow writer to proceed
+        state.remove_immutable(&imm1);
+
+        // Writer should now complete
+        let wait_time = writer.join().unwrap();
+        assert!(
+            wait_time >= Duration::from_millis(40),
+            "Writer should have waited at least 40ms, waited {:?}",
+            wait_time
+        );
+
+        // Verify stall was recorded
+        assert_eq!(state.stall_count(), 1);
+
+        // Clean up
+        state.remove_immutable(&imm2);
+        assert_eq!(state.immutable_count(), 0);
+    }
+
+    /// Test that writes don't stall when under the limit
+    #[test]
+    fn test_no_stall_under_limit() {
+        let state = MemTableState::new_with_config(
+            u64::MAX,
+            BTreeMap::new(),
+            0,
+            4, // Max 4 immutable memtables
+        );
+
+        // Create 3 immutable memtables (under the limit)
+        state.insert("k1".to_string(), Some("v1".to_string()));
+        let _imm1 = state.needs_flush_manual();
+        state.insert("k2".to_string(), Some("v2".to_string()));
+        let _imm2 = state.needs_flush_manual();
+        state.insert("k3".to_string(), Some("v3".to_string()));
+        let _imm3 = state.needs_flush_manual();
+
+        assert_eq!(state.immutable_count(), 3);
+
+        // This should NOT stall
+        let stalled = state.wait_if_stalled();
+        assert!(!stalled, "Should not stall when under limit");
+        assert_eq!(state.stall_count(), 0);
     }
 }
 

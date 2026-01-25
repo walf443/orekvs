@@ -934,6 +934,10 @@ impl LsmTreeEngine {
 impl Engine for LsmTreeEngine {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
         self.metrics.record_set();
+
+        // 0. Wait if too many immutable memtables are pending (write stall prevention)
+        self.mem_state.wait_if_stalled();
+
         let new_val_opt = Some(value);
 
         // 1. Start writing to WAL
@@ -1018,6 +1022,9 @@ impl Engine for LsmTreeEngine {
     fn delete(&self, key: String) -> Result<(), Status> {
         self.metrics.record_delete();
 
+        // 0. Wait if too many immutable memtables are pending (write stall prevention)
+        self.mem_state.wait_if_stalled();
+
         // 1. Start writing tombstone to WAL
         let wal = self.wal.clone();
         let key_clone = key.clone();
@@ -1045,6 +1052,9 @@ impl Engine for LsmTreeEngine {
         if items.is_empty() {
             return Ok(0);
         }
+
+        // 0. Wait if too many immutable memtables are pending (write stall prevention)
+        self.mem_state.wait_if_stalled();
 
         let count = items.len();
         self.metrics.record_batch_set(count as u64);
@@ -1161,6 +1171,9 @@ impl Engine for LsmTreeEngine {
         if keys.is_empty() {
             return Ok(0);
         }
+
+        // 0. Wait if too many immutable memtables are pending (write stall prevention)
+        self.mem_state.wait_if_stalled();
 
         let count = keys.len();
         self.metrics.record_batch_delete(count as u64);
