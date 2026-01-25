@@ -257,3 +257,108 @@ async fn bench_bloom_loading() {
     );
     println!("=====================================\n");
 }
+
+/// Benchmark test to measure Index Block Cache effectiveness
+/// Run with: cargo test bench_index_cache --release -- --nocapture --ignored
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_index_cache() {
+    use super::sstable::MappedSSTable;
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    println!("\n=== Index Cache Benchmark ===");
+    println!("Creating test data...");
+
+    // Create engine and populate with data to create SSTables
+    let engine = LsmTreeEngine::new(data_dir.clone(), 50 * 1024, 100);
+
+    // Write enough data to create multiple SSTables
+    for i in 0..5000 {
+        engine
+            .set(format!("key{:05}", i), format!("value{:05}", i))
+            .unwrap();
+    }
+
+    // Force flush
+    for i in 0..100 {
+        engine
+            .set(format!("flush{:05}", i), "x".repeat(1000))
+            .unwrap();
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Get SSTable paths
+    let sst_files: Vec<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "data"))
+        .map(|e| e.path())
+        .collect();
+
+    println!("Created {} SSTables", sst_files.len());
+
+    if sst_files.is_empty() {
+        println!("No SSTables created, skipping benchmark");
+        return;
+    }
+
+    let iterations = 1000;
+
+    // Benchmark: First read (cold cache) vs subsequent reads (warm cache)
+    println!("\n--- Index Read Performance ---");
+
+    // Test with fresh MappedSSTable instances (simulates cold cache)
+    let start = Instant::now();
+    for _ in 0..iterations {
+        for path in &sst_files {
+            let sst = MappedSSTable::open(path).unwrap();
+            let _ = sst.read_index().unwrap();
+        }
+    }
+    let cold_duration = start.elapsed();
+    println!(
+        "Cold cache (new SSTable each time): {} reads in {:?} ({:.2}/sec)",
+        iterations * sst_files.len(),
+        cold_duration,
+        (iterations * sst_files.len()) as f64 / cold_duration.as_secs_f64()
+    );
+
+    // Open SSTables once and reuse (warm cache)
+    let sstables: Vec<_> = sst_files
+        .iter()
+        .map(|p| MappedSSTable::open(p).unwrap())
+        .collect();
+
+    // First read to populate cache
+    for sst in &sstables {
+        let _ = sst.read_index().unwrap();
+    }
+
+    // Benchmark warm cache reads
+    let start = Instant::now();
+    for _ in 0..iterations {
+        for sst in &sstables {
+            let _ = sst.read_index().unwrap();
+        }
+    }
+    let warm_duration = start.elapsed();
+    println!(
+        "Warm cache (reuse SSTable):         {} reads in {:?} ({:.2}/sec)",
+        iterations * sst_files.len(),
+        warm_duration,
+        (iterations * sst_files.len()) as f64 / warm_duration.as_secs_f64()
+    );
+
+    let improvement = cold_duration.as_secs_f64() / warm_duration.as_secs_f64();
+    println!("\n=== Results ===");
+    println!("Index cache speedup: {:.2}x faster with OnceLock cache", improvement);
+    println!(
+        "Cold: {:.3} ms/read, Warm: {:.3} ms/read",
+        cold_duration.as_secs_f64() * 1000.0 / (iterations * sst_files.len()) as f64,
+        warm_duration.as_secs_f64() * 1000.0 / (iterations * sst_files.len()) as f64
+    );
+    println!("=====================================\n");
+}
