@@ -34,6 +34,216 @@ struct SstableHandle {
     bloom: BloomFilter,
 }
 
+/// Default maximum level for leveled compaction
+const MAX_LEVELS: usize = 7;
+
+/// L0 compaction trigger: compact when L0 has this many files
+#[allow(dead_code)]
+const L0_COMPACTION_THRESHOLD: usize = 4;
+
+/// Size multiplier between levels (L(n+1) is ~10x larger than Ln)
+#[allow(dead_code)]
+const LEVEL_SIZE_MULTIPLIER: u64 = 10;
+
+/// Base level size in bytes (L1 target size)
+#[allow(dead_code)]
+const L1_TARGET_SIZE_BYTES: u64 = 64 * 1024 * 1024; // 64MB
+
+/// Manages SSTables organized by levels for leveled compaction.
+///
+/// - L0: Recently flushed SSTables with potentially overlapping key ranges
+/// - L1+: Non-overlapping key ranges within each level, sorted by min_key
+#[allow(dead_code)]
+pub struct LeveledSstables {
+    /// SSTables organized by level. levels[0] = L0, levels[1] = L1, etc.
+    /// L0: sorted by creation time (newest first)
+    /// L1+: sorted by min_key (for binary search)
+    levels: Vec<Vec<Arc<SstableHandle>>>,
+}
+
+#[allow(dead_code)]
+impl LeveledSstables {
+    /// Create a new empty LeveledSstables structure
+    fn new() -> Self {
+        Self {
+            levels: vec![Vec::new(); MAX_LEVELS],
+        }
+    }
+
+    /// Add an SSTable to a specific level
+    fn add_to_level(&mut self, level: usize, handle: Arc<SstableHandle>) {
+        if level >= self.levels.len() {
+            self.levels.resize(level + 1, Vec::new());
+        }
+
+        if level == 0 {
+            // L0: insert at the beginning (newest first)
+            self.levels[0].insert(0, handle);
+        } else {
+            // L1+: insert in sorted order by min_key
+            let min_key = handle.mmap.min_key().unwrap_or(&[]);
+            let pos = self.levels[level]
+                .binary_search_by(|h| h.mmap.min_key().unwrap_or(&[]).cmp(min_key))
+                .unwrap_or_else(|p| p);
+            self.levels[level].insert(pos, handle);
+        }
+    }
+
+    /// Remove an SSTable from its level
+    fn remove(&mut self, handle: &Arc<SstableHandle>) {
+        for level in &mut self.levels {
+            if let Some(pos) = level.iter().position(|h| Arc::ptr_eq(h, handle)) {
+                level.remove(pos);
+                return;
+            }
+        }
+    }
+
+    /// Get the level count
+    fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Get SSTables at a specific level
+    fn get_level(&self, level: usize) -> &[Arc<SstableHandle>] {
+        if level < self.levels.len() {
+            &self.levels[level]
+        } else {
+            &[]
+        }
+    }
+
+    /// Get all L0 SSTables (for scanning during reads)
+    fn l0_sstables(&self) -> &[Arc<SstableHandle>] {
+        self.get_level(0)
+    }
+
+    /// Get SSTables in L1+ that overlap with the given key range
+    fn get_overlapping(
+        &self,
+        level: usize,
+        min_key: &[u8],
+        max_key: &[u8],
+    ) -> Vec<Arc<SstableHandle>> {
+        if level == 0 || level >= self.levels.len() {
+            return Vec::new();
+        }
+
+        let level_sstables = &self.levels[level];
+        let mut result = Vec::new();
+
+        for handle in level_sstables {
+            let sst_min = handle.mmap.min_key().unwrap_or(&[]);
+            let sst_max = handle.mmap.max_key().unwrap_or(&[]);
+
+            // Check if ranges overlap: [sst_min, sst_max] overlaps [min_key, max_key]
+            // Overlap occurs when: sst_min <= max_key AND sst_max >= min_key
+            if sst_min <= max_key && sst_max >= min_key {
+                result.push(Arc::clone(handle));
+            }
+        }
+
+        result
+    }
+
+    /// Binary search for the SSTable that might contain the key in L1+
+    /// Returns None if no SSTable could contain the key
+    fn binary_search_level(&self, level: usize, key: &[u8]) -> Option<Arc<SstableHandle>> {
+        if level == 0 || level >= self.levels.len() {
+            return None;
+        }
+
+        let level_sstables = &self.levels[level];
+        if level_sstables.is_empty() {
+            return None;
+        }
+
+        // Binary search by min_key to find the rightmost SSTable where min_key <= key
+        let pos = level_sstables
+            .binary_search_by(|h| {
+                let min = h.mmap.min_key().unwrap_or(&[]);
+                min.cmp(key)
+            })
+            .unwrap_or_else(|p| p.saturating_sub(1));
+
+        if pos < level_sstables.len() {
+            let handle = &level_sstables[pos];
+            // Verify key is within this SSTable's range
+            if handle.mmap.key_in_range(key) {
+                return Some(Arc::clone(handle));
+            }
+        }
+
+        None
+    }
+
+    /// Get total number of SSTables across all levels
+    fn total_sstable_count(&self) -> usize {
+        self.levels.iter().map(|l| l.len()).sum()
+    }
+
+    /// Get the total size of a level in bytes
+    fn level_size(&self, level: usize) -> u64 {
+        if level >= self.levels.len() {
+            return 0;
+        }
+
+        self.levels[level]
+            .iter()
+            .filter_map(|h| std::fs::metadata(h.mmap.path()).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Get the target size for a level
+    fn level_target_size(&self, level: usize) -> u64 {
+        if level == 0 {
+            return 0; // L0 is controlled by file count, not size
+        }
+        L1_TARGET_SIZE_BYTES * LEVEL_SIZE_MULTIPLIER.pow((level - 1) as u32)
+    }
+
+    /// Check if L0 needs compaction (too many files)
+    fn l0_needs_compaction(&self) -> bool {
+        self.levels[0].len() >= L0_COMPACTION_THRESHOLD
+    }
+
+    /// Check if a level needs compaction (exceeds target size)
+    fn level_needs_compaction(&self, level: usize) -> bool {
+        if level == 0 {
+            return self.l0_needs_compaction();
+        }
+        self.level_size(level) > self.level_target_size(level)
+    }
+
+    /// Convert from flat SSTable list (for migration)
+    /// Places all SSTables in L0 since we don't have level info
+    fn from_flat_list(sstables: Vec<Arc<SstableHandle>>) -> Self {
+        let mut leveled = Self::new();
+        for handle in sstables {
+            leveled.levels[0].push(handle);
+        }
+        leveled
+    }
+
+    /// Convert to flat SSTable list (for backward compatibility)
+    /// Returns all SSTables from all levels, L0 first (newest first),
+    /// then L1, L2, etc.
+    fn to_flat_list(&self) -> Vec<Arc<SstableHandle>> {
+        let mut result = Vec::new();
+        for level in &self.levels {
+            result.extend(level.iter().cloned());
+        }
+        result
+    }
+}
+
+impl Default for LeveledSstables {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Configuration for WAL archiving
 #[derive(Clone)]
 pub struct WalArchiveConfig {
@@ -1887,5 +2097,223 @@ mod tests {
             );
         }
         println!("All data verified after compaction completed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_leveled_sstables_basic() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Create some SSTable files with different key ranges
+        let mut memtable1 = std::collections::BTreeMap::new();
+        memtable1.insert("a".to_string(), Some("v1".to_string()));
+        memtable1.insert("b".to_string(), Some("v2".to_string()));
+        let sst1_path = data_dir.join("sst_1_0.data");
+        sstable::create_from_memtable(&sst1_path, &memtable1).unwrap();
+
+        let mut memtable2 = std::collections::BTreeMap::new();
+        memtable2.insert("c".to_string(), Some("v3".to_string()));
+        memtable2.insert("d".to_string(), Some("v4".to_string()));
+        let sst2_path = data_dir.join("sst_2_0.data");
+        sstable::create_from_memtable(&sst2_path, &memtable2).unwrap();
+
+        // Create handles
+        let mmap1 = MappedSSTable::open(&sst1_path).unwrap();
+        let bloom1 = mmap1.read_bloom_filter().unwrap();
+        let handle1 = Arc::new(SstableHandle {
+            mmap: mmap1,
+            bloom: bloom1,
+        });
+
+        let mmap2 = MappedSSTable::open(&sst2_path).unwrap();
+        let bloom2 = mmap2.read_bloom_filter().unwrap();
+        let handle2 = Arc::new(SstableHandle {
+            mmap: mmap2,
+            bloom: bloom2,
+        });
+
+        // Test LeveledSstables
+        let mut leveled = LeveledSstables::new();
+        assert_eq!(leveled.total_sstable_count(), 0);
+        assert_eq!(leveled.level_count(), MAX_LEVELS);
+
+        // Add to L0
+        leveled.add_to_level(0, Arc::clone(&handle1));
+        leveled.add_to_level(0, Arc::clone(&handle2));
+        assert_eq!(leveled.l0_sstables().len(), 2);
+        assert_eq!(leveled.total_sstable_count(), 2);
+
+        // L0 should have handle2 first (newest)
+        assert!(Arc::ptr_eq(&leveled.l0_sstables()[0], &handle2));
+
+        // Add to L1
+        leveled.add_to_level(1, Arc::clone(&handle1));
+        assert_eq!(leveled.get_level(1).len(), 1);
+        assert_eq!(leveled.total_sstable_count(), 3);
+
+        // Remove from L0
+        leveled.remove(&handle2);
+        assert_eq!(leveled.l0_sstables().len(), 1);
+        assert_eq!(leveled.total_sstable_count(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_leveled_sstables_binary_search() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Create SSTables with non-overlapping ranges for L1
+        let mut memtable1 = std::collections::BTreeMap::new();
+        memtable1.insert("aaa".to_string(), Some("v1".to_string()));
+        memtable1.insert("bbb".to_string(), Some("v2".to_string()));
+        let sst1_path = data_dir.join("sst_1_0.data");
+        sstable::create_from_memtable(&sst1_path, &memtable1).unwrap();
+
+        let mut memtable2 = std::collections::BTreeMap::new();
+        memtable2.insert("ccc".to_string(), Some("v3".to_string()));
+        memtable2.insert("ddd".to_string(), Some("v4".to_string()));
+        let sst2_path = data_dir.join("sst_2_0.data");
+        sstable::create_from_memtable(&sst2_path, &memtable2).unwrap();
+
+        let mut memtable3 = std::collections::BTreeMap::new();
+        memtable3.insert("eee".to_string(), Some("v5".to_string()));
+        memtable3.insert("fff".to_string(), Some("v6".to_string()));
+        let sst3_path = data_dir.join("sst_3_0.data");
+        sstable::create_from_memtable(&sst3_path, &memtable3).unwrap();
+
+        // Create handles
+        let mmap1 = MappedSSTable::open(&sst1_path).unwrap();
+        let bloom1 = mmap1.read_bloom_filter().unwrap();
+        let handle1 = Arc::new(SstableHandle {
+            mmap: mmap1,
+            bloom: bloom1,
+        });
+
+        let mmap2 = MappedSSTable::open(&sst2_path).unwrap();
+        let bloom2 = mmap2.read_bloom_filter().unwrap();
+        let handle2 = Arc::new(SstableHandle {
+            mmap: mmap2,
+            bloom: bloom2,
+        });
+
+        let mmap3 = MappedSSTable::open(&sst3_path).unwrap();
+        let bloom3 = mmap3.read_bloom_filter().unwrap();
+        let handle3 = Arc::new(SstableHandle {
+            mmap: mmap3,
+            bloom: bloom3,
+        });
+
+        let mut leveled = LeveledSstables::new();
+
+        // Add to L1 (non-overlapping)
+        leveled.add_to_level(1, Arc::clone(&handle1));
+        leveled.add_to_level(1, Arc::clone(&handle2));
+        leveled.add_to_level(1, Arc::clone(&handle3));
+
+        // Binary search should find the right SSTable
+        let found = leveled.binary_search_level(1, b"aaa");
+        assert!(found.is_some());
+
+        let found = leveled.binary_search_level(1, b"ccc");
+        assert!(found.is_some());
+
+        let found = leveled.binary_search_level(1, b"fff");
+        assert!(found.is_some());
+
+        // Key outside all ranges should return None
+        let found = leveled.binary_search_level(1, b"zzz");
+        assert!(found.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_leveled_sstables_get_overlapping() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Create SSTables for L1
+        let mut memtable1 = std::collections::BTreeMap::new();
+        memtable1.insert("a".to_string(), Some("v1".to_string()));
+        memtable1.insert("c".to_string(), Some("v2".to_string()));
+        let sst1_path = data_dir.join("sst_1_0.data");
+        sstable::create_from_memtable(&sst1_path, &memtable1).unwrap();
+
+        let mut memtable2 = std::collections::BTreeMap::new();
+        memtable2.insert("d".to_string(), Some("v3".to_string()));
+        memtable2.insert("f".to_string(), Some("v4".to_string()));
+        let sst2_path = data_dir.join("sst_2_0.data");
+        sstable::create_from_memtable(&sst2_path, &memtable2).unwrap();
+
+        let mut memtable3 = std::collections::BTreeMap::new();
+        memtable3.insert("g".to_string(), Some("v5".to_string()));
+        memtable3.insert("i".to_string(), Some("v6".to_string()));
+        let sst3_path = data_dir.join("sst_3_0.data");
+        sstable::create_from_memtable(&sst3_path, &memtable3).unwrap();
+
+        // Create handles
+        let mmap1 = MappedSSTable::open(&sst1_path).unwrap();
+        let bloom1 = mmap1.read_bloom_filter().unwrap();
+        let handle1 = Arc::new(SstableHandle {
+            mmap: mmap1,
+            bloom: bloom1,
+        });
+
+        let mmap2 = MappedSSTable::open(&sst2_path).unwrap();
+        let bloom2 = mmap2.read_bloom_filter().unwrap();
+        let handle2 = Arc::new(SstableHandle {
+            mmap: mmap2,
+            bloom: bloom2,
+        });
+
+        let mmap3 = MappedSSTable::open(&sst3_path).unwrap();
+        let bloom3 = mmap3.read_bloom_filter().unwrap();
+        let handle3 = Arc::new(SstableHandle {
+            mmap: mmap3,
+            bloom: bloom3,
+        });
+
+        let mut leveled = LeveledSstables::new();
+        leveled.add_to_level(1, Arc::clone(&handle1));
+        leveled.add_to_level(1, Arc::clone(&handle2));
+        leveled.add_to_level(1, Arc::clone(&handle3));
+
+        // Query range [b, e] should overlap with handle1 ([a,c]) and handle2 ([d,f])
+        let overlapping = leveled.get_overlapping(1, b"b", b"e");
+        assert_eq!(overlapping.len(), 2);
+
+        // Query range [h, j] should only overlap with handle3 ([g,i])
+        let overlapping = leveled.get_overlapping(1, b"h", b"j");
+        assert_eq!(overlapping.len(), 1);
+
+        // Query range [x, z] should not overlap with anything
+        let overlapping = leveled.get_overlapping(1, b"x", b"z");
+        assert_eq!(overlapping.len(), 0);
+    }
+
+    #[test]
+    fn test_leveled_sstables_level_size_calculation() {
+        let leveled = LeveledSstables::new();
+
+        // L0 has no target size (controlled by file count)
+        assert_eq!(leveled.level_target_size(0), 0);
+
+        // L1 = 64MB
+        assert_eq!(leveled.level_target_size(1), 64 * 1024 * 1024);
+
+        // L2 = 640MB (10x L1)
+        assert_eq!(leveled.level_target_size(2), 640 * 1024 * 1024);
+
+        // L3 = 6.4GB (10x L2)
+        assert_eq!(leveled.level_target_size(3), 6400 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_leveled_sstables_from_flat_list() {
+        let leveled = LeveledSstables::from_flat_list(Vec::new());
+        assert_eq!(leveled.total_sstable_count(), 0);
+        assert_eq!(leveled.l0_sstables().len(), 0);
+
+        // to_flat_list should work on empty
+        let flat = leveled.to_flat_list();
+        assert!(flat.is_empty());
     }
 }
