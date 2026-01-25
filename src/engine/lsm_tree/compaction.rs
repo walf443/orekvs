@@ -15,16 +15,21 @@ use std::path::{Path, PathBuf};
 use tonic::Status;
 
 /// Configuration for leveled compaction
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     /// Number of L0 files that triggers compaction
     pub l0_compaction_threshold: usize,
     /// Size multiplier between levels (L(n+1) = multiplier * Ln)
+    /// Used for Ln → Ln+1 compaction (future)
+    #[allow(dead_code)]
     pub level_size_multiplier: u64,
     /// Target size for L1 in bytes
+    /// Used for Ln → Ln+1 compaction (future)
+    #[allow(dead_code)]
     pub l1_target_size_bytes: u64,
     /// Maximum number of levels
+    /// Used for Ln → Ln+1 compaction (future)
+    #[allow(dead_code)]
     pub max_levels: usize,
 }
 
@@ -39,7 +44,6 @@ impl Default for CompactionConfig {
     }
 }
 
-#[allow(dead_code)]
 impl CompactionConfig {
     /// Calculate target size for a given level
     pub fn target_size_for_level(&self, level: usize) -> u64 {
@@ -51,10 +55,10 @@ impl CompactionConfig {
 }
 
 /// Represents a planned compaction task
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CompactionTask {
     /// Source level (files to compact from)
+    #[allow(dead_code)]
     pub source_level: usize,
     /// Target level (files to write to)
     pub target_level: usize,
@@ -63,11 +67,11 @@ pub struct CompactionTask {
     /// SSTable files from target level that overlap with source
     pub target_files: Vec<PathBuf>,
     /// Key range of the compaction [min_key, max_key]
+    #[allow(dead_code)]
     pub key_range: (Vec<u8>, Vec<u8>),
 }
 
 /// Result of a compaction operation
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct CompactionResult {
     /// New SSTable files created
@@ -81,7 +85,6 @@ pub struct CompactionResult {
 }
 
 /// Information about a newly created SSTable from compaction
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CompactionOutputFile {
     /// Path to the new SSTable
@@ -97,13 +100,11 @@ pub struct CompactionOutputFile {
 }
 
 /// Leveled compaction planner and executor
-#[allow(dead_code)]
 pub struct LeveledCompaction {
     config: CompactionConfig,
     data_dir: PathBuf,
 }
 
-#[allow(dead_code)]
 impl LeveledCompaction {
     /// Create a new leveled compaction handler
     pub fn new(data_dir: PathBuf, config: CompactionConfig) -> Self {
@@ -365,7 +366,6 @@ impl LeveledCompaction {
 }
 
 /// Helper to create ManifestEntry from CompactionOutputFile
-#[allow(dead_code)]
 impl CompactionOutputFile {
     /// Convert to ManifestEntry
     pub fn to_manifest_entry(&self) -> ManifestEntry {
@@ -598,5 +598,102 @@ mod tests {
         assert_eq!(entry.min_key(), b"apple".to_vec());
         assert_eq!(entry.max_key(), b"zebra".to_vec());
         assert_eq!(entry.size_bytes, 1024);
+    }
+
+    #[test]
+    fn test_level_needs_compaction() {
+        let dir = tempdir().unwrap();
+        let compaction =
+            LeveledCompaction::new(dir.path().to_path_buf(), CompactionConfig::default());
+
+        // L0 is never triggered by size (handled by file count)
+        assert!(!compaction.level_needs_compaction(0, 1000 * 1024 * 1024));
+
+        // L1 target is 64MB
+        assert!(!compaction.level_needs_compaction(1, 60 * 1024 * 1024)); // under limit
+        assert!(compaction.level_needs_compaction(1, 65 * 1024 * 1024)); // over limit
+
+        // L2 target is 640MB
+        assert!(!compaction.level_needs_compaction(2, 600 * 1024 * 1024)); // under limit
+        assert!(compaction.level_needs_compaction(2, 700 * 1024 * 1024)); // over limit
+    }
+
+    #[test]
+    fn test_plan_level_compaction() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Create L1 files (non-overlapping ranges)
+        let l1_file1 = create_test_sstable(data_dir, "sst_1_0.data", &[("a", "v1"), ("c", "v3")]);
+        let l1_file2 = create_test_sstable(data_dir, "sst_2_0.data", &[("d", "v4"), ("f", "v6")]);
+
+        // Create L2 files (non-overlapping ranges)
+        let l2_file1 =
+            create_test_sstable(data_dir, "sst_3_0.data", &[("a", "old_a"), ("b", "old_b")]);
+        let l2_file2 =
+            create_test_sstable(data_dir, "sst_4_0.data", &[("g", "old_g"), ("h", "old_h")]);
+
+        let compaction =
+            LeveledCompaction::new(data_dir.to_path_buf(), CompactionConfig::default());
+
+        // Plan L1 → L2 compaction (should pick l1_file1 and find overlapping l2_file1)
+        let task = compaction
+            .plan_level_compaction(
+                1,
+                &[l1_file1.clone(), l1_file2.clone()],
+                &[l2_file1, l2_file2],
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(task.source_level, 1);
+        assert_eq!(task.target_level, 2);
+        assert_eq!(task.source_files.len(), 1); // Only picks one file from L1
+        assert_eq!(task.target_files.len(), 1); // l2_file1 overlaps with l1_file1
+    }
+
+    #[test]
+    fn test_execute_level_compaction() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Create L1 file
+        let l1_file =
+            create_test_sstable(data_dir, "sst_1_0.data", &[("b", "new_b"), ("c", "new_c")]);
+
+        // Create L2 file with some overlapping keys
+        let l2_file = create_test_sstable(
+            data_dir,
+            "sst_2_0.data",
+            &[("a", "old_a"), ("b", "old_b"), ("d", "old_d")],
+        );
+
+        let compaction =
+            LeveledCompaction::new(data_dir.to_path_buf(), CompactionConfig::default());
+
+        // Plan L1 → L2 compaction
+        let task = compaction
+            .plan_level_compaction(1, &[l1_file], &[l2_file])
+            .unwrap()
+            .unwrap();
+
+        // Execute compaction
+        let mut next_sst_id = 10;
+        let result = compaction.execute(&task, &mut next_sst_id, 0).unwrap();
+
+        assert_eq!(result.new_files.len(), 1);
+        assert_eq!(result.files_to_delete.len(), 2); // L1 file + L2 file
+
+        // Verify the new file is at L2
+        let new_file = &result.new_files[0];
+        assert_eq!(new_file.level, 2);
+
+        // Verify newer values win
+        let entries = sstable::read_entries(&new_file.path).unwrap();
+        assert_eq!(entries.len(), 4); // a, b, c, d
+        assert_eq!(entries.get("b").unwrap().1, Some("new_b".to_string())); // new wins
+        assert_eq!(entries.get("c").unwrap().1, Some("new_c".to_string())); // new
+        assert_eq!(entries.get("a").unwrap().1, Some("old_a".to_string())); // old (no conflict)
+        assert_eq!(entries.get("d").unwrap().1, Some("old_d".to_string())); // old (no conflict)
     }
 }

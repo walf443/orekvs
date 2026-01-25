@@ -89,31 +89,8 @@ impl MappedFile {
         self.get_slice(offset, end)
     }
 
-    /// Advise the OS that this file will be accessed sequentially.
-    /// This enables read-ahead optimization for operations like compaction.
-    ///
-    /// Returns `Ok(())` on success, or an error if the advise call fails.
-    pub fn advise_sequential(&self) -> io::Result<()> {
-        self.inner.advise(Advice::Sequential)
-    }
-
-    /// Advise the OS that the specified range will be needed soon.
-    /// This triggers prefetching of the data into the page cache.
-    ///
-    /// Returns `Ok(())` on success, or an error if the advise call fails.
-    /// If the range is out of bounds, returns Ok(()) without advising.
-    pub fn prefetch(&self, offset: usize, len: usize) -> io::Result<()> {
-        if offset + len <= self.inner.len() {
-            self.inner.advise_range(Advice::WillNeed, offset, len)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Advise the OS that the file will be accessed randomly.
     /// This disables read-ahead which may be wasteful for point lookups.
-    ///
-    /// Returns `Ok(())` on success, or an error if the advise call fails.
     pub fn advise_random(&self) -> io::Result<()> {
         self.inner.advise(Advice::Random)
     }

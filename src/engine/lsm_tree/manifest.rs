@@ -12,7 +12,6 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Encode bytes to hex string
-#[allow(dead_code)]
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
@@ -30,19 +29,15 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Current manifest format version
-#[allow(dead_code)]
 const MANIFEST_VERSION: u32 = 1;
 
 /// Manifest file name
-#[allow(dead_code)]
 const MANIFEST_FILENAME: &str = "MANIFEST";
 
 /// Temporary manifest file name for atomic writes
-#[allow(dead_code)]
 const MANIFEST_TMP_FILENAME: &str = "MANIFEST.tmp";
 
 /// Entry in the manifest representing a single SSTable
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestEntry {
     /// SSTable file name (relative to data directory)
@@ -57,7 +52,6 @@ pub struct ManifestEntry {
     pub size_bytes: u64,
 }
 
-#[allow(dead_code)]
 impl ManifestEntry {
     /// Create a new manifest entry
     pub fn new(
@@ -77,18 +71,19 @@ impl ManifestEntry {
     }
 
     /// Get the minimum key as bytes
+    #[allow(dead_code)]
     pub fn min_key(&self) -> Vec<u8> {
         hex_decode(&self.min_key_hex).unwrap_or_default()
     }
 
     /// Get the maximum key as bytes
+    #[allow(dead_code)]
     pub fn max_key(&self) -> Vec<u8> {
         hex_decode(&self.max_key_hex).unwrap_or_default()
     }
 }
 
 /// The manifest file structure
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     /// Manifest format version
@@ -97,14 +92,12 @@ pub struct Manifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-#[allow(dead_code)]
 impl Default for Manifest {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[allow(dead_code)]
 impl Manifest {
     /// Create a new empty manifest
     pub fn new() -> Self {
@@ -180,6 +173,7 @@ impl Manifest {
     }
 
     /// Get all entries for a specific level
+    #[allow(dead_code)]
     pub fn entries_for_level(&self, level: usize) -> Vec<&ManifestEntry> {
         self.entries.iter().filter(|e| e.level == level).collect()
     }
@@ -190,6 +184,7 @@ impl Manifest {
     }
 
     /// Update the level of an existing entry
+    #[allow(dead_code)]
     pub fn update_level(&mut self, filename: &str, new_level: usize) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.filename == filename) {
             entry.level = new_level;
@@ -197,11 +192,13 @@ impl Manifest {
     }
 
     /// Get manifest file path
+    #[allow(dead_code)]
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join(MANIFEST_FILENAME)
     }
 
     /// Check if manifest exists
+    #[allow(dead_code)]
     pub fn exists(data_dir: &Path) -> bool {
         Self::path(data_dir).exists()
     }

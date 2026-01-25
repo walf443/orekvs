@@ -965,20 +965,21 @@ async fn test_leveled_sstables_get_overlapping() {
 }
 
 #[test]
-fn test_leveled_sstables_level_size_calculation() {
-    let leveled = LeveledSstables::new();
+fn test_compaction_config_level_size_calculation() {
+    use super::compaction::CompactionConfig;
+    let config = CompactionConfig::default();
 
     // L0 has no target size (controlled by file count)
-    assert_eq!(leveled.level_target_size(0), 0);
+    assert_eq!(config.target_size_for_level(0), 0);
 
     // L1 = 64MB
-    assert_eq!(leveled.level_target_size(1), 64 * 1024 * 1024);
+    assert_eq!(config.target_size_for_level(1), 64 * 1024 * 1024);
 
     // L2 = 640MB (10x L1)
-    assert_eq!(leveled.level_target_size(2), 640 * 1024 * 1024);
+    assert_eq!(config.target_size_for_level(2), 640 * 1024 * 1024);
 
     // L3 = 6.4GB (10x L2)
-    assert_eq!(leveled.level_target_size(3), 6400 * 1024 * 1024);
+    assert_eq!(config.target_size_for_level(3), 6400 * 1024 * 1024);
 }
 
 #[test]

@@ -12,10 +12,12 @@ mod wal;
 use super::Engine;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use bloom::BloomFilter;
+use compaction::{CompactionConfig, LeveledCompaction};
+use manifest::{Manifest, ManifestEntry};
 use memtable::{MemTable, MemTableState};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
-use sstable::{MappedSSTable, TimestampedEntry};
+use sstable::MappedSSTable;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -38,18 +40,6 @@ struct SstableHandle {
 
 /// Default maximum level for leveled compaction
 const MAX_LEVELS: usize = 7;
-
-/// L0 compaction trigger: compact when L0 has this many files
-#[allow(dead_code)]
-const L0_COMPACTION_THRESHOLD: usize = 4;
-
-/// Size multiplier between levels (L(n+1) is ~10x larger than Ln)
-#[allow(dead_code)]
-const LEVEL_SIZE_MULTIPLIER: u64 = 10;
-
-/// Base level size in bytes (L1 target size)
-#[allow(dead_code)]
-const L1_TARGET_SIZE_BYTES: u64 = 64 * 1024 * 1024; // 64MB
 
 /// Manages SSTables organized by levels for leveled compaction.
 ///
@@ -90,6 +80,7 @@ impl LeveledSstables {
     }
 
     /// Remove an SSTable from its level
+    #[allow(dead_code)]
     fn remove(&mut self, handle: &Arc<SstableHandle>) {
         for level in &mut self.levels {
             if let Some(pos) = level.iter().position(|h| Arc::ptr_eq(h, handle)) {
@@ -179,12 +170,12 @@ impl LeveledSstables {
     }
 
     /// Get total number of SSTables across all levels
+    #[allow(dead_code)]
     fn total_sstable_count(&self) -> usize {
         self.levels.iter().map(|l| l.len()).sum()
     }
 
     /// Get the total size of a level in bytes
-    #[allow(dead_code)]
     fn level_size(&self, level: usize) -> u64 {
         if level >= self.levels.len() {
             return 0;
@@ -197,32 +188,9 @@ impl LeveledSstables {
             .sum()
     }
 
-    /// Get the target size for a level
-    #[allow(dead_code)]
-    fn level_target_size(&self, level: usize) -> u64 {
-        if level == 0 {
-            return 0; // L0 is controlled by file count, not size
-        }
-        L1_TARGET_SIZE_BYTES * LEVEL_SIZE_MULTIPLIER.pow((level - 1) as u32)
-    }
-
-    /// Check if L0 needs compaction (too many files)
-    #[allow(dead_code)]
-    fn l0_needs_compaction(&self) -> bool {
-        self.levels[0].len() >= L0_COMPACTION_THRESHOLD
-    }
-
-    /// Check if a level needs compaction (exceeds target size)
-    #[allow(dead_code)]
-    fn level_needs_compaction(&self, level: usize) -> bool {
-        if level == 0 {
-            return self.l0_needs_compaction();
-        }
-        self.level_size(level) > self.level_target_size(level)
-    }
-
     /// Convert from flat SSTable list (for migration)
     /// Places all SSTables in L0 since we don't have level info
+    #[cfg(test)]
     fn from_flat_list(sstables: Vec<Arc<SstableHandle>>) -> Self {
         let mut leveled = Self::new();
         for handle in sstables {
@@ -305,6 +273,10 @@ pub struct LsmTreeEngine {
     wal_archive_config: WalArchiveConfig,
     // Lock to prevent SSTable deletion during snapshot transfer
     snapshot_lock: SnapshotLock,
+    // Manifest for persisting SSTable level assignments
+    manifest: Arc<Mutex<Manifest>>,
+    // Leveled compaction handler
+    compaction_handler: LeveledCompaction,
 }
 
 impl Clone for LsmTreeEngine {
@@ -321,6 +293,11 @@ impl Clone for LsmTreeEngine {
             metrics: Arc::clone(&self.metrics),
             wal_archive_config: self.wal_archive_config.clone(),
             snapshot_lock: Arc::clone(&self.snapshot_lock),
+            manifest: Arc::clone(&self.manifest),
+            compaction_handler: LeveledCompaction::new(
+                self.data_dir.clone(),
+                CompactionConfig::default(),
+            ),
         }
     }
 }
@@ -417,8 +394,25 @@ impl LsmTreeEngine {
         sst_files.sort_by(|a, b| b.cmp(a));
         wal_files.sort_by_key(|(id, _)| *id);
 
+        // Load manifest to get level assignments
+        let manifest = match Manifest::load(&data_dir) {
+            Ok(Some(m)) => {
+                println!("Loaded manifest with {} entries", m.entries.len());
+                m
+            }
+            Ok(None) => {
+                println!("No manifest found, creating new one");
+                Manifest::new()
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load manifest: {}, creating new one", e);
+                Manifest::new()
+            }
+        };
+
         // Build SstableHandles with mmap readers and Bloom filters for existing SSTables
-        let mut sst_handles = Vec::new();
+        // Organize by level according to manifest
+        let mut leveled_sstables = LeveledSstables::new();
         for p in &sst_files {
             // Open mmap for the SSTable
             let mmap = match MappedSSTable::open(p) {
@@ -433,7 +427,12 @@ impl LsmTreeEngine {
             let bloom = mmap
                 .read_bloom_filter()
                 .expect("Failed to read Bloom filter from SSTable");
-            sst_handles.push(Arc::new(SstableHandle { mmap, bloom }));
+            let handle = Arc::new(SstableHandle { mmap, bloom });
+
+            // Get level from manifest, default to L0 if not found
+            let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let level = manifest.get_entry(filename).map(|e| e.level).unwrap_or(0);
+            leveled_sstables.add_to_level(level, handle);
         }
 
         // Recover MemTable from WAL files that are newer than the latest SSTable
@@ -495,9 +494,12 @@ impl LsmTreeEngine {
         let mem_state =
             MemTableState::new(memtable_capacity_bytes, recovered_memtable, recovered_size);
 
+        let compaction_handler =
+            LeveledCompaction::new(data_dir.clone(), CompactionConfig::default());
+
         LsmTreeEngine {
             mem_state,
-            leveled_sstables: Arc::new(Mutex::new(LeveledSstables::from_flat_list(sst_handles))),
+            leveled_sstables: Arc::new(Mutex::new(leveled_sstables)),
             data_dir,
             next_sst_id: Arc::new(AtomicU64::new(max_sst_id)),
             compaction_trigger_file_count,
@@ -507,6 +509,8 @@ impl LsmTreeEngine {
             metrics: Arc::new(EngineMetrics::new()),
             wal_archive_config,
             snapshot_lock: Arc::new(RwLock::new(())),
+            manifest: Arc::new(Mutex::new(manifest)),
+            compaction_handler,
         }
     }
 
@@ -541,11 +545,32 @@ impl LsmTreeEngine {
         // Open mmap for the newly created SSTable
         let mmap = MappedSSTable::open(&sst_path)?;
 
+        // Get min/max keys for manifest
+        let min_key = mmap.min_key().map(|k| k.to_vec()).unwrap_or_default();
+        let max_key = mmap.max_key().map(|k| k.to_vec()).unwrap_or_default();
+        let file_size = std::fs::metadata(&sst_path).map(|m| m.len()).unwrap_or(0);
+        let filename = sst_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
         let handle = Arc::new(SstableHandle { mmap, bloom });
 
         {
             let mut leveled = self.leveled_sstables.lock().unwrap();
             leveled.add_to_level(0, handle);
+        }
+
+        // Update manifest with new SSTable
+        {
+            let mut manifest = self.manifest.lock().unwrap();
+            manifest.add_entry(ManifestEntry::new(
+                filename, 0, &min_key, &max_key, file_size,
+            ));
+            if let Err(e) = manifest.save(&self.data_dir) {
+                eprintln!("Warning: Failed to save manifest: {}", e);
+            }
         }
 
         self.mem_state.remove_immutable(&memtable);
@@ -568,12 +593,32 @@ impl LsmTreeEngine {
 
     /// Check if compaction should be triggered and run it if needed
     fn check_compaction(&self) {
-        let sst_count = {
+        // Find which level needs compaction
+        let compaction_level = {
             let leveled = self.leveled_sstables.lock().unwrap();
-            leveled.total_sstable_count()
+
+            // Check L0 file count first
+            let l0_count = leveled.l0_sstables().len();
+            if self.compaction_handler.l0_needs_compaction(l0_count) {
+                Some(0)
+            } else {
+                // Check L1+ for size-based compaction
+                let mut needs_compaction = None;
+                for level in 1..leveled.level_count() {
+                    let level_size = leveled.level_size(level);
+                    if self
+                        .compaction_handler
+                        .level_needs_compaction(level, level_size)
+                    {
+                        needs_compaction = Some(level);
+                        break;
+                    }
+                }
+                needs_compaction
+            }
         };
 
-        if sst_count >= self.compaction_trigger_file_count {
+        if let Some(level) = compaction_level {
             let mut in_progress = self.compaction_in_progress.lock().unwrap();
             if !*in_progress {
                 *in_progress = true;
@@ -581,8 +626,8 @@ impl LsmTreeEngine {
 
                 let engine_clone = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = engine_clone.run_compaction().await {
-                        eprintln!("Compaction failed: {}", e);
+                    if let Err(e) = engine_clone.run_compaction_for_level(level).await {
+                        eprintln!("Compaction failed for level {}: {}", level, e);
                     }
                     *engine_clone.compaction_in_progress.lock().unwrap() = false;
                 });
@@ -725,106 +770,162 @@ impl LsmTreeEngine {
         Arc::clone(&self.snapshot_lock)
     }
 
-    /// Run compaction: merge all SSTables into a single new SSTable and delete old ones
-    async fn run_compaction(&self) -> Result<(), Status> {
-        println!("Starting compaction...");
+    /// Run leveled compaction for the specified level
+    /// - Level 0: Compact all L0 files into L1
+    /// - Level 1+: Compact one file from Ln into Ln+1
+    async fn run_compaction_for_level(&self, source_level: usize) -> Result<(), Status> {
+        println!("Starting leveled compaction for L{}...", source_level);
 
-        // Get current SSTables to compact (flatten all levels)
-        let sst_handles: Vec<Arc<SstableHandle>> = {
+        let target_level = source_level + 1;
+
+        // Get source and target level file paths
+        let (source_paths, target_paths): (Vec<PathBuf>, Vec<PathBuf>) = {
             let leveled = self.leveled_sstables.lock().unwrap();
-            leveled.to_flat_list()
+            let source = leveled
+                .get_level(source_level)
+                .iter()
+                .map(|h| h.mmap.path().to_path_buf())
+                .collect();
+            let target = leveled
+                .get_level(target_level)
+                .iter()
+                .map(|h| h.mmap.path().to_path_buf())
+                .collect();
+            (source, target)
         };
 
-        if sst_handles.len() < 2 {
-            println!("Not enough SSTables to compact");
+        if source_paths.is_empty() {
+            println!("No L{} SSTables to compact", source_level);
             return Ok(());
         }
 
-        // Calculate bytes read from input SSTables
-        let bytes_read: u64 = sst_handles
-            .iter()
-            .filter_map(|h| std::fs::metadata(h.mmap.path()).ok())
-            .map(|m| m.len())
-            .sum();
+        // Plan compaction based on level
+        let task = if source_level == 0 {
+            // L0 → L1: Compact all L0 files
+            match self
+                .compaction_handler
+                .plan_l0_compaction(&source_paths, &target_paths)?
+            {
+                Some(t) => t,
+                None => {
+                    println!("No L0 compaction needed");
+                    return Ok(());
+                }
+            }
+        } else {
+            // Ln → Ln+1: Compact one file from source level
+            match self.compaction_handler.plan_level_compaction(
+                source_level,
+                &source_paths,
+                &target_paths,
+            )? {
+                Some(t) => t,
+                None => {
+                    println!("No L{} compaction needed", source_level);
+                    return Ok(());
+                }
+            }
+        };
 
-        // Merge all SSTables, keeping only the latest value for each key
-        let mut merged: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
+        println!(
+            "Compacting {} L{} files + {} L{} files → L{}",
+            task.source_files.len(),
+            source_level,
+            task.target_files.len(),
+            target_level,
+            target_level
+        );
 
-        for handle in &sst_handles {
-            let entries = sstable::read_entries(handle.mmap.path())?;
-            for (key, (timestamp, value)) in entries {
-                match merged.get(&key) {
-                    Some((existing_ts, _)) if *existing_ts >= timestamp => {
-                        // Keep existing entry (newer timestamp)
-                    }
-                    _ => {
-                        merged.insert(key, (timestamp, value));
+        // Execute compaction
+        let mut next_sst_id = self.next_sst_id.load(Ordering::SeqCst);
+        let wal_id = self.wal.current_id();
+        let result = self
+            .compaction_handler
+            .execute(&task, &mut next_sst_id, wal_id)?;
+
+        // Update next_sst_id
+        self.next_sst_id.store(next_sst_id, Ordering::SeqCst);
+
+        // Record compaction metrics
+        self.metrics
+            .record_compaction(result.bytes_read, result.bytes_written);
+
+        // Build handles for new SSTables
+        let mut new_handles = Vec::new();
+        for output in &result.new_files {
+            let mmap = MappedSSTable::open(&output.path)?;
+            let bloom = mmap.read_bloom_filter()?;
+            new_handles.push((output.level, Arc::new(SstableHandle { mmap, bloom })));
+        }
+
+        // Update leveled sstables
+        {
+            let mut leveled = self.leveled_sstables.lock().unwrap();
+
+            // Remove compacted files from their levels
+            for path in &result.files_to_delete {
+                // Find and remove the handle
+                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                for level_idx in 0..leveled.level_count() {
+                    let level = &mut leveled.levels[level_idx];
+                    if let Some(pos) = level.iter().position(|h| {
+                        h.mmap
+                            .path()
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            == filename
+                    }) {
+                        level.remove(pos);
+                        break;
                     }
                 }
             }
-        }
 
-        // Remove tombstones (deleted entries) during compaction
-        merged.retain(|_, (_, value)| value.is_some());
-
-        // Write merged data to a new SSTable
-        let new_sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
-        // Use the max WAL ID from compacted SSTables
-        let max_wal_id = sst_handles
-            .iter()
-            .filter_map(|h| sstable::extract_wal_id_from_sstable(h.mmap.path()))
-            .max()
-            .unwrap_or(0);
-        let new_sst_path = sstable::generate_path(&self.data_dir, new_sst_id, max_wal_id);
-
-        println!("Writing compacted SSTable to {:?}...", new_sst_path);
-
-        // write_timestamped_entries returns the embedded Bloom filter
-        let bloom = sstable::write_timestamped_entries(&new_sst_path, &merged)?;
-
-        // Record compaction metrics
-        let bytes_written = std::fs::metadata(&new_sst_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        self.metrics.record_compaction(bytes_read, bytes_written);
-
-        // Open mmap for the newly created SSTable
-        let mmap = MappedSSTable::open(&new_sst_path)?;
-
-        let new_handle = Arc::new(SstableHandle { mmap, bloom });
-
-        // Update leveled sstables: remove compacted SSTables and add new one
-        // Keep any SSTables that were added during compaction (by flush)
-        {
-            let mut leveled = self.leveled_sstables.lock().unwrap();
-            // Remove compacted SSTables from all levels
-            for handle in &sst_handles {
-                leveled.remove(handle);
+            // Add new SSTables to their target levels
+            for (level, handle) in new_handles {
+                leveled.add_to_level(level, handle);
             }
-            // Add the new compacted SSTable to L0
-            // (Future: could be placed in appropriate level based on size/keys)
-            leveled.add_to_level(0, new_handle);
         }
 
-        // Delete old SSTable files after updating the list.
-        // Acquire write lock to ensure no snapshot transfer is in progress.
+        // Update manifest
+        {
+            let mut manifest = self.manifest.lock().unwrap();
+
+            // Remove old entries
+            for path in &result.files_to_delete {
+                let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                manifest.remove_entry(filename);
+            }
+
+            // Add new entries
+            for output in &result.new_files {
+                manifest.add_entry(output.to_manifest_entry());
+            }
+
+            if let Err(e) = manifest.save(&self.data_dir) {
+                eprintln!("Warning: Failed to save manifest after compaction: {}", e);
+            }
+        }
+
+        // Delete old SSTable files
         {
             let _lock = self.snapshot_lock.write().unwrap();
-            for handle in &sst_handles {
-                let path = handle.mmap.path();
+            for path in &result.files_to_delete {
                 if let Err(e) = fs::remove_file(path) {
                     eprintln!("Failed to delete old SSTable {:?}: {}", path, e);
                 } else {
                     println!("Deleted old SSTable: {:?}", path);
-                    // Invalidate cache entries for deleted file
                     self.block_cache.invalidate_file(path);
                 }
             }
         }
 
         println!(
-            "Compaction finished. Merged {} SSTables into 1.",
-            sst_handles.len()
+            "Leveled compaction L{} → L{} finished. Created {} new SSTables.",
+            source_level,
+            target_level,
+            result.new_files.len()
         );
         Ok(())
     }

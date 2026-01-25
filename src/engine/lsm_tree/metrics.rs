@@ -23,11 +23,6 @@ pub struct EngineMetrics {
     pub compaction_count: AtomicU64,
     pub compaction_bytes_read: AtomicU64,
     pub compaction_bytes_written: AtomicU64,
-
-    // WAL metrics
-    pub wal_writes: AtomicU64,
-    pub wal_syncs: AtomicU64,
-    pub wal_bytes_written: AtomicU64,
 }
 
 impl Default for EngineMetrics {
@@ -56,10 +51,6 @@ impl EngineMetrics {
             compaction_count: AtomicU64::new(0),
             compaction_bytes_read: AtomicU64::new(0),
             compaction_bytes_written: AtomicU64::new(0),
-
-            wal_writes: AtomicU64::new(0),
-            wal_syncs: AtomicU64::new(0),
-            wal_bytes_written: AtomicU64::new(0),
         }
     }
 
@@ -125,19 +116,6 @@ impl EngineMetrics {
             .fetch_add(bytes_written, Ordering::Relaxed);
     }
 
-    /// Record WAL write (for future instrumentation)
-    #[allow(dead_code)]
-    pub fn record_wal_write(&self, bytes: u64) {
-        self.wal_writes.fetch_add(1, Ordering::Relaxed);
-        self.wal_bytes_written.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    /// Record WAL sync (for future instrumentation)
-    #[allow(dead_code)]
-    pub fn record_wal_sync(&self) {
-        self.wal_syncs.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Get a snapshot of all metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         let bloom_checks = self.bloom_filter_hits.load(Ordering::Relaxed)
@@ -167,10 +145,6 @@ impl EngineMetrics {
             compaction_count: self.compaction_count.load(Ordering::Relaxed),
             compaction_bytes_read: self.compaction_bytes_read.load(Ordering::Relaxed),
             compaction_bytes_written: self.compaction_bytes_written.load(Ordering::Relaxed),
-
-            wal_writes: self.wal_writes.load(Ordering::Relaxed),
-            wal_syncs: self.wal_syncs.load(Ordering::Relaxed),
-            wal_bytes_written: self.wal_bytes_written.load(Ordering::Relaxed),
         }
     }
 
@@ -195,10 +169,6 @@ impl EngineMetrics {
         self.compaction_count.store(0, Ordering::Relaxed);
         self.compaction_bytes_read.store(0, Ordering::Relaxed);
         self.compaction_bytes_written.store(0, Ordering::Relaxed);
-
-        self.wal_writes.store(0, Ordering::Relaxed);
-        self.wal_syncs.store(0, Ordering::Relaxed);
-        self.wal_bytes_written.store(0, Ordering::Relaxed);
     }
 }
 
@@ -228,11 +198,6 @@ pub struct MetricsSnapshot {
     pub compaction_count: u64,
     pub compaction_bytes_read: u64,
     pub compaction_bytes_written: u64,
-
-    // WAL metrics
-    pub wal_writes: u64,
-    pub wal_syncs: u64,
-    pub wal_bytes_written: u64,
 }
 
 impl std::fmt::Display for MetricsSnapshot {
@@ -282,16 +247,6 @@ impl std::fmt::Display for MetricsSnapshot {
             "  Bytes written: {} ({:.2} MB)",
             self.compaction_bytes_written,
             self.compaction_bytes_written as f64 / 1024.0 / 1024.0
-        )?;
-        writeln!(f)?;
-        writeln!(f, "WAL:")?;
-        writeln!(f, "  Writes: {}", self.wal_writes)?;
-        writeln!(f, "  Syncs: {}", self.wal_syncs)?;
-        writeln!(
-            f,
-            "  Bytes written: {} ({:.2} MB)",
-            self.wal_bytes_written,
-            self.wal_bytes_written as f64 / 1024.0 / 1024.0
         )?;
         Ok(())
     }
