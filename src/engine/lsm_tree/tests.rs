@@ -514,10 +514,36 @@ async fn test_wal_archive_by_size() {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
-    // Wait for flushes to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Helper to calculate total WAL size
+    let calc_wal_size = || -> u64 {
+        fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.starts_with("wal_") && name.ends_with(".log"))
+            })
+            .filter_map(|e| fs::metadata(e.path()).ok())
+            .map(|m| m.len())
+            .sum()
+    };
 
-    // Count WAL files - should be limited by size
+    // Wait for WAL size to stabilize below limit (polling with timeout)
+    // This is more robust than a fixed sleep as it handles slow systems
+    let max_wait_ms = 5000;
+    let poll_interval_ms = 100;
+    let mut waited_ms = 0;
+    let mut total_wal_size = calc_wal_size();
+
+    while total_wal_size > 2048 && waited_ms < max_wait_ms {
+        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
+        waited_ms += poll_interval_ms;
+        total_wal_size = calc_wal_size();
+    }
+
+    // Count WAL files for logging
     let wal_files: Vec<_> = fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
@@ -529,17 +555,11 @@ async fn test_wal_archive_by_size() {
         })
         .collect();
 
-    // Calculate total WAL size
-    let total_wal_size: u64 = wal_files
-        .iter()
-        .filter_map(|e| fs::metadata(e.path()).ok())
-        .map(|m| m.len())
-        .sum();
-
     println!(
-        "WAL files count: {}, total size: {} bytes",
+        "WAL files count: {}, total size: {} bytes (waited {}ms)",
         wal_files.len(),
-        total_wal_size
+        total_wal_size,
+        waited_ms
     );
 
     // The archiving should keep total size near the limit (1KB)
@@ -547,8 +567,9 @@ async fn test_wal_archive_by_size() {
     // Each WAL file is around 100-150 bytes, so we expect around 8-10 files max
     assert!(
         total_wal_size <= 2048, // Allow some slack (2KB)
-        "Expected WAL size to be limited, got {} bytes",
-        total_wal_size
+        "Expected WAL size to be limited, got {} bytes after waiting {}ms",
+        total_wal_size,
+        waited_ms
     );
 
     // Data should still be accessible (from SSTables)

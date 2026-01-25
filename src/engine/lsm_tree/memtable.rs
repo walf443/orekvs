@@ -2,7 +2,7 @@ use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 /// Lock-free SkipList-based MemTable
 /// Allows concurrent reads and writes without mutex
@@ -52,8 +52,12 @@ impl std::fmt::Debug for WriteStallState {
     }
 }
 
-#[derive(Debug)]
 pub struct MemTableState {
+    /// Lock to coordinate inserts and flush:
+    /// - insert() takes read lock (concurrent inserts allowed)
+    /// - needs_flush() takes write lock (exclusive, blocks inserts during swap+conversion)
+    /// This prevents data loss when skip_to_btree runs during concurrent inserts.
+    flush_lock: Arc<RwLock<()>>,
     /// Current in-memory write buffer (lock-free SkipList with atomic swap)
     /// Uses ArcSwap for lock-free atomic replacement during flush
     pub active_memtable: ArcSwap<SkipMemTable>,
@@ -71,9 +75,20 @@ pub struct MemTableState {
     stall_count: Arc<AtomicUsize>,
 }
 
+impl std::fmt::Debug for MemTableState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemTableState")
+            .field("capacity_bytes", &self.capacity_bytes)
+            .field("current_size", &self.current_size.load(Ordering::Relaxed))
+            .field("max_immutable_memtables", &self.max_immutable_memtables)
+            .finish()
+    }
+}
+
 impl Clone for MemTableState {
     fn clone(&self) -> Self {
         MemTableState {
+            flush_lock: Arc::clone(&self.flush_lock),
             active_memtable: ArcSwap::new(self.active_memtable.load_full()),
             immutable_memtables: Arc::clone(&self.immutable_memtables),
             capacity_bytes: self.capacity_bytes,
@@ -108,6 +123,7 @@ impl MemTableState {
         }
 
         MemTableState {
+            flush_lock: Arc::new(RwLock::new(())),
             active_memtable: ArcSwap::new(Arc::new(skip_map)),
             immutable_memtables: Arc::new(Mutex::new(Vec::new())),
             capacity_bytes,
@@ -165,8 +181,12 @@ impl MemTableState {
         self.immutable_memtables.lock().unwrap().len()
     }
 
-    /// Insert a key-value pair into the active MemTable (lock-free)
+    /// Insert a key-value pair into the active MemTable
+    /// Takes a read lock to prevent data loss during flush (multiple inserts can run concurrently)
     pub fn insert(&self, key: String, value: Option<String>) {
+        // Take read lock - allows concurrent inserts but blocks during flush
+        let _guard = self.flush_lock.read().unwrap();
+
         let entry_size = estimate_entry_size(&key, &value);
 
         // Load current active memtable
@@ -190,21 +210,31 @@ impl MemTableState {
     }
 
     /// Check if flush is needed and return immutable memtable if so.
-    /// Uses atomic swap to ensure no writes are lost during the transition.
+    /// Takes write lock to ensure no concurrent inserts during swap+conversion.
     pub fn needs_flush(&self) -> Option<Arc<MemTable>> {
         let size = self.current_size.load(Ordering::SeqCst);
         if size >= self.capacity_bytes {
+            // Take write lock - blocks all inserts during swap and conversion
+            // This prevents data loss from concurrent inserts during skip_to_btree
+            let _guard = self.flush_lock.write().unwrap();
+
+            // Re-check size under lock (another thread might have triggered flush)
+            let size = self.current_size.load(Ordering::SeqCst);
+            if size < self.capacity_bytes {
+                return None;
+            }
+
             // Create a new empty SkipMap
             let new_memtable = Arc::new(SkipMap::new());
 
             // Atomically swap the old memtable with the new one
-            // This ensures all writers after this point write to the new memtable
             let old_memtable = self.active_memtable.swap(new_memtable);
 
             // Reset size counter (new memtable is empty)
             self.current_size.store(0, Ordering::SeqCst);
 
             // Convert the old SkipMap to BTreeMap for SSTable creation
+            // Safe because write lock ensures no concurrent inserts
             let btree = skip_to_btree(&old_memtable);
 
             let immutable = Arc::new(btree);
@@ -464,12 +494,14 @@ mod tests {
             }
         });
 
-        // Flusher thread that does multiple swaps
+        // Flusher thread that does multiple swaps (using proper locking)
         let state_flusher = Arc::clone(&state);
         let flusher = thread::spawn(move || {
             let mut all_immutables = Vec::new();
             for _ in 0..10 {
                 thread::sleep(std::time::Duration::from_micros(100));
+                // Take write lock to prevent concurrent inserts during conversion
+                let _guard = state_flusher.flush_lock.write().unwrap();
                 let old = state_flusher.active_memtable.swap(Arc::new(SkipMap::new()));
                 let btree = skip_to_btree(&old);
                 all_immutables.push(btree);
@@ -585,6 +617,9 @@ impl MemTableState {
     // Helper for testing to force a flush regardless of size
     #[cfg(test)]
     fn needs_flush_manual(&self) -> Arc<MemTable> {
+        // Take write lock to prevent concurrent inserts during conversion
+        let _guard = self.flush_lock.write().unwrap();
+
         let old = self.active_memtable.swap(Arc::new(SkipMap::new()));
         self.current_size.store(0, Ordering::SeqCst);
         let btree = skip_to_btree(&old);
