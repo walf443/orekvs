@@ -1,6 +1,7 @@
 mod block_cache;
 mod bloom;
 mod buffer_pool;
+mod compaction;
 mod manifest;
 mod memtable;
 mod metrics;
