@@ -298,29 +298,41 @@ async fn test_lsm_recovery_merges_wal_and_sst() {
     let data_dir = dir.path().to_str().unwrap().to_string();
 
     {
+        // Phase 1: Create SSTables with k1=v1 and k2=v2
+        // Use 30 byte memtable to trigger flushes
         let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+
         // k1 goes to SSTable
         engine.set("k1".to_string(), "v1".to_string()).unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // k2 triggers another flush to SSTable
         engine.set("k2".to_string(), "v2".to_string()).unwrap();
-        // Wait for second flush to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        // k1 updated in WAL/MemTable
-        engine.set("k1".to_string(), "v1_new".to_string()).unwrap();
-
-        // Wait for WAL group commit to flush before engine drop
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-        // Properly shutdown to ensure all WAL writes are flushed
         engine.shutdown().await;
     }
 
     {
+        // Phase 2: Update k1 in WAL only (no flush)
+        // Use large memtable so k1=v1_new won't trigger flush
         let engine = LsmTreeEngine::new(data_dir.clone(), 1024, 100);
+
+        // k1 updated in WAL/MemTable only (won't trigger flush)
+        engine.set("k1".to_string(), "v1_new".to_string()).unwrap();
+
+        // Wait for WAL group commit to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        engine.shutdown().await;
+    }
+
+    {
+        // Phase 3: Verify recovery merges WAL with SSTable
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024, 100);
+        // k1 should be v1_new (from WAL, overwriting SSTable's v1)
         assert_eq!(engine.get("k1".to_string()).unwrap(), "v1_new");
+        // k2 should be v2 (from SSTable)
         assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
     }
 }
