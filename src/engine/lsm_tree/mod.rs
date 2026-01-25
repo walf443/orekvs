@@ -551,9 +551,10 @@ impl LsmTreeEngine {
         // Open mmap for the newly created SSTable
         let mmap = MappedSSTable::open(&sst_path)?;
 
-        // Get min/max keys for manifest
+        // Get min/max keys and entry count for manifest
         let min_key = mmap.min_key().map(|k| k.to_vec()).unwrap_or_default();
         let max_key = mmap.max_key().map(|k| k.to_vec()).unwrap_or_default();
+        let entry_count = mmap.entry_count();
         let file_size = std::fs::metadata(&sst_path).map(|m| m.len()).unwrap_or(0);
         let filename = sst_path
             .file_name()
@@ -572,7 +573,12 @@ impl LsmTreeEngine {
         {
             let mut manifest = self.manifest.lock().unwrap();
             manifest.add_entry(ManifestEntry::new(
-                filename, 0, &min_key, &max_key, file_size,
+                filename,
+                0,
+                &min_key,
+                &max_key,
+                file_size,
+                entry_count,
             ));
             if let Err(e) = manifest.save(&self.data_dir) {
                 eprintln!("Warning: Failed to save manifest: {}", e);

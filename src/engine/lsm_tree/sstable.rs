@@ -13,7 +13,7 @@ use super::memtable::MemTable;
 use super::mmap::MappedFile;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 7;
+pub const DATA_VERSION: u32 = 8;
 
 /// Compute CRC32C checksum
 fn crc32(data: &[u8]) -> u32 {
@@ -62,6 +62,8 @@ pub struct MappedSSTable {
     min_key: Option<Vec<u8>>,
     /// Maximum key in this SSTable (v7+, used for leveled compaction)
     max_key: Option<Vec<u8>>,
+    /// Number of entries in this SSTable (v8+, used for approximate count/rank)
+    entry_count: Option<u64>,
 }
 
 impl MappedSSTable {
@@ -92,9 +94,9 @@ impl MappedSSTable {
         }
 
         let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if !(5..=7).contains(&version) {
+        if !(5..=8).contains(&version) {
             return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
+                "Unsupported SSTable version: {}. Only versions 5-8 are supported.",
                 version
             )));
         }
@@ -112,61 +114,76 @@ impl MappedSSTable {
 
         // Read footer based on version
         let footer_start = file_len - footer_size;
-        let (index_offset, bloom_offset, keyrange_offset, min_key, max_key) = if version >= 7 {
-            // V7 footer: [index_offset][bloom_offset][keyrange_offset][footer_magic]
-            let footer = mmap.slice(footer_start, footer_start + 32);
-            let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-            let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-            let keyrange_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-            let magic = u64::from_le_bytes(footer[24..32].try_into().unwrap());
-            if magic != FOOTER_MAGIC {
-                return Err(Status::internal("Invalid footer magic"));
-            }
+        let (index_offset, bloom_offset, keyrange_offset, min_key, max_key, entry_count) =
+            if version >= 7 {
+                // V7/V8 footer: [index_offset][bloom_offset][keyrange_offset][footer_magic]
+                let footer = mmap.slice(footer_start, footer_start + 32);
+                let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+                let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+                let keyrange_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+                let magic = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+                if magic != FOOTER_MAGIC {
+                    return Err(Status::internal("Invalid footer magic"));
+                }
 
-            // Read key range at keyrange_offset
-            let keyrange_pos = keyrange_offset as usize;
+                // Read key range at keyrange_offset
+                let keyrange_pos = keyrange_offset as usize;
 
-            // Read min_key
-            let min_key_len_bytes = mmap
-                .read_at(keyrange_pos, 4)
-                .ok_or_else(|| Status::internal("Failed to read min_key length"))?;
-            let min_key_len = u32::from_le_bytes(min_key_len_bytes.try_into().unwrap()) as usize;
-            let min_key = mmap
-                .read_at(keyrange_pos + 4, min_key_len)
-                .ok_or_else(|| Status::internal("Failed to read min_key"))?
-                .to_vec();
+                // Read min_key
+                let min_key_len_bytes = mmap
+                    .read_at(keyrange_pos, 4)
+                    .ok_or_else(|| Status::internal("Failed to read min_key length"))?;
+                let min_key_len =
+                    u32::from_le_bytes(min_key_len_bytes.try_into().unwrap()) as usize;
+                let min_key = mmap
+                    .read_at(keyrange_pos + 4, min_key_len)
+                    .ok_or_else(|| Status::internal("Failed to read min_key"))?
+                    .to_vec();
 
-            // Read max_key
-            let max_key_pos = keyrange_pos + 4 + min_key_len;
-            let max_key_len_bytes = mmap
-                .read_at(max_key_pos, 4)
-                .ok_or_else(|| Status::internal("Failed to read max_key length"))?;
-            let max_key_len = u32::from_le_bytes(max_key_len_bytes.try_into().unwrap()) as usize;
-            let max_key = mmap
-                .read_at(max_key_pos + 4, max_key_len)
-                .ok_or_else(|| Status::internal("Failed to read max_key"))?
-                .to_vec();
+                // Read max_key
+                let max_key_pos = keyrange_pos + 4 + min_key_len;
+                let max_key_len_bytes = mmap
+                    .read_at(max_key_pos, 4)
+                    .ok_or_else(|| Status::internal("Failed to read max_key length"))?;
+                let max_key_len =
+                    u32::from_le_bytes(max_key_len_bytes.try_into().unwrap()) as usize;
+                let max_key = mmap
+                    .read_at(max_key_pos + 4, max_key_len)
+                    .ok_or_else(|| Status::internal("Failed to read max_key"))?
+                    .to_vec();
 
-            (
-                index_offset,
-                bloom_offset,
-                Some(keyrange_offset),
-                Some(min_key),
-                Some(max_key),
-            )
-        } else {
-            // V5-V6 footer: [index_offset][bloom_offset][footer_magic]
-            let footer = mmap.slice(footer_start, footer_start + 24);
-            let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-            let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-            let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-            if magic != FOOTER_MAGIC {
-                return Err(Status::internal("Invalid footer magic"));
-            }
-            (index_offset, bloom_offset, None, None, None)
-        };
+                // Read entry_count (v8+)
+                let entry_count = if version >= 8 {
+                    let entry_count_pos = max_key_pos + 4 + max_key_len;
+                    let entry_count_bytes = mmap
+                        .read_at(entry_count_pos, 8)
+                        .ok_or_else(|| Status::internal("Failed to read entry_count"))?;
+                    Some(u64::from_le_bytes(entry_count_bytes.try_into().unwrap()))
+                } else {
+                    None
+                };
 
-        let _ = keyrange_offset; // Used in v7 to read key range, not stored in struct
+                (
+                    index_offset,
+                    bloom_offset,
+                    Some(keyrange_offset),
+                    Some(min_key),
+                    Some(max_key),
+                    entry_count,
+                )
+            } else {
+                // V5-V6 footer: [index_offset][bloom_offset][footer_magic]
+                let footer = mmap.slice(footer_start, footer_start + 24);
+                let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+                let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+                let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+                if magic != FOOTER_MAGIC {
+                    return Err(Status::internal("Invalid footer magic"));
+                }
+                (index_offset, bloom_offset, None, None, None, None)
+            };
+
+        let _ = keyrange_offset; // Used in v7+ to read key range, not stored in struct
 
         Ok(Self {
             mmap,
@@ -176,6 +193,7 @@ impl MappedSSTable {
             bloom_offset,
             min_key,
             max_key,
+            entry_count,
         })
     }
 
@@ -199,6 +217,11 @@ impl MappedSSTable {
     /// Get the maximum key in this SSTable (v7+, used for leveled compaction)
     pub fn max_key(&self) -> Option<&[u8]> {
         self.max_key.as_deref()
+    }
+
+    /// Get the number of entries in this SSTable (v8+, used for approximate count/rank)
+    pub fn entry_count(&self) -> Option<u64> {
+        self.entry_count
     }
 
     /// Check if a key might be in the key range of this SSTable (used for leveled compaction)
@@ -416,9 +439,9 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(5..=7).contains(&version) {
+    if !(5..=8).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-8 are supported.",
             version
         )));
     }
@@ -703,9 +726,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(5..=7).contains(&version) {
+    if !(5..=8).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-8 are supported.",
             version
         )));
     }
@@ -886,9 +909,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if !(5..=7).contains(&version) {
+    if !(5..=8).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-8 are supported.",
             version
         )));
     }
@@ -1010,9 +1033,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(5..=7).contains(&version) {
+    if !(5..=8).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-8 are supported.",
             version
         )));
     }
@@ -1224,7 +1247,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         .map_err(|e| Status::internal(e.to_string()))?;
     current_offset += 8 + bloom_len;
 
-    // Write key range section (V7)
+    // Write key range section (V8)
     let keyrange_offset = current_offset;
     // Get min/max keys from memtable (BTreeMap is sorted)
     let min_key = memtable.keys().next().map(|k| k.as_bytes()).unwrap_or(&[]);
@@ -1233,6 +1256,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         .next_back()
         .map(|k| k.as_bytes())
         .unwrap_or(&[]);
+    let entry_count = memtable.len() as u64;
 
     // Write min_key: [len: u32][key: bytes]
     file.write_all(&(min_key.len() as u32).to_le_bytes())
@@ -1246,7 +1270,11 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
     file.write_all(max_key)
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // Write V7 footer: index_offset + bloom_offset + keyrange_offset + magic
+    // Write entry_count: [count: u64] (V8)
+    file.write_all(&entry_count.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write V8 footer: index_offset + bloom_offset + keyrange_offset + magic
     file.write_all(&index_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_offset.to_le_bytes())
@@ -1364,7 +1392,7 @@ pub fn write_timestamped_entries(
         .map_err(|e| Status::internal(e.to_string()))?;
     current_offset += 8 + bloom_len;
 
-    // Write key range section (V7)
+    // Write key range section (V8)
     let keyrange_offset = current_offset;
     // Get min/max keys from entries (BTreeMap is sorted)
     let min_key = entries.keys().next().map(|k| k.as_bytes()).unwrap_or(&[]);
@@ -1373,6 +1401,7 @@ pub fn write_timestamped_entries(
         .next_back()
         .map(|k| k.as_bytes())
         .unwrap_or(&[]);
+    let entry_count = entries.len() as u64;
 
     // Write min_key: [len: u32][key: bytes]
     file.write_all(&(min_key.len() as u32).to_le_bytes())
@@ -1386,7 +1415,11 @@ pub fn write_timestamped_entries(
     file.write_all(max_key)
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // Write V7 footer: index_offset + bloom_offset + keyrange_offset + magic
+    // Write entry_count: [count: u64] (V8)
+    file.write_all(&entry_count.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write V8 footer: index_offset + bloom_offset + keyrange_offset + magic
     file.write_all(&index_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_offset.to_le_bytes())
@@ -1498,9 +1531,9 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if !(5..=7).contains(&version) {
+    if !(5..=8).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-8 are supported.",
             version
         )));
     }

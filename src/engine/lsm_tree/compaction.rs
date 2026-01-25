@@ -92,6 +92,8 @@ pub struct CompactionOutputFile {
     pub size_bytes: u64,
     /// Target level for this file
     pub level: usize,
+    /// Number of entries in this SSTable
+    pub entry_count: u64,
 }
 
 /// Leveled compaction planner and executor
@@ -288,7 +290,7 @@ impl LeveledCompaction {
         // Get file size
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-        // Get min/max keys
+        // Get min/max keys and entry count
         let min_key = entries
             .keys()
             .next()
@@ -299,6 +301,7 @@ impl LeveledCompaction {
             .next_back()
             .map(|k| k.as_bytes().to_vec())
             .unwrap_or_default();
+        let entry_count = entries.len() as u64;
 
         Ok(vec![CompactionOutputFile {
             path,
@@ -306,6 +309,7 @@ impl LeveledCompaction {
             max_key,
             size_bytes,
             level: target_level,
+            entry_count,
         }])
     }
 
@@ -382,6 +386,7 @@ impl CompactionOutputFile {
             &self.min_key,
             &self.max_key,
             self.size_bytes,
+            Some(self.entry_count),
         )
     }
 }
@@ -593,6 +598,7 @@ mod tests {
             max_key: b"zebra".to_vec(),
             size_bytes: 1024,
             level: 2,
+            entry_count: 100,
         };
 
         let entry = output.to_manifest_entry();
@@ -601,6 +607,7 @@ mod tests {
         assert_eq!(entry.min_key(), b"apple".to_vec());
         assert_eq!(entry.max_key(), b"zebra".to_vec());
         assert_eq!(entry.size_bytes, 1024);
+        assert_eq!(entry.entry_count, Some(100));
     }
 
     #[test]

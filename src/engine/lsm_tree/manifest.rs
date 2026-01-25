@@ -52,6 +52,9 @@ pub struct ManifestEntry {
     pub max_key_hex: String,
     /// File size in bytes
     pub size_bytes: u64,
+    /// Number of entries in this SSTable (v8+, None for older SSTables)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_count: Option<u64>,
 }
 
 impl ManifestEntry {
@@ -62,6 +65,7 @@ impl ManifestEntry {
         min_key: &[u8],
         max_key: &[u8],
         size_bytes: u64,
+        entry_count: Option<u64>,
     ) -> Self {
         Self {
             filename,
@@ -69,6 +73,7 @@ impl ManifestEntry {
             min_key_hex: hex_encode(min_key),
             max_key_hex: hex_encode(max_key),
             size_bytes,
+            entry_count,
         }
     }
 
@@ -213,13 +218,21 @@ mod tests {
 
     #[test]
     fn test_manifest_entry_creation() {
-        let entry = ManifestEntry::new("sst_1_0.data".to_string(), 0, b"apple", b"zebra", 1024);
+        let entry = ManifestEntry::new(
+            "sst_1_0.data".to_string(),
+            0,
+            b"apple",
+            b"zebra",
+            1024,
+            Some(50),
+        );
 
         assert_eq!(entry.filename, "sst_1_0.data");
         assert_eq!(entry.level, 0);
         assert_eq!(entry.min_key(), b"apple");
         assert_eq!(entry.max_key(), b"zebra");
         assert_eq!(entry.size_bytes, 1024);
+        assert_eq!(entry.entry_count, Some(50));
     }
 
     #[test]
@@ -235,6 +248,7 @@ mod tests {
             b"a",
             b"m",
             1000,
+            Some(100),
         ));
         manifest.add_entry(ManifestEntry::new(
             "sst_2_0.data".to_string(),
@@ -242,6 +256,7 @@ mod tests {
             b"n",
             b"z",
             2000,
+            Some(200),
         ));
         manifest.add_entry(ManifestEntry::new(
             "sst_3_0.data".to_string(),
@@ -249,6 +264,7 @@ mod tests {
             b"a",
             b"z",
             5000,
+            Some(500),
         ));
 
         // Save
@@ -287,6 +303,7 @@ mod tests {
             b"a",
             b"z",
             1000,
+            Some(100),
         ));
         manifest.add_entry(ManifestEntry::new(
             "sst_2_0.data".to_string(),
@@ -294,6 +311,7 @@ mod tests {
             b"a",
             b"z",
             2000,
+            Some(200),
         ));
 
         assert_eq!(manifest.entries.len(), 2);
@@ -312,6 +330,7 @@ mod tests {
             b"a",
             b"z",
             1000,
+            Some(100),
         ));
 
         assert_eq!(manifest.get_entry("sst_1_0.data").unwrap().level, 0);
@@ -333,6 +352,7 @@ mod tests {
             b"test",
             b"test",
             100,
+            Some(10),
         ));
         manifest.save(data_dir).unwrap();
 
