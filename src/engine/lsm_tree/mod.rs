@@ -296,7 +296,10 @@ impl Clone for LsmTreeEngine {
             manifest: Arc::clone(&self.manifest),
             compaction_handler: LeveledCompaction::new(
                 self.data_dir.clone(),
-                CompactionConfig::default(),
+                CompactionConfig {
+                    l0_compaction_threshold: self.compaction_trigger_file_count,
+                    ..CompactionConfig::default()
+                },
             ),
         }
     }
@@ -494,8 +497,11 @@ impl LsmTreeEngine {
         let mem_state =
             MemTableState::new(memtable_capacity_bytes, recovered_memtable, recovered_size);
 
-        let compaction_handler =
-            LeveledCompaction::new(data_dir.clone(), CompactionConfig::default());
+        let compaction_config = CompactionConfig {
+            l0_compaction_threshold: compaction_trigger_file_count,
+            ..CompactionConfig::default()
+        };
+        let compaction_handler = LeveledCompaction::new(data_dir.clone(), compaction_config);
 
         LsmTreeEngine {
             mem_state,
