@@ -13,7 +13,7 @@ use super::memtable::MemTable;
 use super::mmap::MappedFile;
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 6;
+pub const DATA_VERSION: u32 = 7;
 
 /// Compute CRC32C checksum
 fn crc32(data: &[u8]) -> u32 {
@@ -24,8 +24,10 @@ fn crc32(data: &[u8]) -> u32 {
 
 // Header size: 6 bytes magic + 4 bytes version
 pub const HEADER_SIZE: u64 = 10;
-// Footer size: index_offset(8) + bloom_offset(8) + footer_magic(8)
-pub const FOOTER_SIZE: u64 = 24;
+// Footer size v5-v6: index_offset(8) + bloom_offset(8) + footer_magic(8)
+pub const FOOTER_SIZE_V6: u64 = 24;
+// Footer size v7: index_offset(8) + bloom_offset(8) + keyrange_offset(8) + footer_magic(8)
+pub const FOOTER_SIZE_V7: u64 = 32;
 
 // Prefix compression restart interval for index
 // Every N entries, store full key for random access
@@ -56,6 +58,12 @@ pub struct MappedSSTable {
     version: u32,
     index_offset: u64,
     bloom_offset: u64,
+    /// Minimum key in this SSTable (v7+, used for leveled compaction)
+    #[allow(dead_code)]
+    min_key: Option<Vec<u8>>,
+    /// Maximum key in this SSTable (v7+, used for leveled compaction)
+    #[allow(dead_code)]
+    max_key: Option<Vec<u8>>,
 }
 
 impl MappedSSTable {
@@ -86,27 +94,81 @@ impl MappedSSTable {
         }
 
         let version = u32::from_le_bytes(mmap.slice(6, 10).try_into().unwrap());
-        if !(5..=6).contains(&version) {
+        if !(5..=7).contains(&version) {
             return Err(Status::internal(format!(
-                "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
+                "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
                 version
             )));
         }
 
         let file_len = mmap.len();
-        if file_len < HEADER_SIZE as usize + FOOTER_SIZE as usize {
+        let footer_size = if version >= 7 {
+            FOOTER_SIZE_V7 as usize
+        } else {
+            FOOTER_SIZE_V6 as usize
+        };
+
+        if file_len < HEADER_SIZE as usize + footer_size {
             return Err(Status::internal("SSTable file too small for footer"));
         }
 
-        // Read footer
-        let footer_start = file_len - FOOTER_SIZE as usize;
-        let footer = mmap.slice(footer_start, footer_start + 24);
-        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
-        if magic != FOOTER_MAGIC {
-            return Err(Status::internal("Invalid footer magic"));
-        }
+        // Read footer based on version
+        let footer_start = file_len - footer_size;
+        let (index_offset, bloom_offset, keyrange_offset, min_key, max_key) = if version >= 7 {
+            // V7 footer: [index_offset][bloom_offset][keyrange_offset][footer_magic]
+            let footer = mmap.slice(footer_start, footer_start + 32);
+            let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+            let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+            let keyrange_offset = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+            let magic = u64::from_le_bytes(footer[24..32].try_into().unwrap());
+            if magic != FOOTER_MAGIC {
+                return Err(Status::internal("Invalid footer magic"));
+            }
+
+            // Read key range at keyrange_offset
+            let keyrange_pos = keyrange_offset as usize;
+
+            // Read min_key
+            let min_key_len_bytes = mmap
+                .read_at(keyrange_pos, 4)
+                .ok_or_else(|| Status::internal("Failed to read min_key length"))?;
+            let min_key_len = u32::from_le_bytes(min_key_len_bytes.try_into().unwrap()) as usize;
+            let min_key = mmap
+                .read_at(keyrange_pos + 4, min_key_len)
+                .ok_or_else(|| Status::internal("Failed to read min_key"))?
+                .to_vec();
+
+            // Read max_key
+            let max_key_pos = keyrange_pos + 4 + min_key_len;
+            let max_key_len_bytes = mmap
+                .read_at(max_key_pos, 4)
+                .ok_or_else(|| Status::internal("Failed to read max_key length"))?;
+            let max_key_len = u32::from_le_bytes(max_key_len_bytes.try_into().unwrap()) as usize;
+            let max_key = mmap
+                .read_at(max_key_pos + 4, max_key_len)
+                .ok_or_else(|| Status::internal("Failed to read max_key"))?
+                .to_vec();
+
+            (
+                index_offset,
+                bloom_offset,
+                Some(keyrange_offset),
+                Some(min_key),
+                Some(max_key),
+            )
+        } else {
+            // V5-V6 footer: [index_offset][bloom_offset][footer_magic]
+            let footer = mmap.slice(footer_start, footer_start + 24);
+            let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+            let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+            let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+            if magic != FOOTER_MAGIC {
+                return Err(Status::internal("Invalid footer magic"));
+            }
+            (index_offset, bloom_offset, None, None, None)
+        };
+
+        let _ = keyrange_offset; // Used in v7 to read key range, not stored in struct
 
         Ok(Self {
             mmap,
@@ -114,6 +176,8 @@ impl MappedSSTable {
             version,
             index_offset,
             bloom_offset,
+            min_key,
+            max_key,
         })
     }
 
@@ -127,6 +191,28 @@ impl MappedSSTable {
         self.path
             .canonicalize()
             .unwrap_or_else(|_| self.path.clone())
+    }
+
+    /// Get the minimum key in this SSTable (v7+, used for leveled compaction)
+    #[allow(dead_code)]
+    pub fn min_key(&self) -> Option<&[u8]> {
+        self.min_key.as_deref()
+    }
+
+    /// Get the maximum key in this SSTable (v7+, used for leveled compaction)
+    #[allow(dead_code)]
+    pub fn max_key(&self) -> Option<&[u8]> {
+        self.max_key.as_deref()
+    }
+
+    /// Check if a key might be in the key range of this SSTable (used for leveled compaction)
+    /// Returns true if the key is within [min_key, max_key] or if key range is not available
+    #[allow(dead_code)]
+    pub fn key_in_range(&self, key: &[u8]) -> bool {
+        match (&self.min_key, &self.max_key) {
+            (Some(min), Some(max)) => key >= min.as_slice() && key <= max.as_slice(),
+            _ => true, // If no key range info, assume key might be present
+        }
     }
 
     /// Read and decompress the index
@@ -335,9 +421,9 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(5..=6).contains(&version) {
+    if !(5..=7).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
             version
         )));
     }
@@ -347,17 +433,23 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+    let footer_size = if version >= 7 {
+        FOOTER_SIZE_V7
+    } else {
+        FOOTER_SIZE_V6
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Err(Status::internal("SSTable file too small"));
     }
 
-    // Read footer to get index offset
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+    // Read footer to get index offset (index_offset is always at the start of footer)
+    file.seek(SeekFrom::Start(file_len - footer_size))
         .map_err(|e| Status::internal(e.to_string()))?;
-    let mut footer = [0u8; 24];
+    let mut footer = [0u8; 8];
     file.read_exact(&mut footer)
         .map_err(|e| Status::internal(e.to_string()))?;
-    let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let index_offset = u64::from_le_bytes(footer);
 
     // Read index (v5+ uses prefix compression)
     let index = read_index_prefix_compressed(&mut file, index_offset)?;
@@ -616,9 +708,9 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(5..=6).contains(&version) {
+    if !(5..=7).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
             version
         )));
     }
@@ -628,17 +720,23 @@ fn get_or_load_index(
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+    let footer_size = if version >= 7 {
+        FOOTER_SIZE_V7
+    } else {
+        FOOTER_SIZE_V6
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Err(Status::internal("SSTable file too small"));
     }
 
     // Read footer to get index offset
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+    file.seek(SeekFrom::Start(file_len - footer_size))
         .map_err(|e| Status::internal(e.to_string()))?;
-    let mut footer = [0u8; 24];
+    let mut footer = [0u8; 8];
     file.read_exact(&mut footer)
         .map_err(|e| Status::internal(e.to_string()))?;
-    let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let index_offset = u64::from_le_bytes(footer);
 
     // Read and decompress index (v5+ uses prefix compression)
     let index = read_index_prefix_compressed(&mut file, index_offset)?;
@@ -793,9 +891,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if !(5..=6).contains(&version) {
+    if !(5..=7).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
             version
         )));
     }
@@ -805,17 +903,23 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+    let footer_size = if version >= 7 {
+        FOOTER_SIZE_V7
+    } else {
+        FOOTER_SIZE_V6
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Ok(Vec::new());
     }
 
     // Read footer to get index offset (marks end of data blocks)
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+    file.seek(SeekFrom::Start(file_len - footer_size))
         .map_err(|e| Status::internal(e.to_string()))?;
-    let mut footer = [0u8; 24];
+    let mut footer = [0u8; 8];
     file.read_exact(&mut footer)
         .map_err(|e| Status::internal(e.to_string()))?;
-    let end_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let end_offset = u64::from_le_bytes(footer);
 
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -911,9 +1015,9 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?;
     let version = u32::from_le_bytes(ver_bytes);
 
-    if !(5..=6).contains(&version) {
+    if !(5..=7).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
             version
         )));
     }
@@ -923,17 +1027,23 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+    let footer_size = if version >= 7 {
+        FOOTER_SIZE_V7
+    } else {
+        FOOTER_SIZE_V6
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Ok(BTreeMap::new()); // Corrupt or empty?
     }
 
     // Read footer to get index offset (which marks end of data blocks)
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+    file.seek(SeekFrom::Start(file_len - footer_size))
         .map_err(|e| Status::internal(e.to_string()))?;
-    let mut footer = [0u8; 24];
+    let mut footer = [0u8; 8];
     file.read_exact(&mut footer)
         .map_err(|e| Status::internal(e.to_string()))?;
-    let end_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let end_offset = u64::from_le_bytes(footer);
 
     file.seek(SeekFrom::Start(HEADER_SIZE))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -1117,11 +1227,36 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_data)
         .map_err(|e| Status::internal(e.to_string()))?;
+    current_offset += 8 + bloom_len;
 
-    // Write V5 footer: index_offset + bloom_offset + magic
+    // Write key range section (V7)
+    let keyrange_offset = current_offset;
+    // Get min/max keys from memtable (BTreeMap is sorted)
+    let min_key = memtable.keys().next().map(|k| k.as_bytes()).unwrap_or(&[]);
+    let max_key = memtable
+        .keys()
+        .next_back()
+        .map(|k| k.as_bytes())
+        .unwrap_or(&[]);
+
+    // Write min_key: [len: u32][key: bytes]
+    file.write_all(&(min_key.len() as u32).to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(min_key)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write max_key: [len: u32][key: bytes]
+    file.write_all(&(max_key.len() as u32).to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(max_key)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write V7 footer: index_offset + bloom_offset + keyrange_offset + magic
     file.write_all(&index_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_offset.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&keyrange_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&FOOTER_MAGIC.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -1232,11 +1367,36 @@ pub fn write_timestamped_entries(
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_data)
         .map_err(|e| Status::internal(e.to_string()))?;
+    current_offset += 8 + bloom_len;
 
-    // Write V5 footer: index_offset + bloom_offset + magic
+    // Write key range section (V7)
+    let keyrange_offset = current_offset;
+    // Get min/max keys from entries (BTreeMap is sorted)
+    let min_key = entries.keys().next().map(|k| k.as_bytes()).unwrap_or(&[]);
+    let max_key = entries
+        .keys()
+        .next_back()
+        .map(|k| k.as_bytes())
+        .unwrap_or(&[]);
+
+    // Write min_key: [len: u32][key: bytes]
+    file.write_all(&(min_key.len() as u32).to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(min_key)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write max_key: [len: u32][key: bytes]
+    file.write_all(&(max_key.len() as u32).to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(max_key)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Write V7 footer: index_offset + bloom_offset + keyrange_offset + magic
     file.write_all(&index_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&bloom_offset.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&keyrange_offset.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     file.write_all(&FOOTER_MAGIC.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -1343,9 +1503,9 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
     }
 
     let version = u32::from_le_bytes(header[6..10].try_into().unwrap());
-    if !(5..=6).contains(&version) {
+    if !(5..=7).contains(&version) {
         return Err(Status::internal(format!(
-            "Unsupported SSTable version: {}. Only versions 5-6 are supported.",
+            "Unsupported SSTable version: {}. Only versions 5-7 are supported.",
             version
         )));
     }
@@ -1355,20 +1515,33 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
         .map_err(|e| Status::internal(e.to_string()))?
         .len();
 
-    if file_len < HEADER_SIZE + FOOTER_SIZE {
+    let footer_size = if version >= 7 {
+        FOOTER_SIZE_V7
+    } else {
+        FOOTER_SIZE_V6
+    };
+
+    if file_len < HEADER_SIZE + footer_size {
         return Err(Status::internal("SSTable file too small"));
     }
 
     // Read footer
-    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+    file.seek(SeekFrom::Start(file_len - footer_size))
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    let mut footer = [0u8; 24];
-    file.read_exact(&mut footer)
+    let mut footer = [0u8; 32];
+    let footer_bytes_to_read = footer_size as usize;
+    file.read_exact(&mut footer[..footer_bytes_to_read])
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    // bloom_offset is always at bytes 8..16
     let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-    let footer_magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+    // footer_magic is at bytes 16..24 for v6, or 24..32 for v7
+    let footer_magic = if version >= 7 {
+        u64::from_le_bytes(footer[24..32].try_into().unwrap())
+    } else {
+        u64::from_le_bytes(footer[16..24].try_into().unwrap())
+    };
 
     if footer_magic != FOOTER_MAGIC {
         return Err(Status::internal("Invalid footer magic"));
@@ -1861,14 +2034,14 @@ mod tests {
         memtable.insert("key1".to_string(), Some("value1".to_string()));
         create_from_memtable(&sst_path, &memtable).unwrap();
 
-        // Corrupt the index offset in the footer (V4 format)
-        // Footer layout: index_offset(8) + bloom_offset(8) + footer_magic(8)
-        // index_offset is at offset len - 24
+        // Corrupt the index offset in the footer (V7 format)
+        // Footer layout: index_offset(8) + bloom_offset(8) + keyrange_offset(8) + footer_magic(8)
+        // index_offset is at offset len - 32
         let mut data = std::fs::read(&sst_path).unwrap();
         let len = data.len();
-        if len > 24 {
+        if len > 32 {
             // Change the index offset to something invalid
-            data[len - 24] ^= 0xFF;
+            data[len - 32] ^= 0xFF;
         }
         std::fs::write(&sst_path, data).unwrap();
 
@@ -1976,5 +2149,47 @@ mod tests {
         };
 
         assert!(read_index.is_empty());
+    }
+
+    #[test]
+    fn test_v7_min_max_key() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_v7_minmax.data");
+
+        let mut memtable = BTreeMap::new();
+        memtable.insert("apple".to_string(), Some("red".to_string()));
+        memtable.insert("banana".to_string(), Some("yellow".to_string()));
+        memtable.insert("cherry".to_string(), Some("red".to_string()));
+        memtable.insert("date".to_string(), Some("brown".to_string()));
+
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Open with MappedSSTable and verify min/max keys
+        let sst = MappedSSTable::open(&sst_path).unwrap();
+        assert_eq!(sst.min_key(), Some(b"apple".as_ref()));
+        assert_eq!(sst.max_key(), Some(b"date".as_ref()));
+
+        // Verify key_in_range works correctly
+        assert!(sst.key_in_range(b"apple"));
+        assert!(sst.key_in_range(b"banana"));
+        assert!(sst.key_in_range(b"cherry"));
+        assert!(sst.key_in_range(b"date"));
+        assert!(sst.key_in_range(b"coconut")); // between cherry and date
+        assert!(!sst.key_in_range(b"aaaa")); // before apple
+        assert!(!sst.key_in_range(b"zebra")); // after date
+    }
+
+    #[test]
+    fn test_v7_empty_memtable_min_max_key() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_v7_empty.data");
+
+        let memtable: BTreeMap<String, Option<String>> = BTreeMap::new();
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Open with MappedSSTable - empty memtable should have empty min/max keys
+        let sst = MappedSSTable::open(&sst_path).unwrap();
+        assert_eq!(sst.min_key(), Some(b"".as_ref()));
+        assert_eq!(sst.max_key(), Some(b"".as_ref()));
     }
 }
