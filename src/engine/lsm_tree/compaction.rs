@@ -217,9 +217,17 @@ impl LeveledCompaction {
         // Calculate bytes written
         let bytes_written: u64 = output_files.iter().map(|f| f.size_bytes).sum();
 
+        // Remove duplicate paths from files_to_delete (can occur in edge cases)
+        // Use a seen set to preserve order while removing duplicates
+        let mut seen = std::collections::HashSet::new();
+        let files_to_delete: Vec<PathBuf> = all_files
+            .into_iter()
+            .filter(|p| seen.insert(p.clone()))
+            .collect();
+
         Ok(CompactionResult {
             new_files: output_files,
-            files_to_delete: all_files,
+            files_to_delete,
             bytes_read,
             bytes_written,
         })
