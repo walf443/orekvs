@@ -55,15 +55,13 @@ const L1_TARGET_SIZE_BYTES: u64 = 64 * 1024 * 1024; // 64MB
 ///
 /// - L0: Recently flushed SSTables with potentially overlapping key ranges
 /// - L1+: Non-overlapping key ranges within each level, sorted by min_key
-#[allow(dead_code)]
-pub struct LeveledSstables {
+struct LeveledSstables {
     /// SSTables organized by level. levels[0] = L0, levels[1] = L1, etc.
     /// L0: sorted by creation time (newest first)
     /// L1+: sorted by min_key (for binary search)
     levels: Vec<Vec<Arc<SstableHandle>>>,
 }
 
-#[allow(dead_code)]
 impl LeveledSstables {
     /// Create a new empty LeveledSstables structure
     fn new() -> Self {
@@ -121,6 +119,7 @@ impl LeveledSstables {
     }
 
     /// Get SSTables in L1+ that overlap with the given key range
+    #[allow(dead_code)]
     fn get_overlapping(
         &self,
         level: usize,
@@ -185,6 +184,7 @@ impl LeveledSstables {
     }
 
     /// Get the total size of a level in bytes
+    #[allow(dead_code)]
     fn level_size(&self, level: usize) -> u64 {
         if level >= self.levels.len() {
             return 0;
@@ -198,6 +198,7 @@ impl LeveledSstables {
     }
 
     /// Get the target size for a level
+    #[allow(dead_code)]
     fn level_target_size(&self, level: usize) -> u64 {
         if level == 0 {
             return 0; // L0 is controlled by file count, not size
@@ -206,11 +207,13 @@ impl LeveledSstables {
     }
 
     /// Check if L0 needs compaction (too many files)
+    #[allow(dead_code)]
     fn l0_needs_compaction(&self) -> bool {
         self.levels[0].len() >= L0_COMPACTION_THRESHOLD
     }
 
     /// Check if a level needs compaction (exceeds target size)
+    #[allow(dead_code)]
     fn level_needs_compaction(&self, level: usize) -> bool {
         if level == 0 {
             return self.l0_needs_compaction();
@@ -282,8 +285,8 @@ impl WalArchiveConfig {
 pub struct LsmTreeEngine {
     // MemTable management state
     mem_state: MemTableState,
-    // List of SSTable file handles (newest first)
-    sstables: Arc<Mutex<Vec<Arc<SstableHandle>>>>,
+    // SSTables organized by level for leveled compaction
+    leveled_sstables: Arc<Mutex<LeveledSstables>>,
     // Base directory for SSTables
     data_dir: PathBuf,
     // Counter for next SSTable file ID
@@ -308,7 +311,7 @@ impl Clone for LsmTreeEngine {
     fn clone(&self) -> Self {
         LsmTreeEngine {
             mem_state: self.mem_state.clone(),
-            sstables: Arc::clone(&self.sstables),
+            leveled_sstables: Arc::clone(&self.leveled_sstables),
             data_dir: self.data_dir.clone(),
             next_sst_id: Arc::clone(&self.next_sst_id),
             compaction_trigger_file_count: self.compaction_trigger_file_count,
@@ -494,7 +497,7 @@ impl LsmTreeEngine {
 
         LsmTreeEngine {
             mem_state,
-            sstables: Arc::new(Mutex::new(sst_handles)),
+            leveled_sstables: Arc::new(Mutex::new(LeveledSstables::from_flat_list(sst_handles))),
             data_dir,
             next_sst_id: Arc::new(AtomicU64::new(max_sst_id)),
             compaction_trigger_file_count,
@@ -541,8 +544,8 @@ impl LsmTreeEngine {
         let handle = Arc::new(SstableHandle { mmap, bloom });
 
         {
-            let mut sstables = self.sstables.lock().unwrap();
-            sstables.insert(0, handle);
+            let mut leveled = self.leveled_sstables.lock().unwrap();
+            leveled.add_to_level(0, handle);
         }
 
         self.mem_state.remove_immutable(&memtable);
@@ -566,8 +569,8 @@ impl LsmTreeEngine {
     /// Check if compaction should be triggered and run it if needed
     fn check_compaction(&self) {
         let sst_count = {
-            let sstables = self.sstables.lock().unwrap();
-            sstables.len()
+            let leveled = self.leveled_sstables.lock().unwrap();
+            leveled.total_sstable_count()
         };
 
         if sst_count >= self.compaction_trigger_file_count {
@@ -682,14 +685,17 @@ impl LsmTreeEngine {
 
     /// Get the maximum WAL ID that has been flushed to SSTables
     fn get_max_flushed_wal_id(&self) -> u64 {
-        let sstables = self.sstables.lock().unwrap();
+        let leveled = self.leveled_sstables.lock().unwrap();
         let mut max_wal_id = 0u64;
 
-        for handle in sstables.iter() {
-            if let Some(wal_id) = sstable::extract_wal_id_from_sstable(handle.mmap.path())
-                && wal_id > max_wal_id
-            {
-                max_wal_id = wal_id;
+        // Check all levels for the max WAL ID
+        for level in 0..leveled.level_count() {
+            for handle in leveled.get_level(level) {
+                if let Some(wal_id) = sstable::extract_wal_id_from_sstable(handle.mmap.path())
+                    && wal_id > max_wal_id
+                {
+                    max_wal_id = wal_id;
+                }
             }
         }
 
@@ -723,10 +729,10 @@ impl LsmTreeEngine {
     async fn run_compaction(&self) -> Result<(), Status> {
         println!("Starting compaction...");
 
-        // Get current SSTables to compact
+        // Get current SSTables to compact (flatten all levels)
         let sst_handles: Vec<Arc<SstableHandle>> = {
-            let sstables = self.sstables.lock().unwrap();
-            sstables.clone()
+            let leveled = self.leveled_sstables.lock().unwrap();
+            leveled.to_flat_list()
         };
 
         if sst_handles.len() < 2 {
@@ -787,25 +793,17 @@ impl LsmTreeEngine {
 
         let new_handle = Arc::new(SstableHandle { mmap, bloom });
 
-        // Update sstables list: remove compacted SSTables and add new one
+        // Update leveled sstables: remove compacted SSTables and add new one
         // Keep any SSTables that were added during compaction (by flush)
-        let compacted_paths: std::collections::HashSet<_> = sst_handles
-            .iter()
-            .map(|h| h.mmap.path().to_path_buf())
-            .collect();
         {
-            let mut sstables = self.sstables.lock().unwrap();
-            // Keep SSTables that were not part of this compaction
-            let mut new_list: Vec<Arc<SstableHandle>> = sstables
-                .iter()
-                .filter(|h| !compacted_paths.contains(h.mmap.path()))
-                .cloned()
-                .collect();
-            // Add the new compacted SSTable
-            new_list.push(new_handle);
-            // Sort by path (descending) to maintain newest-first order
-            new_list.sort_by(|a, b| b.mmap.path().cmp(a.mmap.path()));
-            *sstables = new_list;
+            let mut leveled = self.leveled_sstables.lock().unwrap();
+            // Remove compacted SSTables from all levels
+            for handle in &sst_handles {
+                leveled.remove(handle);
+            }
+            // Add the new compacted SSTable to L0
+            // (Future: could be placed in appropriate level based on size/keys)
+            leveled.add_to_level(0, new_handle);
         }
 
         // Delete old SSTable files after updating the list.
@@ -864,6 +862,7 @@ impl Engine for LsmTreeEngine {
     fn get(&self, key: String) -> Result<String, Status> {
         self.metrics.record_get();
 
+        // 1. Check memtable (active and immutable)
         if let Some(val_opt) = self.mem_state.get(&key) {
             return val_opt
                 .as_ref()
@@ -871,29 +870,47 @@ impl Engine for LsmTreeEngine {
                 .ok_or_else(|| Status::not_found("Key deleted"));
         }
 
-        let handles = {
-            let sstables = self.sstables.lock().unwrap();
-            sstables.clone()
-        };
-        for handle in handles {
+        let leveled = self.leveled_sstables.lock().unwrap();
+        let key_bytes = key.as_bytes();
+
+        // 2. Check L0 SSTables (scan all, newest first - they may have overlapping keys)
+        for handle in leveled.l0_sstables() {
             if !handle.bloom.contains(&key) {
-                // Bloom filter says key is definitely not in this SSTable
                 self.metrics.record_bloom_filter_hit();
                 continue;
             }
-            // Bloom filter says key might be in this SSTable, need to search
             self.metrics.record_sstable_search();
             match sstable::search_key_mmap(&handle.mmap, &key, &self.block_cache) {
                 Ok(Some(v)) => return Ok(v),
                 Ok(None) => return Err(Status::not_found("Key deleted")),
                 Err(e) if e.code() == tonic::Code::NotFound => {
-                    // Key wasn't actually in SSTable - this was a false positive
                     self.metrics.record_bloom_filter_false_positive();
                     continue;
                 }
                 Err(e) => return Err(e),
             }
         }
+
+        // 3. Check L1+ (non-overlapping, use binary search by key range)
+        for level in 1..leveled.level_count() {
+            if let Some(handle) = leveled.binary_search_level(level, key_bytes) {
+                if !handle.bloom.contains(&key) {
+                    self.metrics.record_bloom_filter_hit();
+                    continue;
+                }
+                self.metrics.record_sstable_search();
+                match sstable::search_key_mmap(&handle.mmap, &key, &self.block_cache) {
+                    Ok(Some(v)) => return Ok(v),
+                    Ok(None) => return Err(Status::not_found("Key deleted")),
+                    Err(e) if e.code() == tonic::Code::NotFound => {
+                        self.metrics.record_bloom_filter_false_positive();
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
         Err(Status::not_found("Key not found"))
     }
 
@@ -994,16 +1011,17 @@ impl Engine for LsmTreeEngine {
 
         // Second pass: check SSTables for remaining keys in parallel
         if !remaining_keys.is_empty() {
+            // Get flattened SSTable list: L0 first (newest first), then L1, L2, etc.
             let handles = {
-                let sstables = self.sstables.lock().unwrap();
-                sstables.clone()
+                let leveled = self.leveled_sstables.lock().unwrap();
+                leveled.to_flat_list()
             };
 
             // Process keys in parallel using rayon
             let sstable_results: Vec<(String, String)> = remaining_keys
                 .par_iter()
                 .filter_map(|key| {
-                    // Check each SSTable (newest first)
+                    // Check each SSTable (L0 newest first, then other levels)
                     for handle in &handles {
                         // Skip if bloom filter says key is definitely not present
                         if !handle.bloom.contains(key) {
@@ -1138,7 +1156,11 @@ mod tests {
         // (バグがあればここで100個近いSSTableが生成される)
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        let sst_count = engine.sstables.lock().unwrap().len();
+        let sst_count = engine
+            .leveled_sstables
+            .lock()
+            .unwrap()
+            .total_sstable_count();
         assert!(
             sst_count <= 1,
             "Should not flush multiple times for the same key. Count: {}",
@@ -1666,7 +1688,8 @@ mod tests {
         // Wait for all flushes to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-        let sst_handles: Vec<Arc<SstableHandle>> = engine.sstables.lock().unwrap().clone();
+        let sst_handles: Vec<Arc<SstableHandle>> =
+            engine.leveled_sstables.lock().unwrap().to_flat_list();
         println!("Created {} SSTables", sst_handles.len());
 
         // Phase 2: Compare non-mmap vs mmap reads directly on SSTable
