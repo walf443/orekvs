@@ -9,7 +9,9 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// Encode bytes to hex string
 fn hex_encode(bytes: &[u8]) -> String {
@@ -17,7 +19,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode hex string to bytes
-#[allow(dead_code)]
+#[cfg(test)]
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
@@ -71,13 +73,13 @@ impl ManifestEntry {
     }
 
     /// Get the minimum key as bytes
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn min_key(&self) -> Vec<u8> {
         hex_decode(&self.min_key_hex).unwrap_or_default()
     }
 
     /// Get the maximum key as bytes
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn max_key(&self) -> Vec<u8> {
         hex_decode(&self.max_key_hex).unwrap_or_default()
     }
@@ -173,7 +175,7 @@ impl Manifest {
     }
 
     /// Get all entries for a specific level
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn entries_for_level(&self, level: usize) -> Vec<&ManifestEntry> {
         self.entries.iter().filter(|e| e.level == level).collect()
     }
@@ -184,7 +186,7 @@ impl Manifest {
     }
 
     /// Update the level of an existing entry
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn update_level(&mut self, filename: &str, new_level: usize) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.filename == filename) {
             entry.level = new_level;
@@ -192,13 +194,13 @@ impl Manifest {
     }
 
     /// Get manifest file path
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join(MANIFEST_FILENAME)
     }
 
     /// Check if manifest exists
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn exists(data_dir: &Path) -> bool {
         Self::path(data_dir).exists()
     }

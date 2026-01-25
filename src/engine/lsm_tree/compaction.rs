@@ -20,15 +20,10 @@ pub struct CompactionConfig {
     /// Number of L0 files that triggers compaction
     pub l0_compaction_threshold: usize,
     /// Size multiplier between levels (L(n+1) = multiplier * Ln)
-    /// Used for Ln → Ln+1 compaction (future)
-    #[allow(dead_code)]
     pub level_size_multiplier: u64,
     /// Target size for L1 in bytes
-    /// Used for Ln → Ln+1 compaction (future)
-    #[allow(dead_code)]
     pub l1_target_size_bytes: u64,
-    /// Maximum number of levels
-    /// Used for Ln → Ln+1 compaction (future)
+    /// Maximum number of levels (reserved for future use)
     #[allow(dead_code)]
     pub max_levels: usize,
 }
@@ -58,7 +53,7 @@ impl CompactionConfig {
 #[derive(Debug)]
 pub struct CompactionTask {
     /// Source level (files to compact from)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Read in tests
     pub source_level: usize,
     /// Target level (files to write to)
     pub target_level: usize,
@@ -67,7 +62,7 @@ pub struct CompactionTask {
     /// SSTable files from target level that overlap with source
     pub target_files: Vec<PathBuf>,
     /// Key range of the compaction [min_key, max_key]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Read in tests
     pub key_range: (Vec<u8>, Vec<u8>),
 }
 

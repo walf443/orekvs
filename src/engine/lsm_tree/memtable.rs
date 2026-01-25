@@ -354,7 +354,6 @@ impl MemTableState {
 
     /// Benchmark: Compare BTreeMap+Mutex vs SkipList concurrent performance
     #[cfg(test)]
-    #[allow(dead_code)]
     pub fn bench_concurrent_comparison() {
         use std::sync::Mutex;
         use std::thread;

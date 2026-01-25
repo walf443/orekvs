@@ -180,7 +180,7 @@ impl BlockCache {
     }
 
     /// Reset cache statistics counters (for testing)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn reset_stats(&self) {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);

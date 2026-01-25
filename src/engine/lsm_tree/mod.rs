@@ -80,7 +80,7 @@ impl LeveledSstables {
     }
 
     /// Remove an SSTable from its level
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn remove(&mut self, handle: &Arc<SstableHandle>) {
         for level in &mut self.levels {
             if let Some(pos) = level.iter().position(|h| Arc::ptr_eq(h, handle)) {
@@ -110,7 +110,7 @@ impl LeveledSstables {
     }
 
     /// Get SSTables in L1+ that overlap with the given key range
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn get_overlapping(
         &self,
         level: usize,
@@ -170,7 +170,7 @@ impl LeveledSstables {
     }
 
     /// Get total number of SSTables across all levels
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn total_sstable_count(&self) -> usize {
         self.levels.iter().map(|l| l.len()).sum()
     }
@@ -758,7 +758,7 @@ impl LsmTreeEngine {
     }
 
     /// Reset all metrics counters (for testing)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn reset_metrics(&self) {
         self.metrics.reset();
         self.block_cache.reset_stats();

@@ -59,10 +59,8 @@ pub struct MappedSSTable {
     index_offset: u64,
     bloom_offset: u64,
     /// Minimum key in this SSTable (v7+, used for leveled compaction)
-    #[allow(dead_code)]
     min_key: Option<Vec<u8>>,
     /// Maximum key in this SSTable (v7+, used for leveled compaction)
-    #[allow(dead_code)]
     max_key: Option<Vec<u8>>,
 }
 
@@ -194,20 +192,17 @@ impl MappedSSTable {
     }
 
     /// Get the minimum key in this SSTable (v7+, used for leveled compaction)
-    #[allow(dead_code)]
     pub fn min_key(&self) -> Option<&[u8]> {
         self.min_key.as_deref()
     }
 
     /// Get the maximum key in this SSTable (v7+, used for leveled compaction)
-    #[allow(dead_code)]
     pub fn max_key(&self) -> Option<&[u8]> {
         self.max_key.as_deref()
     }
 
     /// Check if a key might be in the key range of this SSTable (used for leveled compaction)
     /// Returns true if the key is within [min_key, max_key] or if key range is not available
-    #[allow(dead_code)]
     pub fn key_in_range(&self, key: &[u8]) -> bool {
         match (&self.min_key, &self.max_key) {
             (Some(min), Some(max)) => key >= min.as_slice() && key <= max.as_slice(),
@@ -397,8 +392,8 @@ pub fn generate_filename(sst_id: u64, wal_id: u64) -> String {
 }
 
 /// Search for a key in an SSTable file
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     // If file doesn't exist (deleted by compaction), skip it
     let mut file = match File::open(path) {
@@ -557,8 +552,8 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
 
 /// Search for a key in an SSTable file with block cache support
 /// Uses binary search on parsed block entries for O(log n) lookup within blocks
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 pub fn search_key_cached(
     path: &Path,
     key: &str,
@@ -674,8 +669,8 @@ fn get_or_load_parsed_block_mmap(
 }
 
 /// Get index from cache or load from file
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn get_or_load_index(
     path: &Path,
     canonical_path: &Path,
@@ -750,8 +745,8 @@ fn get_or_load_index(
 
 /// Get parsed block from cache or load and parse from file
 /// Returns parsed entries sorted by key for binary search
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn get_or_load_parsed_block(
     path: &Path,
     canonical_path: &Path,
@@ -872,8 +867,8 @@ fn search_in_parsed_block(
 }
 
 /// Read only keys from an SSTable file
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -1482,8 +1477,8 @@ pub fn generate_path(data_dir: &Path, sst_id: u64, wal_id: u64) -> PathBuf {
 }
 
 /// Read Bloom filter from SSTable file
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
     let mut file = match File::open(path) {
         Ok(f) => f,
@@ -1566,8 +1561,8 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
         .ok_or_else(|| Status::internal("Failed to deserialize Bloom filter"))
 }
 
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn write_index_compressed(
     file: &mut File,
     index: &[(String, u64)],
@@ -1620,8 +1615,8 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 /// - For each entry (unified format):
 ///   - prefix_len (u16) + suffix_len (u16) + suffix + offset (u64)
 ///   - Restart points have prefix_len = 0, suffix = full key
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn write_index_prefix_compressed(
     file: &mut File,
     index: &[(String, u64)],
@@ -1743,8 +1738,8 @@ fn write_index_prefix_compressed_v6(
 
 /// Read index with prefix compression (V5 format)
 /// Unified format: every entry uses prefix_len (u16) + suffix_len (u16) + suffix
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)]
 fn read_index_prefix_compressed(
     file: &mut File,
     index_offset: u64,

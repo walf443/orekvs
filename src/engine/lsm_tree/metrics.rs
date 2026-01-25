@@ -149,7 +149,7 @@ impl EngineMetrics {
     }
 
     /// Reset all metrics (for testing)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn reset(&self) {
         self.get_count.store(0, Ordering::Relaxed);
         self.set_count.store(0, Ordering::Relaxed);

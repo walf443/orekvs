@@ -54,7 +54,7 @@ impl MappedFile {
 
     /// Returns true if the mapped region is empty.
     #[inline]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
