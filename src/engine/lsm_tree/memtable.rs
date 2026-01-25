@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use crossbeam_skiplist::SkipMap;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,8 +26,9 @@ pub fn skip_to_btree(skip: &SkipMemTable) -> MemTable {
 
 #[derive(Debug)]
 pub struct MemTableState {
-    /// Current in-memory write buffer (lock-free SkipList)
-    pub active_memtable: Arc<SkipMemTable>,
+    /// Current in-memory write buffer (lock-free SkipList with atomic swap)
+    /// Uses ArcSwap for lock-free atomic replacement during flush
+    pub active_memtable: ArcSwap<SkipMemTable>,
     /// MemTables currently being flushed to disk (converted to BTreeMap for ordered iteration)
     pub immutable_memtables: Arc<std::sync::Mutex<Vec<Arc<MemTable>>>>,
     /// Max size for MemTable in bytes
@@ -38,7 +40,7 @@ pub struct MemTableState {
 impl Clone for MemTableState {
     fn clone(&self) -> Self {
         MemTableState {
-            active_memtable: Arc::clone(&self.active_memtable),
+            active_memtable: ArcSwap::new(self.active_memtable.load_full()),
             immutable_memtables: Arc::clone(&self.immutable_memtables),
             capacity_bytes: self.capacity_bytes,
             current_size: Arc::clone(&self.current_size),
@@ -55,7 +57,7 @@ impl MemTableState {
         }
 
         MemTableState {
-            active_memtable: Arc::new(skip_map),
+            active_memtable: ArcSwap::new(Arc::new(skip_map)),
             immutable_memtables: Arc::new(std::sync::Mutex::new(Vec::new())),
             capacity_bytes,
             current_size: Arc::new(AtomicU64::new(recovered_size)),
@@ -66,8 +68,11 @@ impl MemTableState {
     pub fn insert(&self, key: String, value: Option<String>) {
         let entry_size = estimate_entry_size(&key, &value);
 
+        // Load current active memtable
+        let active = self.active_memtable.load();
+
         // Check if key already exists to adjust size tracking
-        if let Some(existing) = self.active_memtable.get(&key) {
+        if let Some(existing) = active.get(&key) {
             let old_size = estimate_entry_size(&key, existing.value());
             if entry_size > old_size {
                 self.current_size
@@ -80,22 +85,26 @@ impl MemTableState {
             self.current_size.fetch_add(entry_size, Ordering::SeqCst);
         }
 
-        self.active_memtable.insert(key, value);
+        active.insert(key, value);
     }
 
-    /// Check if flush is needed and return immutable memtable if so
-    /// Note: This operation requires replacing the active memtable, which is not lock-free
+    /// Check if flush is needed and return immutable memtable if so.
+    /// Uses atomic swap to ensure no writes are lost during the transition.
     pub fn needs_flush(&self) -> Option<Arc<MemTable>> {
         let size = self.current_size.load(Ordering::SeqCst);
         if size >= self.capacity_bytes {
-            // Convert current SkipMap to BTreeMap and create new empty SkipMap
-            // This is the only point where we need synchronization
-            let btree = skip_to_btree(&self.active_memtable);
+            // Create a new empty SkipMap
+            let new_memtable = Arc::new(SkipMap::new());
 
-            // Clear the skipmap (this is safe because readers will see empty or partial state
-            // but we're about to replace it anyway)
-            self.active_memtable.clear();
+            // Atomically swap the old memtable with the new one
+            // This ensures all writers after this point write to the new memtable
+            let old_memtable = self.active_memtable.swap(new_memtable);
+
+            // Reset size counter (new memtable is empty)
             self.current_size.store(0, Ordering::SeqCst);
+
+            // Convert the old SkipMap to BTreeMap for SSTable creation
+            let btree = skip_to_btree(&old_memtable);
 
             let immutable = Arc::new(btree);
             let mut immutables = self.immutable_memtables.lock().unwrap();
@@ -114,7 +123,8 @@ impl MemTableState {
     /// Get a value from MemTable (lock-free for active memtable)
     pub fn get(&self, key: &str) -> Option<Option<String>> {
         // Check active memtable (lock-free)
-        if let Some(entry) = self.active_memtable.get(key) {
+        let active = self.active_memtable.load();
+        if let Some(entry) = active.get(key) {
             return Some(entry.value().clone());
         }
 
@@ -214,7 +224,7 @@ mod tests {
         assert!(immutable.is_some());
 
         // Active memtable should be empty now
-        assert!(state.active_memtable.is_empty());
+        assert!(state.active_memtable.load().is_empty());
         assert_eq!(state.current_size.load(Ordering::SeqCst), 0);
 
         // Immutable memtables should have one entry
@@ -231,14 +241,12 @@ mod tests {
         // 1. Insert k1=v1
         state.insert("k1".to_string(), Some("v1".to_string()));
 
-        // 2. Force flush to immutable
-        {
-            let btree = skip_to_btree(&state.active_memtable);
-            state.active_memtable.clear();
-            state.current_size.store(0, Ordering::SeqCst);
-            let immutable1 = Arc::new(btree);
-            state.immutable_memtables.lock().unwrap().push(immutable1);
-        }
+        // 2. Force flush to immutable using atomic swap
+        let old = state.active_memtable.swap(Arc::new(SkipMap::new()));
+        state.current_size.store(0, Ordering::SeqCst);
+        let btree = skip_to_btree(&old);
+        let immutable1 = Arc::new(btree);
+        state.immutable_memtables.lock().unwrap().push(immutable1);
 
         // 3. Insert k1=v2 in active
         state.insert("k1".to_string(), Some("v2".to_string()));
@@ -247,13 +255,11 @@ mod tests {
         assert_eq!(state.get("k1"), Some(Some("v2".to_string())));
 
         // 4. Force another flush
-        {
-            let btree = skip_to_btree(&state.active_memtable);
-            state.active_memtable.clear();
-            state.current_size.store(0, Ordering::SeqCst);
-            let immutable2 = Arc::new(btree);
-            state.immutable_memtables.lock().unwrap().push(immutable2);
-        }
+        let old = state.active_memtable.swap(Arc::new(SkipMap::new()));
+        state.current_size.store(0, Ordering::SeqCst);
+        let btree = skip_to_btree(&old);
+        let immutable2 = Arc::new(btree);
+        state.immutable_memtables.lock().unwrap().push(immutable2);
 
         // 5. Insert k1=v3 in active
         state.insert("k1".to_string(), Some("v3".to_string()));
@@ -262,7 +268,7 @@ mod tests {
         assert_eq!(state.get("k1"), Some(Some("v3".to_string())));
 
         // 6. Clear active, should get v2 from newest immutable (immutable2)
-        state.active_memtable.clear();
+        state.active_memtable.swap(Arc::new(SkipMap::new()));
         assert_eq!(state.get("k1"), Some(Some("v2".to_string())));
     }
 
@@ -335,15 +341,67 @@ mod tests {
         assert!(state.get("key_0_0").is_some());
         assert!(state.get("key_3_999").is_some());
     }
+
+    /// Test atomic swap doesn't lose writes during flush
+    #[test]
+    fn test_atomic_swap_no_data_loss() {
+        use std::thread;
+
+        let state = Arc::new(MemTableState::new(u64::MAX, BTreeMap::new(), 0)); // Large capacity to prevent auto-flush
+
+        // Writer thread that continuously writes
+        let state_writer = Arc::clone(&state);
+        let writer = thread::spawn(move || {
+            for i in 0..10000 {
+                let key = format!("key_{}", i);
+                let value = format!("value_{}", i);
+                state_writer.insert(key, Some(value));
+            }
+        });
+
+        // Flusher thread that does multiple swaps
+        let state_flusher = Arc::clone(&state);
+        let flusher = thread::spawn(move || {
+            let mut all_immutables = Vec::new();
+            for _ in 0..10 {
+                thread::sleep(std::time::Duration::from_micros(100));
+                let old = state_flusher.active_memtable.swap(Arc::new(SkipMap::new()));
+                let btree = skip_to_btree(&old);
+                all_immutables.push(btree);
+            }
+            all_immutables
+        });
+
+        writer.join().unwrap();
+        let immutables = flusher.join().unwrap();
+
+        // Collect all keys from active and immutables
+        let active = state.active_memtable.load();
+        let mut all_keys: std::collections::HashSet<String> =
+            active.iter().map(|e| e.key().clone()).collect();
+
+        for imm in &immutables {
+            for key in imm.keys() {
+                all_keys.insert(key.clone());
+            }
+        }
+
+        // All 10000 keys should be present (no data loss)
+        assert_eq!(
+            all_keys.len(),
+            10000,
+            "Some keys were lost during atomic swap"
+        );
+    }
 }
 
 impl MemTableState {
     // Helper for testing to force a flush regardless of size
     #[cfg(test)]
     fn needs_flush_manual(&self) -> Arc<MemTable> {
-        let btree = skip_to_btree(&self.active_memtable);
-        self.active_memtable.clear();
+        let old = self.active_memtable.swap(Arc::new(SkipMap::new()));
         self.current_size.store(0, Ordering::SeqCst);
+        let btree = skip_to_btree(&old);
         let immutable = Arc::new(btree);
         self.immutable_memtables
             .lock()

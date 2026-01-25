@@ -18,6 +18,7 @@ tokio-stream = "0.1"
 tonic = "0.12"
 prost = "0.13"
 zstd = "0.13.3"
+arc-swap = "1.8.0"
 
 [dev-dependencies]
 tempfile = "3.10"
