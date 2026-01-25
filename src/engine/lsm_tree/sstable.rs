@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
@@ -64,6 +64,8 @@ pub struct MappedSSTable {
     max_key: Option<Vec<u8>>,
     /// Number of entries in this SSTable (v8+, used for approximate count/rank)
     entry_count: Option<u64>,
+    /// Cached decompressed index (lazy loaded on first access)
+    cached_index: OnceLock<Vec<(String, u64)>>,
 }
 
 impl MappedSSTable {
@@ -194,6 +196,7 @@ impl MappedSSTable {
             min_key,
             max_key,
             entry_count,
+            cached_index: OnceLock::new(),
         })
     }
 
@@ -233,9 +236,43 @@ impl MappedSSTable {
         }
     }
 
-    /// Read and decompress the index
+    /// Read index with caching (returns reference to cached data)
+    ///
+    /// The index is decompressed and parsed on first access, then cached
+    /// for subsequent lookups. This avoids repeated decompression overhead.
     #[allow(clippy::result_large_err)]
-    pub fn read_index(&self) -> Result<Vec<(String, u64)>, Status> {
+    pub fn read_index(&self) -> Result<&[(String, u64)], Status> {
+        // Fast path: already cached
+        if let Some(cached) = self.cached_index.get() {
+            return Ok(cached.as_slice());
+        }
+
+        // Slow path: decompress and cache
+        let index = self.decompress_index()?;
+        // Try to set the cache (ignore if another thread beat us)
+        let _ = self.cached_index.set(index);
+        // Return from cache (guaranteed to be set now)
+        Ok(self.cached_index.get().unwrap().as_slice())
+    }
+
+    /// Read index without caching (returns owned data)
+    ///
+    /// Use this when you need ownership of the index data.
+    #[allow(clippy::result_large_err)]
+    pub fn read_index_owned(&self) -> Result<Vec<(String, u64)>, Status> {
+        // If already cached, clone from cache
+        if let Some(cached) = self.cached_index.get() {
+            return Ok(cached.clone());
+        }
+        // Decompress and cache
+        let index = self.decompress_index()?;
+        let _ = self.cached_index.set(index);
+        Ok(self.cached_index.get().unwrap().clone())
+    }
+
+    /// Internal: decompress and parse index from disk
+    #[allow(clippy::result_large_err)]
+    fn decompress_index(&self) -> Result<Vec<(String, u64)>, Status> {
         let offset = self.index_offset as usize;
 
         // Read compressed size
@@ -653,8 +690,8 @@ fn get_or_load_index_mmap(
         return Ok(index);
     }
 
-    // Load from mmap
-    let index = sst.read_index()?;
+    // Load from mmap (use owned version for Arc wrapping)
+    let index = sst.read_index_owned()?;
     let arc_index = Arc::new(index);
 
     // Cache it
