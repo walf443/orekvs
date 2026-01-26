@@ -182,257 +182,74 @@ impl WalRecord {
     }
 }
 
-/// WAL writer for B-tree operations
-pub struct BTreeWalWriter {
-    /// WAL file path
-    path: PathBuf,
-    /// Buffered writer
-    writer: Mutex<Option<BufWriter<File>>>,
-    /// Sequence number generator
-    seq_gen: SeqGenerator,
-    /// Current batch sequence (0 if not in batch)
-    batch_seq: AtomicU64,
+// ============================================================================
+// WAL Reading Functions
+// ============================================================================
+
+/// Read all records from a WAL file (v4 block-based format)
+pub fn read_wal_records<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalRecord>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Read and validate header using common function
+    let version = read_wal_header(&mut reader)?;
+
+    if version != WAL_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Unsupported WAL version: {} (expected {})",
+                version, WAL_FORMAT_VERSION
+            ),
+        ));
+    }
+
+    read_wal_records_v4(&mut reader)
 }
 
-impl BTreeWalWriter {
-    /// Create or open WAL file
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let file_exists = path.exists();
+/// Read records in v4 format (block-based, compatible with LSM-Tree)
+fn read_wal_records_v4<R: Read>(reader: &mut R) -> io::Result<Vec<WalRecord>> {
+    let mut records = Vec::new();
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-
-        let mut writer = BufWriter::new(file);
-
-        let max_seq = if file_exists {
-            // Read existing WAL to find last sequence
-            let mut max_seq = 0u64;
-            if let Ok(records) = Self::read_records_internal(&path) {
-                for record in records {
-                    max_seq = max_seq.max(record.seq);
-                }
-            }
-            // Seek to end for appending
-            writer.seek(SeekFrom::End(0))?;
-            max_seq
-        } else {
-            // Write header using common format (v4)
-            write_wal_header(&mut writer, WAL_FORMAT_VERSION)?;
-            writer.flush()?;
-            0
-        };
-
-        Ok(Self {
-            path,
-            writer: Mutex::new(Some(writer)),
-            seq_gen: SeqGenerator::new(max_seq),
-            batch_seq: AtomicU64::new(0),
-        })
-    }
-
-    /// Get WAL path
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Get next sequence number
-    pub fn next_seq(&self) -> u64 {
-        self.seq_gen.current()
-    }
-
-    /// Append a record and sync to disk (v4 block format)
-    fn append_record(&self, record: &WalRecord, sync: bool) -> io::Result<u64> {
-        let mut guard = self.writer.lock().unwrap();
-        let writer = guard
-            .as_mut()
-            .ok_or_else(|| io::Error::other("WAL writer closed"))?;
-
-        // Serialize record using v4 format (no per-record checksum)
-        let mut buf = Vec::new();
-        record.serialize(&mut buf);
-
-        // Write as a block (checksum is in the block)
-        write_block(writer, &buf, false)?;
-        writer.flush()?;
-
-        if sync {
-            // fdatasync - sync data to disk (not metadata)
-            writer.get_ref().sync_data()?;
-        }
-
-        Ok(record.seq)
-    }
-
-    /// Log an insert operation (syncs to disk for durability)
-    pub fn log_insert(&self, key: &str, value: &str) -> io::Result<u64> {
-        let seq = self.seq_gen.allocate();
-        let record = WalRecord::insert(seq, key.to_string(), value.to_string());
-        // Sync immediately for durability (not in batch mode)
-        let sync = !self.in_batch();
-        self.append_record(&record, sync)
-    }
-
-    /// Log a delete operation (syncs to disk for durability)
-    pub fn log_delete(&self, key: &str) -> io::Result<u64> {
-        let seq = self.seq_gen.allocate();
-        let record = WalRecord::delete(seq, key.to_string());
-        // Sync immediately for durability (not in batch mode)
-        let sync = !self.in_batch();
-        self.append_record(&record, sync)
-    }
-
-    /// Log a checkpoint
-    pub fn log_checkpoint(&self) -> io::Result<u64> {
-        let seq = self.seq_gen.allocate();
-        let record = WalRecord::checkpoint(seq);
-        self.append_record(&record, true) // Always sync checkpoint
-    }
-
-    /// Begin a batch operation
-    pub fn begin_batch(&self) -> io::Result<u64> {
-        let seq = self.seq_gen.allocate();
-        self.batch_seq.store(seq, Ordering::SeqCst);
-        let record = WalRecord::begin_batch(seq);
-        self.append_record(&record, false) // Don't sync yet
-    }
-
-    /// End a batch operation (syncs to disk)
-    pub fn end_batch(&self) -> io::Result<u64> {
-        let seq = self.seq_gen.allocate();
-        self.batch_seq.store(0, Ordering::SeqCst);
-        let record = WalRecord::end_batch(seq);
-        self.append_record(&record, true) // Sync at end of batch
-    }
-
-    /// Check if currently in a batch
-    pub fn in_batch(&self) -> bool {
-        self.batch_seq.load(Ordering::SeqCst) != 0
-    }
-
-    /// Sync WAL to disk
-    pub fn sync(&self) -> io::Result<()> {
-        let mut guard = self.writer.lock().unwrap();
-        if let Some(writer) = guard.as_mut() {
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
-        }
-        Ok(())
-    }
-
-    /// Read all records from WAL file (v4 block-based format)
-    fn read_records_internal<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalRecord>> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        // Read and validate header using common function
-        let version = read_wal_header(&mut reader)?;
-
-        if version != WAL_FORMAT_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Unsupported WAL version: {} (expected {})",
-                    version, WAL_FORMAT_VERSION
-                ),
-            ));
-        }
-
-        Self::read_records_v4(&mut reader)
-    }
-
-    /// Read records in v4 format (block-based, compatible with LSM-Tree)
-    fn read_records_v4<R: Read>(reader: &mut R) -> io::Result<Vec<WalRecord>> {
-        let mut records = Vec::new();
-
-        loop {
-            match read_block(reader) {
-                Ok(Some(block_data)) => {
-                    // Parse records from block
-                    let mut offset = 0;
-                    while offset < block_data.len() {
-                        match WalRecord::deserialize(&block_data[offset..]) {
-                            Ok((record, size)) => {
-                                records.push(record);
-                                offset += size;
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                                break;
-                            }
-                            Err(e) => {
-                                eprintln!("WAL record parse error: {}. Stopping recovery.", e);
-                                return Ok(records);
-                            }
+    loop {
+        match read_block(reader) {
+            Ok(Some(block_data)) => {
+                // Parse records from block
+                let mut offset = 0;
+                while offset < block_data.len() {
+                    match WalRecord::deserialize(&block_data[offset..]) {
+                        Ok((record, size)) => {
+                            records.push(record);
+                            offset += size;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("WAL record parse error: {}. Stopping recovery.", e);
+                            return Ok(records);
                         }
                     }
                 }
-                Ok(None) => {
-                    // End of file
-                    break;
-                }
-                Err(e) => {
-                    // Block read error - stop recovery
-                    eprintln!("WAL block read error: {}. Stopping recovery.", e);
-                    break;
-                }
+            }
+            Ok(None) => {
+                // End of file
+                break;
+            }
+            Err(e) => {
+                // Block read error - stop recovery
+                eprintln!("WAL block read error: {}. Stopping recovery.", e);
+                break;
             }
         }
-
-        Ok(records)
     }
 
-    /// Read all records from this WAL
-    pub fn read_records(&self) -> io::Result<Vec<WalRecord>> {
-        Self::read_records_internal(&self.path)
-    }
-
-    /// Truncate WAL after checkpoint
-    pub fn truncate_after_checkpoint(&self) -> io::Result<()> {
-        // Close current writer
-        {
-            let mut guard = self.writer.lock().unwrap();
-            *guard = None;
-        }
-
-        // Rewrite WAL with just header using common format (v4)
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-
-        let mut writer = BufWriter::new(file);
-        write_wal_header(&mut writer, WAL_FORMAT_VERSION)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-
-        // Reopen for appending
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        let writer = BufWriter::new(file);
-
-        {
-            let mut guard = self.writer.lock().unwrap();
-            *guard = Some(writer);
-        }
-
-        Ok(())
-    }
-
-    /// Close the WAL writer
-    pub fn close(&self) -> io::Result<()> {
-        self.sync()?;
-        let mut guard = self.writer.lock().unwrap();
-        *guard = None;
-        Ok(())
-    }
+    Ok(records)
 }
 
 /// Read WAL records for recovery (from last checkpoint)
 pub fn recover_from_wal<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalRecord>> {
-    let all_records = BTreeWalWriter::read_records_internal(path)?;
+    let all_records = read_wal_records(path)?;
 
     // Find last checkpoint
     let checkpoint_idx = all_records
@@ -596,7 +413,7 @@ impl GroupCommitWalWriter {
         let max_seq = if file_exists {
             // Read existing WAL to find last sequence
             let mut max_seq = initial_seq;
-            if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
+            if let Ok(records) = read_wal_records(&path) {
                 for record in records {
                     max_seq = max_seq.max(record.seq);
                 }
@@ -662,7 +479,7 @@ impl GroupCommitWalWriter {
 
                     // Read records to find max sequence
                     let path = entry.path();
-                    if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
+                    if let Ok(records) = read_wal_records(&path) {
                         for record in records {
                             max_seq = max_seq.max(record.seq);
                         }
@@ -881,7 +698,7 @@ impl GroupCommitWalWriter {
     /// Read all records from the current WAL file
     pub fn read_records(&self) -> io::Result<Vec<WalRecord>> {
         let path = self.path();
-        BTreeWalWriter::read_records_internal(&path)
+        read_wal_records(&path)
     }
 
     /// Read all records from all WAL files in the data directory
@@ -906,7 +723,7 @@ impl GroupCommitWalWriter {
 
         // Read records from each WAL file in order
         for (_, path) in wal_files {
-            if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
+            if let Ok(records) = read_wal_records(&path) {
                 all_records.extend(records);
             }
         }
@@ -1092,17 +909,13 @@ mod tests {
     #[test]
     fn test_wal_write_read() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("test.wal");
+        let config = GroupCommitConfig::default();
 
-        {
-            let wal = BTreeWalWriter::open(&path).unwrap();
-            wal.log_insert("key1", "value1").unwrap();
-            wal.log_insert("key2", "value2").unwrap();
-            wal.log_delete("key1").unwrap();
-            wal.sync().unwrap();
-        }
+        let wal = GroupCommitWalWriter::open(dir.path(), config).unwrap();
+        wal.log_insert("key1", "value1").unwrap();
+        wal.log_insert("key2", "value2").unwrap();
+        wal.log_delete("key1").unwrap();
 
-        let wal = BTreeWalWriter::open(&path).unwrap();
         let records = wal.read_records().unwrap();
 
         assert_eq!(records.len(), 3);
@@ -1112,22 +925,25 @@ mod tests {
         assert_eq!(records[1].key, "key2");
         assert_eq!(records[2].record_type, RecordType::Delete);
         assert_eq!(records[2].key, "key1");
+
+        wal.close().unwrap();
     }
 
     #[test]
     fn test_wal_checkpoint() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("test.wal");
+        let config = GroupCommitConfig::default();
 
         {
-            let wal = BTreeWalWriter::open(&path).unwrap();
+            let wal = GroupCommitWalWriter::open(dir.path(), config).unwrap();
             wal.log_insert("key1", "value1").unwrap();
             wal.log_checkpoint().unwrap();
             wal.log_insert("key2", "value2").unwrap();
-            wal.sync().unwrap();
+            wal.close().unwrap();
         }
 
-        let records = recover_from_wal(&path).unwrap();
+        let wal_path = dir.path().join("wal_00000.log");
+        let records = recover_from_wal(&wal_path).unwrap();
 
         // Should only have records after checkpoint
         assert_eq!(records.len(), 1);
@@ -1135,40 +951,22 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_batch() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("test.wal");
-
-        {
-            let wal = BTreeWalWriter::open(&path).unwrap();
-            wal.begin_batch().unwrap();
-            wal.log_insert("key1", "value1").unwrap();
-            wal.log_insert("key2", "value2").unwrap();
-            wal.end_batch().unwrap();
-            wal.sync().unwrap();
-        }
-
-        let wal = BTreeWalWriter::open(&path).unwrap();
-        let records = wal.read_records().unwrap();
-
-        assert_eq!(records.len(), 4); // begin + 2 inserts + end
-    }
-
-    #[test]
     fn test_wal_truncate() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("test.wal");
+        let config = GroupCommitConfig::default();
 
         {
-            let wal = BTreeWalWriter::open(&path).unwrap();
+            let wal = GroupCommitWalWriter::open(dir.path(), config).unwrap();
             wal.log_insert("key1", "value1").unwrap();
             wal.log_checkpoint().unwrap();
             wal.truncate_after_checkpoint().unwrap();
+            wal.close().unwrap();
         }
 
-        let wal = BTreeWalWriter::open(&path).unwrap();
+        let wal = GroupCommitWalWriter::open(dir.path(), config).unwrap();
         let records = wal.read_records().unwrap();
 
         assert!(records.is_empty());
+        wal.close().unwrap();
     }
 }
