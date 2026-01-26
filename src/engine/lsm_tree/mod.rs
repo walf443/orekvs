@@ -217,38 +217,10 @@ impl Default for LeveledSstables {
     }
 }
 
-/// Configuration for WAL archiving
-#[derive(Clone)]
-pub struct WalArchiveConfig {
-    /// Retention period in seconds (None = keep forever)
-    pub retention_secs: Option<u64>,
-    /// Maximum total WAL size in bytes (None = no limit)
-    pub max_size_bytes: Option<u64>,
-}
-
-/// Default WAL retention period: 7 days
-pub const DEFAULT_WAL_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
-/// Default maximum WAL size: 1GB
-pub const DEFAULT_WAL_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-
-impl Default for WalArchiveConfig {
-    fn default() -> Self {
-        Self {
-            retention_secs: Some(DEFAULT_WAL_RETENTION_SECS),
-            max_size_bytes: Some(DEFAULT_WAL_MAX_SIZE_BYTES),
-        }
-    }
-}
-
-impl WalArchiveConfig {
-    /// Create a config that disables WAL archiving (keep all WAL files)
-    pub fn disabled() -> Self {
-        Self {
-            retention_secs: None,
-            max_size_bytes: None,
-        }
-    }
-}
+// Re-export WalArchiveConfig and constants from common wal module
+pub use crate::engine::wal::{
+    DEFAULT_WAL_MAX_SIZE_BYTES, DEFAULT_WAL_RETENTION_SECS, WalArchiveConfig,
+};
 
 pub struct LsmTreeEngine {
     // MemTable management state
