@@ -23,7 +23,7 @@ use self::freelist::Freelist;
 use self::node::{InternalNode, LeafEntry, LeafNode};
 use self::page::MetaPage;
 use self::page_manager::PageManager;
-use self::wal::{GroupCommitWalWriter, RecordType, recover_from_wal};
+use self::wal::{GroupCommitWalWriter, RecordType};
 use crate::engine::Engine;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,7 +108,13 @@ impl BTreeEngine {
         }
 
         let db_path = data_dir.join("btree.db");
-        let wal_path = data_dir.join("btree.wal");
+        let wal_dir = data_dir.join("wal");
+
+        // Create WAL directory if it doesn't exist
+        if !wal_dir.exists() {
+            std::fs::create_dir_all(&wal_dir)
+                .map_err(|e| Status::internal(format!("Failed to create WAL directory: {}", e)))?;
+        }
 
         // Open page manager
         let page_manager = PageManager::open(&db_path)
@@ -141,7 +147,7 @@ impl BTreeEngine {
         // Open WAL if enabled (with group commit)
         let wal = if config.enable_wal {
             Some(
-                GroupCommitWalWriter::open(&wal_path, config.wal_batch_interval_micros)
+                GroupCommitWalWriter::open(&wal_dir, config.wal_batch_interval_micros)
                     .map_err(|e| Status::internal(format!("Failed to open WAL: {}", e)))?,
             )
         } else {
@@ -174,11 +180,7 @@ impl BTreeEngine {
     /// Only replays records with sequence number > last_wal_seq stored in meta page.
     /// This allows incremental recovery instead of full WAL replay.
     fn recover(&mut self) -> Result<(), Status> {
-        let wal_path = self.data_dir.join("btree.wal");
-
-        if !wal_path.exists() {
-            return Ok(());
-        }
+        let wal = self.wal.as_ref().expect("WAL must be present for recovery");
 
         // Get the last persisted WAL sequence from meta page
         let last_persisted_seq = {
@@ -186,7 +188,8 @@ impl BTreeEngine {
             meta.last_wal_seq
         };
 
-        let records = recover_from_wal(&wal_path)
+        let records = wal
+            .read_all_records()
             .map_err(|e| Status::internal(format!("Failed to read WAL: {}", e)))?;
 
         // Filter records to only replay those after the last persisted sequence

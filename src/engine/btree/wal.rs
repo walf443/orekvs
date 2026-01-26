@@ -562,6 +562,7 @@ pub fn delete_wal<P: AsRef<Path>>(path: P) -> io::Result<()> {
 // Group Commit WAL Writer
 // ============================================================================
 
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -572,29 +573,78 @@ struct WriteRequest {
     response_tx: mpsc::Sender<io::Result<u64>>,
 }
 
-/// Group commit WAL writer that batches multiple writes before sync
-pub struct GroupCommitWalWriter {
-    /// Channel to send write requests to background flusher
-    request_tx: mpsc::Sender<WriteRequest>,
-    /// Sequence number generator
-    seq_gen: SeqGenerator,
-    /// WAL file path
+/// Inner state for WAL writer (protected by mutex)
+struct WalWriterInner {
+    writer: BufWriter<File>,
     path: PathBuf,
-    /// Shared writer (for truncate operations)
-    writer: std::sync::Arc<Mutex<BufWriter<File>>>,
+}
+
+/// Group commit WAL writer that batches multiple writes before sync
+///
+/// Supports WAL rotation and is Clone-able for sharing across threads.
+pub struct GroupCommitWalWriter {
+    /// Channel to send write requests to background flusher (shared across clones)
+    request_tx: Arc<Mutex<Option<mpsc::Sender<WriteRequest>>>>,
+    /// Sequence number generator
+    seq_gen: Arc<SeqGenerator>,
+    /// Current WAL ID
+    current_id: Arc<AtomicU64>,
+    /// Data directory for WAL files
+    data_dir: PathBuf,
+    /// Shared writer state
+    inner: Arc<Mutex<WalWriterInner>>,
+    /// Batch interval in microseconds
+    batch_interval_micros: u64,
     /// Handle to the background flusher thread
-    flusher_handle: Mutex<Option<JoinHandle<()>>>,
+    flusher_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Flag to signal shutdown
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Clone for GroupCommitWalWriter {
+    fn clone(&self) -> Self {
+        Self {
+            request_tx: Arc::clone(&self.request_tx),
+            seq_gen: Arc::clone(&self.seq_gen),
+            current_id: Arc::clone(&self.current_id),
+            data_dir: self.data_dir.clone(),
+            inner: Arc::clone(&self.inner),
+            batch_interval_micros: self.batch_interval_micros,
+            flusher_handle: Arc::clone(&self.flusher_handle),
+            shutdown: Arc::clone(&self.shutdown),
+        }
+    }
 }
 
 impl GroupCommitWalWriter {
-    /// Create or open a group commit WAL file
+    /// Generate WAL file path for a given ID
+    fn wal_path(data_dir: &Path, wal_id: u64) -> PathBuf {
+        data_dir.join(format!("wal_{:05}.log", wal_id))
+    }
+
+    /// Create or open a group commit WAL in a directory
     ///
     /// `batch_interval_micros` controls how long to wait for batching writes.
     /// Higher values increase throughput but also increase latency.
-    pub fn open<P: AsRef<Path>>(path: P, batch_interval_micros: u64) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
+    ///
+    /// This will scan for existing WAL files and resume from the latest one.
+    pub fn open<P: AsRef<Path>>(data_dir: P, batch_interval_micros: u64) -> io::Result<Self> {
+        let data_dir = data_dir.as_ref().to_path_buf();
+
+        // Scan for existing WAL files
+        let (wal_id, max_seq) = Self::scan_existing_wals(&data_dir)?;
+
+        Self::open_with_id(&data_dir, wal_id, batch_interval_micros, max_seq)
+    }
+
+    /// Create a new WAL with a specific ID and initial sequence number
+    pub fn open_with_id(
+        data_dir: &Path,
+        wal_id: u64,
+        batch_interval_micros: u64,
+        initial_seq: u64,
+    ) -> io::Result<Self> {
+        let path = Self::wal_path(data_dir, wal_id);
         let file_exists = path.exists();
 
         let file = OpenOptions::new()
@@ -608,7 +658,7 @@ impl GroupCommitWalWriter {
 
         let max_seq = if file_exists {
             // Read existing WAL to find last sequence
-            let mut max_seq = 0u64;
+            let mut max_seq = initial_seq;
             if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
                 for record in records {
                     max_seq = max_seq.max(record.seq);
@@ -622,43 +672,128 @@ impl GroupCommitWalWriter {
             let header = WalHeader::new();
             writer.write_all(&header.serialize())?;
             writer.flush()?;
-            0
+            initial_seq
         };
 
-        let (request_tx, request_rx) = mpsc::channel::<WriteRequest>();
-        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
+        let inner = Arc::new(Mutex::new(WalWriterInner {
+            writer,
+            path: path.clone(),
+        }));
 
-        let writer = Mutex::new(writer);
-        let writer = std::sync::Arc::new(writer);
-        let writer_clone = writer.clone();
+        let (request_tx, request_rx) = mpsc::channel::<WriteRequest>();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let inner_clone = inner.clone();
 
         // Start background flusher thread
         let handle = thread::spawn(move || {
             Self::background_flusher(
                 request_rx,
-                writer_clone,
+                inner_clone,
                 batch_interval_micros,
                 shutdown_clone,
             );
         });
 
         Ok(Self {
-            request_tx,
-            seq_gen: SeqGenerator::new(max_seq),
-            path,
-            writer,
-            flusher_handle: Mutex::new(Some(handle)),
+            request_tx: Arc::new(Mutex::new(Some(request_tx))),
+            seq_gen: Arc::new(SeqGenerator::new(max_seq)),
+            current_id: Arc::new(AtomicU64::new(wal_id)),
+            data_dir: data_dir.to_path_buf(),
+            inner,
+            batch_interval_micros,
+            flusher_handle: Arc::new(Mutex::new(Some(handle))),
             shutdown,
         })
+    }
+
+    /// Scan data directory for existing WAL files and return the latest ID and max sequence
+    fn scan_existing_wals(data_dir: &Path) -> io::Result<(u64, u64)> {
+        use crate::engine::wal::parse_wal_filename;
+
+        let mut max_wal_id = 0u64;
+        let mut max_seq = 0u64;
+
+        if data_dir.exists() {
+            for entry in fs::read_dir(data_dir)? {
+                let entry = entry?;
+                let filename = entry.file_name();
+                let filename_str = filename.to_string_lossy();
+
+                if let Some(id) = parse_wal_filename(&filename_str) {
+                    max_wal_id = max_wal_id.max(id);
+
+                    // Read records to find max sequence
+                    let path = entry.path();
+                    if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
+                        for record in records {
+                            max_seq = max_seq.max(record.seq);
+                        }
+                    }
+                }
+            }
+        } else {
+            fs::create_dir_all(data_dir)?;
+        }
+
+        Ok((max_wal_id, max_seq))
+    }
+
+    /// Get current WAL ID
+    pub fn current_id(&self) -> u64 {
+        self.current_id.load(Ordering::SeqCst)
+    }
+
+    /// Get current sequence number
+    pub fn current_seq(&self) -> u64 {
+        self.seq_gen.current()
+    }
+
+    /// Rotate to a new WAL file
+    ///
+    /// This creates a new WAL file with an incremented ID and switches to it.
+    /// The old WAL file is kept for recovery purposes.
+    pub fn rotate(&self) -> io::Result<u64> {
+        let new_id = self.current_id.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_path = Self::wal_path(&self.data_dir, new_id);
+
+        // Create new WAL file
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&new_path)?;
+
+        let mut new_writer = BufWriter::new(file);
+
+        // Write header
+        let header = WalHeader::new();
+        new_writer.write_all(&header.serialize())?;
+        new_writer.flush()?;
+
+        // Swap writer
+        {
+            let mut guard = self.inner.lock().unwrap();
+            // Flush old writer first
+            guard.writer.flush()?;
+            guard.writer.get_ref().sync_data()?;
+
+            // Replace with new writer
+            guard.writer = new_writer;
+            guard.path = new_path;
+        }
+
+        println!("WAL rotated to ID {}", new_id);
+        Ok(new_id)
     }
 
     /// Background thread that batches writes and flushes periodically
     fn background_flusher(
         request_rx: mpsc::Receiver<WriteRequest>,
-        writer: std::sync::Arc<Mutex<BufWriter<File>>>,
+        inner: Arc<Mutex<WalWriterInner>>,
         batch_interval_micros: u64,
-        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let batch_interval = Duration::from_micros(batch_interval_micros);
         let mut pending: Vec<WriteRequest> = Vec::new();
@@ -679,14 +814,14 @@ impl GroupCommitWalWriter {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // Channel closed, flush remaining and exit
                     if !pending.is_empty() {
-                        Self::flush_and_notify(&writer, &mut pending);
+                        Self::flush_and_notify(&inner, &mut pending);
                     }
                     break;
                 }
             }
 
             if !pending.is_empty() {
-                Self::flush_and_notify(&writer, &mut pending);
+                Self::flush_and_notify(&inner, &mut pending);
             }
 
             if shutdown.load(Ordering::SeqCst) {
@@ -696,17 +831,14 @@ impl GroupCommitWalWriter {
     }
 
     /// Flush pending writes and notify all waiting requests
-    fn flush_and_notify(
-        writer: &std::sync::Arc<Mutex<BufWriter<File>>>,
-        pending: &mut Vec<WriteRequest>,
-    ) {
-        let mut guard = writer.lock().unwrap();
+    fn flush_and_notify(inner: &Arc<Mutex<WalWriterInner>>, pending: &mut Vec<WriteRequest>) {
+        let mut guard = inner.lock().unwrap();
 
         // Stage 1: Write all records
         let mut last_seq = 0u64;
         for req in pending.iter() {
             let data = req.record.serialize();
-            if let Err(e) = guard.write_all(&data) {
+            if let Err(e) = guard.writer.write_all(&data) {
                 // Notify all with error
                 for req in pending.drain(..) {
                     let _ = req
@@ -719,7 +851,7 @@ impl GroupCommitWalWriter {
         }
 
         // Stage 2: Flush buffer
-        if let Err(e) = guard.flush() {
+        if let Err(e) = guard.writer.flush() {
             for req in pending.drain(..) {
                 let _ = req
                     .response_tx
@@ -729,7 +861,7 @@ impl GroupCommitWalWriter {
         }
 
         // Stage 3: Sync to disk (fdatasync)
-        let sync_result = guard.get_ref().sync_data();
+        let sync_result = guard.writer.get_ref().sync_data();
 
         // Stage 4: Notify all
         match sync_result {
@@ -780,23 +912,69 @@ impl GroupCommitWalWriter {
             response_tx,
         };
 
-        self.request_tx
-            .send(request)
-            .map_err(|_| io::Error::other("WAL writer channel closed"))?;
+        // Get the sender (may be None if shutdown)
+        let sender = {
+            let guard = self.request_tx.lock().unwrap();
+            guard.clone()
+        };
+
+        match sender {
+            Some(tx) => tx
+                .send(request)
+                .map_err(|_| io::Error::other("WAL writer channel closed"))?,
+            None => return Err(io::Error::other("WAL writer is shut down")),
+        }
 
         response_rx
             .recv()
             .map_err(|_| io::Error::other("WAL writer response channel closed"))?
     }
 
-    /// Get WAL path
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Get current WAL file path
+    pub fn path(&self) -> PathBuf {
+        let guard = self.inner.lock().unwrap();
+        guard.path.clone()
     }
 
-    /// Read all records from this WAL
+    /// Get data directory
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Read all records from the current WAL file
     pub fn read_records(&self) -> io::Result<Vec<WalRecord>> {
-        BTreeWalWriter::read_records_internal(&self.path)
+        let path = self.path();
+        BTreeWalWriter::read_records_internal(&path)
+    }
+
+    /// Read all records from all WAL files in the data directory
+    pub fn read_all_records(&self) -> io::Result<Vec<WalRecord>> {
+        use crate::engine::wal::parse_wal_filename;
+
+        let mut all_records = Vec::new();
+        let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
+
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let filename_str = filename.to_string_lossy();
+
+            if let Some(id) = parse_wal_filename(&filename_str) {
+                wal_files.push((id, entry.path()));
+            }
+        }
+
+        // Sort by WAL ID
+        wal_files.sort_by_key(|(id, _)| *id);
+
+        // Read records from each WAL file in order
+        for (_, path) in wal_files {
+            if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
+                all_records.extend(records);
+            }
+        }
+
+        Ok(all_records)
     }
 
     /// Sync is a no-op for group commit (always syncs after each batch)
@@ -817,20 +995,41 @@ impl GroupCommitWalWriter {
         Ok(0)
     }
 
-    /// Truncate WAL after checkpoint
+    /// Truncate all WAL files after checkpoint
+    ///
+    /// This removes all WAL files and creates a fresh one.
     pub fn truncate_after_checkpoint(&self) -> io::Result<()> {
-        // Lock the shared writer to prevent concurrent writes during truncation
-        let mut guard = self.writer.lock().unwrap();
+        use crate::engine::wal::parse_wal_filename;
+
+        // Lock the inner state to prevent concurrent writes
+        let mut guard = self.inner.lock().unwrap();
 
         // Flush and sync any pending data
-        guard.flush()?;
-        guard.get_ref().sync_data()?;
+        guard.writer.flush()?;
+        guard.writer.get_ref().sync_data()?;
 
-        // Truncate the file by opening with truncate flag and rewriting header
+        // Delete all existing WAL files
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let filename_str = filename.to_string_lossy();
+
+            if parse_wal_filename(&filename_str).is_some() {
+                fs::remove_file(entry.path())?;
+            }
+        }
+
+        // Reset WAL ID and create new file
+        let new_id = 0;
+        self.current_id.store(new_id, Ordering::SeqCst);
+
+        let new_path = Self::wal_path(&self.data_dir, new_id);
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
+            .create(true)
             .truncate(true)
-            .open(&self.path)?;
+            .open(&new_path)?;
 
         let mut new_writer = BufWriter::new(file);
         let header = WalHeader::new();
@@ -839,10 +1038,31 @@ impl GroupCommitWalWriter {
         new_writer.get_ref().sync_all()?;
 
         // Replace the writer
-        *guard = new_writer;
+        guard.writer = new_writer;
+        guard.path = new_path;
 
         // Reset sequence number
         self.seq_gen.set(1);
+
+        Ok(())
+    }
+
+    /// Delete WAL files up to (and including) the given ID
+    pub fn delete_wals_up_to(&self, max_id: u64) -> io::Result<()> {
+        use crate::engine::wal::parse_wal_filename;
+
+        for entry in fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let filename_str = filename.to_string_lossy();
+
+            if let Some(id) = parse_wal_filename(&filename_str)
+                && id <= max_id
+            {
+                fs::remove_file(entry.path())?;
+                println!("Deleted old WAL: {:?}", entry.path());
+            }
+        }
 
         Ok(())
     }
@@ -855,6 +1075,12 @@ impl GroupCommitWalWriter {
     /// Shutdown the WAL writer gracefully
     pub fn shutdown(&self) -> io::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+
+        // Drop the sender to signal shutdown
+        {
+            let mut guard = self.request_tx.lock().unwrap();
+            guard.take();
+        }
 
         // Take the handle to wait for the background thread
         let handle = {
@@ -875,9 +1101,15 @@ impl GroupCommitWalWriter {
 
 impl Drop for GroupCommitWalWriter {
     fn drop(&mut self) {
-        // Signal shutdown
-        self.shutdown.store(true, Ordering::SeqCst);
-        // The sender will be dropped, causing the receiver to get Disconnected
+        // Only signal shutdown if this is the last reference
+        // (Arc strong_count would be 1 for the last clone)
+        if Arc::strong_count(&self.shutdown) == 1 {
+            self.shutdown.store(true, Ordering::SeqCst);
+            // Drop the sender to signal the receiver
+            if let Ok(mut guard) = self.request_tx.lock() {
+                guard.take();
+            }
+        }
     }
 }
 
