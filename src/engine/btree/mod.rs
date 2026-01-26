@@ -18,7 +18,7 @@ mod benchmark;
 #[cfg(test)]
 mod tests;
 
-use self::buffer_pool::{BufferPool, CachedNode, DEFAULT_POOL_SIZE_PAGES};
+use self::buffer_pool::{BufferPool, BufferPoolConfig, CachedNode, DEFAULT_POOL_SIZE_PAGES};
 use self::freelist::Freelist;
 use self::node::{InternalNode, LeafEntry, LeafNode};
 use self::page::MetaPage;
@@ -39,10 +39,21 @@ pub struct BTreeConfig {
     /// WAL group commit batch interval in microseconds.
     /// Higher values increase throughput but also increase latency.
     pub wal_batch_interval_micros: u64,
+    /// Background flush interval in milliseconds (0 to disable).
+    /// Lower values reduce eviction latency but increase I/O.
+    pub background_flush_interval_ms: u64,
+    /// Maximum dirty pages before triggering background flush.
+    pub max_dirty_pages: usize,
 }
 
 /// Default batch interval in microseconds (100us)
 pub const DEFAULT_WAL_BATCH_INTERVAL_MICROS: u64 = 100;
+
+/// Default background flush interval in milliseconds (100ms)
+pub const DEFAULT_BACKGROUND_FLUSH_INTERVAL_MS: u64 = 100;
+
+/// Default maximum dirty pages
+pub const DEFAULT_MAX_DIRTY_PAGES: usize = 1000;
 
 impl Default for BTreeConfig {
     fn default() -> Self {
@@ -50,6 +61,8 @@ impl Default for BTreeConfig {
             buffer_pool_pages: DEFAULT_POOL_SIZE_PAGES,
             enable_wal: true,
             wal_batch_interval_micros: DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+            background_flush_interval_ms: DEFAULT_BACKGROUND_FLUSH_INTERVAL_MS,
+            max_dirty_pages: DEFAULT_MAX_DIRTY_PAGES,
         }
     }
 }
@@ -98,8 +111,15 @@ impl BTreeEngine {
         let page_manager = PageManager::open(&db_path)
             .map_err(|e| Status::internal(format!("Failed to open page manager: {}", e)))?;
 
-        // Create buffer pool
-        let buffer_pool = BufferPool::new(page_manager, config.buffer_pool_pages);
+        // Create buffer pool with write-behind configuration
+        let buffer_pool = BufferPool::with_config(
+            page_manager,
+            BufferPoolConfig {
+                max_pages: config.buffer_pool_pages,
+                flush_interval_ms: config.background_flush_interval_ms,
+                max_dirty_pages: config.max_dirty_pages,
+            },
+        );
 
         // Read metadata
         let meta = buffer_pool
@@ -535,6 +555,9 @@ impl Engine for BTreeEngine {
 
 impl Drop for BTreeEngine {
     fn drop(&mut self) {
+        // Shutdown buffer pool's background flusher first
+        self.buffer_pool.shutdown();
+
         // Try to flush on drop
         let _ = self.flush();
 

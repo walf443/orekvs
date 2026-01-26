@@ -288,6 +288,8 @@ fn test_btree_without_wal() {
         buffer_pool_pages: 100,
         enable_wal: false,
         wal_batch_interval_micros: 100,
+        background_flush_interval_ms: 0, // Disable for test
+        max_dirty_pages: 100,
     };
 
     let engine = BTreeEngine::open_with_config(dir.path(), config).unwrap();

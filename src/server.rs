@@ -73,7 +73,33 @@ impl LogEngineHolder {
     }
 }
 
+/// Wrapper to hold BTree engine reference for graceful shutdown
+struct BTreeEngineHolder {
+    engine: Option<Arc<BTreeEngine>>,
+}
+
+impl BTreeEngineHolder {
+    fn new() -> Self {
+        BTreeEngineHolder { engine: None }
+    }
+
+    fn set(&mut self, engine: Arc<BTreeEngine>) {
+        self.engine = Some(engine);
+    }
+
+    fn shutdown(&self) {
+        if let Some(ref engine) = self.engine {
+            // Flush all dirty pages and close WAL
+            if let Err(e) = engine.flush() {
+                eprintln!("Error flushing BTree engine during shutdown: {}", e);
+            }
+            println!("BTree engine shutdown complete.");
+        }
+    }
+}
+
 impl MyKeyValue {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         engine_type: EngineType,
         data_dir: String,
@@ -83,6 +109,7 @@ impl MyKeyValue {
         lsm_wal_batch_interval_micros: u64,
         lsm_holder: &mut LsmEngineHolder,
         log_holder: &mut LogEngineHolder,
+        btree_holder: &mut BTreeEngineHolder,
         wal_archive_config: WalArchiveConfig,
     ) -> Self {
         let mut lsm_engine_ref = None;
@@ -108,6 +135,7 @@ impl MyKeyValue {
             EngineType::BTree => {
                 let btree_engine =
                     Arc::new(BTreeEngine::open(data_dir).expect("Failed to open BTree engine"));
+                btree_holder.set(Arc::clone(&btree_engine));
                 Box::new(BTreeEngineWrapper(btree_engine))
             }
         };
@@ -342,6 +370,7 @@ pub async fn run_server(
 ) {
     let mut lsm_holder = LsmEngineHolder::new();
     let mut log_holder = LogEngineHolder::new();
+    let mut btree_holder = BTreeEngineHolder::new();
 
     let key_value = MyKeyValue::new(
         engine_type,
@@ -352,6 +381,7 @@ pub async fn run_server(
         lsm_wal_batch_interval_micros,
         &mut lsm_holder,
         &mut log_holder,
+        &mut btree_holder,
         wal_archive_config,
     );
 
@@ -428,6 +458,7 @@ pub async fn run_server(
     // Gracefully shutdown the engines (flush pending writes)
     lsm_holder.shutdown().await;
     log_holder.shutdown().await;
+    btree_holder.shutdown();
 
     println!("Server stopped.");
 }
