@@ -14,6 +14,8 @@ pub mod page_manager;
 pub mod wal;
 
 #[cfg(test)]
+mod benchmark;
+#[cfg(test)]
 mod tests;
 
 use self::buffer_pool::{BufferPool, CachedNode, DEFAULT_POOL_SIZE_PAGES};
