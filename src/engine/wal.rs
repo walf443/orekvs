@@ -38,6 +38,52 @@ impl GroupCommitConfig {
 }
 
 // ============================================================================
+// WAL Header format
+// ============================================================================
+
+/// Common WAL magic bytes (same as LSM-Tree)
+pub const WAL_MAGIC: &[u8; 9] = b"ORELSMWAL";
+
+/// WAL header size in bytes
+pub const WAL_HEADER_SIZE: usize = 13; // 9 (magic) + 4 (version)
+
+/// Current WAL format version (v4: block-based with compression)
+pub const WAL_FORMAT_VERSION: u32 = 4;
+
+/// Write WAL header to a writer
+///
+/// Header format: [magic: 9 bytes][version: u32 LE]
+pub fn write_wal_header<W: Write>(writer: &mut W, version: u32) -> io::Result<()> {
+    writer.write_all(WAL_MAGIC)?;
+    writer.write_all(&version.to_le_bytes())?;
+    Ok(())
+}
+
+/// Read and validate WAL header from a reader
+///
+/// Returns the version number if valid, or an error if the header is invalid.
+pub fn read_wal_header<R: Read>(reader: &mut R) -> io::Result<u32> {
+    let mut magic = [0u8; 9];
+    reader.read_exact(&mut magic)?;
+
+    if &magic != WAL_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Invalid WAL magic: expected {:?}, got {:?}",
+                WAL_MAGIC, magic
+            ),
+        ));
+    }
+
+    let mut version_bytes = [0u8; 4];
+    reader.read_exact(&mut version_bytes)?;
+    let version = u32::from_le_bytes(version_bytes);
+
+    Ok(version)
+}
+
+// ============================================================================
 // Block format for WAL entries
 // ============================================================================
 

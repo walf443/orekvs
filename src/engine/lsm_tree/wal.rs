@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,11 +10,10 @@ use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
-use crate::engine::wal::{GroupCommitConfig, SeqGenerator, WalWriter, read_block, write_block};
-
-const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
-/// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
-const WAL_VERSION: u32 = 4;
+use crate::engine::wal::{
+    GroupCommitConfig, SeqGenerator, WAL_FORMAT_VERSION, WalWriter, read_block, read_wal_header,
+    write_block, write_wal_header,
+};
 
 /// WAL entry with sequence number for recovery filtering
 #[derive(Debug, Clone)]
@@ -213,10 +212,8 @@ impl GroupCommitWalWriter {
             .open(&wal_path)
             .map_err(|e| Status::internal(format!("Failed to create WAL: {}", e)))?;
 
-        // Write header
-        file.write_all(WAL_MAGIC_BYTES)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        file.write_all(&WAL_VERSION.to_le_bytes())
+        // Write header using common format
+        write_wal_header(&mut file, WAL_FORMAT_VERSION)
             .map_err(|e| Status::internal(e.to_string()))?;
         file.sync_all()
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -551,24 +548,19 @@ impl GroupCommitWalWriter {
             Err(e) => return Err(Status::internal(e.to_string())),
         };
 
-        // Verify header
-        let mut magic = [0u8; 9];
-        if file.read_exact(&mut magic).is_err() {
-            return Ok(BTreeMap::new()); // Empty file
-        }
-        if &magic != WAL_MAGIC_BYTES {
-            return Err(Status::internal("Invalid WAL magic bytes"));
-        }
+        // Verify header using common format
+        let version = match read_wal_header(&mut file) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(BTreeMap::new()); // Empty file
+            }
+            Err(e) => return Err(Status::internal(e.to_string())),
+        };
 
-        let mut version_bytes = [0u8; 4];
-        file.read_exact(&mut version_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let version = u32::from_le_bytes(version_bytes);
-
-        if version != WAL_VERSION {
+        if version != WAL_FORMAT_VERSION {
             return Err(Status::internal(format!(
                 "Unsupported WAL version: {}. Only version {} is supported.",
-                version, WAL_VERSION
+                version, WAL_FORMAT_VERSION
             )));
         }
 
@@ -588,24 +580,19 @@ impl GroupCommitWalWriter {
             Err(e) => return Err(Status::internal(e.to_string())),
         };
 
-        // Verify header
-        let mut magic = [0u8; 9];
-        if file.read_exact(&mut magic).is_err() {
-            return Ok(Vec::new()); // Empty file
-        }
-        if &magic != WAL_MAGIC_BYTES {
-            return Err(Status::internal("Invalid WAL magic bytes"));
-        }
+        // Verify header using common format
+        let version = match read_wal_header(&mut file) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(Vec::new()); // Empty file
+            }
+            Err(e) => return Err(Status::internal(e.to_string())),
+        };
 
-        let mut version_bytes = [0u8; 4];
-        file.read_exact(&mut version_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let version = u32::from_le_bytes(version_bytes);
-
-        if version != WAL_VERSION {
+        if version != WAL_FORMAT_VERSION {
             return Err(Status::internal(format!(
                 "Unsupported WAL version: {}. Only version {} is supported.",
-                version, WAL_VERSION
+                version, WAL_FORMAT_VERSION
             )));
         }
 
@@ -731,6 +718,7 @@ impl WalWriter for GroupCommitWalWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::wal::{WAL_FORMAT_VERSION, WAL_MAGIC};
     use tempfile::tempdir;
 
     /// Test-only WAL writer (synchronous, no group commit)
@@ -768,9 +756,7 @@ mod tests {
                 .open(&wal_path)
                 .map_err(|e| Status::internal(format!("Failed to create WAL: {}", e)))?;
 
-            file.write_all(WAL_MAGIC_BYTES)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.write_all(&WAL_VERSION.to_le_bytes())
+            write_wal_header(&mut file, WAL_FORMAT_VERSION)
                 .map_err(|e| Status::internal(e.to_string()))?;
             file.sync_all()
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -830,11 +816,11 @@ mod tests {
         let mut file = File::open(wal_path).unwrap();
         let mut magic = [0u8; 9];
         file.read_exact(&mut magic).unwrap();
-        assert_eq!(&magic, WAL_MAGIC_BYTES);
+        assert_eq!(&magic, WAL_MAGIC);
 
         let mut version_bytes = [0u8; 4];
         file.read_exact(&mut version_bytes).unwrap();
-        assert_eq!(u32::from_le_bytes(version_bytes), WAL_VERSION);
+        assert_eq!(u32::from_le_bytes(version_bytes), WAL_FORMAT_VERSION);
     }
 
     #[test]
