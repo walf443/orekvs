@@ -556,6 +556,329 @@ pub fn delete_wal<P: AsRef<Path>>(path: P) -> io::Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Group Commit WAL Writer
+// ============================================================================
+
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// Write request for group commit
+struct WriteRequest {
+    record: WalRecord,
+    response_tx: mpsc::Sender<io::Result<u64>>,
+}
+
+/// Group commit WAL writer that batches multiple writes before sync
+pub struct GroupCommitWalWriter {
+    /// Channel to send write requests to background flusher
+    request_tx: mpsc::Sender<WriteRequest>,
+    /// Next sequence number
+    next_seq: AtomicU64,
+    /// WAL file path
+    path: PathBuf,
+    /// Shared writer (for truncate operations)
+    writer: std::sync::Arc<Mutex<BufWriter<File>>>,
+    /// Handle to the background flusher thread
+    flusher_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Flag to signal shutdown
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GroupCommitWalWriter {
+    /// Create or open a group commit WAL file
+    ///
+    /// `batch_interval_micros` controls how long to wait for batching writes.
+    /// Higher values increase throughput but also increase latency.
+    pub fn open<P: AsRef<Path>>(path: P, batch_interval_micros: u64) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file_exists = path.exists();
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+
+        let mut writer = BufWriter::new(file);
+
+        let next_seq = if file_exists {
+            // Read existing WAL to find last sequence
+            let mut max_seq = 0u64;
+            if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
+                for record in records {
+                    max_seq = max_seq.max(record.seq);
+                }
+            }
+            // Seek to end for appending
+            writer.seek(SeekFrom::End(0))?;
+            max_seq + 1
+        } else {
+            // Write header
+            let header = WalHeader::new();
+            writer.write_all(&header.serialize())?;
+            writer.flush()?;
+            1
+        };
+
+        let (request_tx, request_rx) = mpsc::channel::<WriteRequest>();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let writer = Mutex::new(writer);
+        let writer = std::sync::Arc::new(writer);
+        let writer_clone = writer.clone();
+
+        // Start background flusher thread
+        let handle = thread::spawn(move || {
+            Self::background_flusher(
+                request_rx,
+                writer_clone,
+                batch_interval_micros,
+                shutdown_clone,
+            );
+        });
+
+        Ok(Self {
+            request_tx,
+            next_seq: AtomicU64::new(next_seq),
+            path,
+            writer,
+            flusher_handle: Mutex::new(Some(handle)),
+            shutdown,
+        })
+    }
+
+    /// Background thread that batches writes and flushes periodically
+    fn background_flusher(
+        request_rx: mpsc::Receiver<WriteRequest>,
+        writer: std::sync::Arc<Mutex<BufWriter<File>>>,
+        batch_interval_micros: u64,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let batch_interval = Duration::from_micros(batch_interval_micros);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        loop {
+            // Wait for a request with timeout
+            match request_rx.recv_timeout(batch_interval) {
+                Ok(req) => {
+                    pending.push(req);
+                    // Collect any additional pending requests (non-blocking)
+                    while let Ok(req) = request_rx.try_recv() {
+                        pending.push(req);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Timeout - flush if we have pending writes
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Channel closed, flush remaining and exit
+                    if !pending.is_empty() {
+                        Self::flush_and_notify(&writer, &mut pending);
+                    }
+                    break;
+                }
+            }
+
+            if !pending.is_empty() {
+                Self::flush_and_notify(&writer, &mut pending);
+            }
+
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+    }
+
+    /// Flush pending writes and notify all waiting requests
+    fn flush_and_notify(
+        writer: &std::sync::Arc<Mutex<BufWriter<File>>>,
+        pending: &mut Vec<WriteRequest>,
+    ) {
+        let mut guard = writer.lock().unwrap();
+
+        // Stage 1: Write all records
+        let mut last_seq = 0u64;
+        for req in pending.iter() {
+            let data = req.record.serialize();
+            if let Err(e) = guard.write_all(&data) {
+                // Notify all with error
+                for req in pending.drain(..) {
+                    let _ = req
+                        .response_tx
+                        .send(Err(io::Error::new(e.kind(), e.to_string())));
+                }
+                return;
+            }
+            last_seq = req.record.seq;
+        }
+
+        // Stage 2: Flush buffer
+        if let Err(e) = guard.flush() {
+            for req in pending.drain(..) {
+                let _ = req
+                    .response_tx
+                    .send(Err(io::Error::new(e.kind(), e.to_string())));
+            }
+            return;
+        }
+
+        // Stage 3: Sync to disk (fdatasync)
+        let sync_result = guard.get_ref().sync_data();
+
+        // Stage 4: Notify all
+        match sync_result {
+            Ok(()) => {
+                for req in pending.drain(..) {
+                    let _ = req.response_tx.send(Ok(req.record.seq));
+                }
+            }
+            Err(e) => {
+                for req in pending.drain(..) {
+                    let _ = req
+                        .response_tx
+                        .send(Err(io::Error::new(e.kind(), e.to_string())));
+                }
+            }
+        }
+
+        let _ = last_seq; // suppress unused warning
+    }
+
+    /// Log an insert operation (batched with group commit)
+    pub fn log_insert(&self, key: &str, value: &str) -> io::Result<u64> {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let record = WalRecord::insert(seq, key.to_string(), value.to_string());
+        self.send_and_wait(record)
+    }
+
+    /// Log a delete operation (batched with group commit)
+    pub fn log_delete(&self, key: &str) -> io::Result<u64> {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let record = WalRecord::delete(seq, key.to_string());
+        self.send_and_wait(record)
+    }
+
+    /// Log a checkpoint
+    pub fn log_checkpoint(&self) -> io::Result<u64> {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let record = WalRecord::checkpoint(seq);
+        self.send_and_wait(record)
+    }
+
+    /// Send a record to the background flusher and wait for completion
+    fn send_and_wait(&self, record: WalRecord) -> io::Result<u64> {
+        let (response_tx, response_rx) = mpsc::channel();
+
+        let request = WriteRequest {
+            record,
+            response_tx,
+        };
+
+        self.request_tx
+            .send(request)
+            .map_err(|_| io::Error::other("WAL writer channel closed"))?;
+
+        response_rx
+            .recv()
+            .map_err(|_| io::Error::other("WAL writer response channel closed"))?
+    }
+
+    /// Get WAL path
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read all records from this WAL
+    pub fn read_records(&self) -> io::Result<Vec<WalRecord>> {
+        BTreeWalWriter::read_records_internal(&self.path)
+    }
+
+    /// Sync is a no-op for group commit (always syncs after each batch)
+    pub fn sync(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Begin a batch operation (no-op for group commit, batching is automatic)
+    pub fn begin_batch(&self) -> io::Result<u64> {
+        // Group commit already batches writes, so this is a no-op
+        // Just return a dummy sequence number
+        Ok(0)
+    }
+
+    /// End a batch operation (no-op for group commit)
+    pub fn end_batch(&self) -> io::Result<u64> {
+        // Group commit already syncs after each batch
+        Ok(0)
+    }
+
+    /// Truncate WAL after checkpoint
+    pub fn truncate_after_checkpoint(&self) -> io::Result<()> {
+        // Lock the shared writer to prevent concurrent writes during truncation
+        let mut guard = self.writer.lock().unwrap();
+
+        // Flush and sync any pending data
+        guard.flush()?;
+        guard.get_ref().sync_data()?;
+
+        // Truncate the file by opening with truncate flag and rewriting header
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+
+        let mut new_writer = BufWriter::new(file);
+        let header = WalHeader::new();
+        new_writer.write_all(&header.serialize())?;
+        new_writer.flush()?;
+        new_writer.get_ref().sync_all()?;
+
+        // Replace the writer
+        *guard = new_writer;
+
+        // Reset sequence number
+        self.next_seq.store(1, Ordering::SeqCst);
+
+        Ok(())
+    }
+
+    /// Close the WAL writer
+    pub fn close(&self) -> io::Result<()> {
+        self.shutdown()
+    }
+
+    /// Shutdown the WAL writer gracefully
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.shutdown.store(true, Ordering::SeqCst);
+
+        // Take the handle to wait for the background thread
+        let handle = {
+            let mut guard = self.flusher_handle.lock().unwrap();
+            guard.take()
+        };
+
+        if let Some(handle) = handle {
+            // Wait for the background thread to complete
+            handle
+                .join()
+                .map_err(|_| io::Error::other("Failed to join WAL flusher thread"))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for GroupCommitWalWriter {
+    fn drop(&mut self) {
+        // Signal shutdown
+        self.shutdown.store(true, Ordering::SeqCst);
+        // The sender will be dropped, causing the receiver to get Disconnected
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

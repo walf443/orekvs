@@ -21,7 +21,7 @@ use self::freelist::Freelist;
 use self::node::{InternalNode, LeafEntry, LeafNode};
 use self::page::MetaPage;
 use self::page_manager::PageManager;
-use self::wal::{BTreeWalWriter, RecordType, recover_from_wal};
+use self::wal::{GroupCommitWalWriter, RecordType, recover_from_wal};
 use crate::engine::Engine;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -34,13 +34,20 @@ pub struct BTreeConfig {
     pub buffer_pool_pages: usize,
     /// Whether to enable WAL
     pub enable_wal: bool,
+    /// WAL group commit batch interval in microseconds.
+    /// Higher values increase throughput but also increase latency.
+    pub wal_batch_interval_micros: u64,
 }
+
+/// Default batch interval in microseconds (100us)
+pub const DEFAULT_WAL_BATCH_INTERVAL_MICROS: u64 = 100;
 
 impl Default for BTreeConfig {
     fn default() -> Self {
         Self {
             buffer_pool_pages: DEFAULT_POOL_SIZE_PAGES,
             enable_wal: true,
+            wal_batch_interval_micros: DEFAULT_WAL_BATCH_INTERVAL_MICROS,
         }
     }
 }
@@ -55,8 +62,8 @@ pub struct BTreeEngine {
     freelist: Mutex<Freelist>,
     /// Tree metadata (root, height, etc.)
     meta: RwLock<MetaPage>,
-    /// Write-ahead log
-    wal: Option<BTreeWalWriter>,
+    /// Write-ahead log (group commit)
+    wal: Option<GroupCommitWalWriter>,
     /// Configuration
     #[allow(dead_code)]
     config: BTreeConfig,
@@ -106,10 +113,10 @@ impl BTreeEngine {
             Freelist::new()
         };
 
-        // Open WAL if enabled
+        // Open WAL if enabled (with group commit)
         let wal = if config.enable_wal {
             Some(
-                BTreeWalWriter::open(&wal_path)
+                GroupCommitWalWriter::open(&wal_path, config.wal_batch_interval_micros)
                     .map_err(|e| Status::internal(format!("Failed to open WAL: {}", e)))?,
             )
         } else {
