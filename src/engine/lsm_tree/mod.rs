@@ -1300,6 +1300,66 @@ impl Engine for LsmTreeEngine {
     }
 }
 
+/// Wrapper to hold LSM engine reference for graceful shutdown
+pub struct LsmEngineHolder {
+    engine: Option<Arc<LsmTreeEngine>>,
+}
+
+impl LsmEngineHolder {
+    pub fn new() -> Self {
+        LsmEngineHolder { engine: None }
+    }
+
+    pub fn set(&mut self, engine: Arc<LsmTreeEngine>) {
+        self.engine = Some(engine);
+    }
+
+    pub fn engine(&self) -> Option<&Arc<LsmTreeEngine>> {
+        self.engine.as_ref()
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(ref engine) = self.engine {
+            engine.shutdown().await;
+        }
+    }
+}
+
+impl Default for LsmEngineHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wrapper to implement Engine for Arc<LsmTreeEngine>
+pub struct LsmTreeEngineWrapper(pub Arc<LsmTreeEngine>);
+
+impl Engine for LsmTreeEngineWrapper {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.0.set(key, value)
+    }
+
+    fn get(&self, key: String) -> Result<String, Status> {
+        self.0.get(key)
+    }
+
+    fn delete(&self, key: String) -> Result<(), Status> {
+        self.0.delete(key)
+    }
+
+    fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
+        self.0.batch_set(items)
+    }
+
+    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
+        self.0.batch_get(keys)
+    }
+
+    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
+        self.0.batch_delete(keys)
+    }
+}
+
 #[cfg(test)]
 mod benchmark;
 #[cfg(test)]

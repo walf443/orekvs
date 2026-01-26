@@ -488,6 +488,50 @@ impl Engine for LogEngine {
     }
 }
 
+/// Wrapper to hold Log engine reference for graceful shutdown
+pub struct LogEngineHolder {
+    engine: Option<Arc<LogEngine>>,
+}
+
+impl LogEngineHolder {
+    pub fn new() -> Self {
+        LogEngineHolder { engine: None }
+    }
+
+    pub fn set(&mut self, engine: Arc<LogEngine>) {
+        self.engine = Some(engine);
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(ref engine) = self.engine {
+            engine.shutdown().await;
+        }
+    }
+}
+
+impl Default for LogEngineHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wrapper to implement Engine for Arc<LogEngine>
+pub struct LogEngineWrapper(pub Arc<LogEngine>);
+
+impl Engine for LogEngineWrapper {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.0.set(key, value)
+    }
+
+    fn get(&self, key: String) -> Result<String, Status> {
+        self.0.get(key)
+    }
+
+    fn delete(&self, key: String) -> Result<(), Status> {
+        self.0.delete(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,7 +27,7 @@ use self::wal::{GroupCommitWalWriter, RecordType, recover_from_wal};
 use crate::engine::Engine;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
 
 /// B-tree storage engine configuration
@@ -615,5 +615,65 @@ impl Drop for BTreeEngine {
         if let Some(wal) = &self.wal {
             let _ = wal.close();
         }
+    }
+}
+
+/// Wrapper to hold BTree engine reference for graceful shutdown
+pub struct BTreeEngineHolder {
+    engine: Option<Arc<BTreeEngine>>,
+}
+
+impl BTreeEngineHolder {
+    pub fn new() -> Self {
+        BTreeEngineHolder { engine: None }
+    }
+
+    pub fn set(&mut self, engine: Arc<BTreeEngine>) {
+        self.engine = Some(engine);
+    }
+
+    pub fn shutdown(&self) {
+        if let Some(ref engine) = self.engine {
+            // Flush all dirty pages and close WAL
+            if let Err(e) = engine.flush() {
+                eprintln!("Error flushing BTree engine during shutdown: {}", e);
+            }
+            println!("BTree engine shutdown complete.");
+        }
+    }
+}
+
+impl Default for BTreeEngineHolder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wrapper to implement Engine for Arc<BTreeEngine>
+pub struct BTreeEngineWrapper(pub Arc<BTreeEngine>);
+
+impl Engine for BTreeEngineWrapper {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.0.set(key, value)
+    }
+
+    fn get(&self, key: String) -> Result<String, Status> {
+        self.0.get(key)
+    }
+
+    fn delete(&self, key: String) -> Result<(), Status> {
+        self.0.delete(key)
+    }
+
+    fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
+        self.0.batch_set(items)
+    }
+
+    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
+        self.0.batch_get(keys)
+    }
+
+    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
+        self.0.batch_delete(keys)
     }
 }

@@ -16,9 +16,11 @@ use kv::{
 
 use crate::engine::{
     Engine,
-    btree::BTreeEngine,
-    log::LogEngine,
-    lsm_tree::{LsmTreeEngine, SnapshotLock, WalArchiveConfig},
+    btree::{BTreeEngine, BTreeEngineHolder, BTreeEngineWrapper},
+    log::{LogEngine, LogEngineHolder, LogEngineWrapper},
+    lsm_tree::{
+        LsmEngineHolder, LsmTreeEngine, LsmTreeEngineWrapper, SnapshotLock, WalArchiveConfig,
+    },
     memory::MemoryEngine,
 };
 use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationService};
@@ -29,73 +31,6 @@ pub struct MyKeyValue {
     engine: Box<dyn Engine>,
     // Optional reference to LsmTreeEngine for metrics access
     lsm_engine: Option<Arc<LsmTreeEngine>>,
-}
-
-/// Wrapper to hold LSM engine reference for graceful shutdown
-struct LsmEngineHolder {
-    engine: Option<Arc<LsmTreeEngine>>,
-}
-
-impl LsmEngineHolder {
-    fn new() -> Self {
-        LsmEngineHolder { engine: None }
-    }
-
-    fn set(&mut self, engine: Arc<LsmTreeEngine>) {
-        self.engine = Some(engine);
-    }
-
-    async fn shutdown(&self) {
-        if let Some(ref engine) = self.engine {
-            engine.shutdown().await;
-        }
-    }
-}
-
-/// Wrapper to hold Log engine reference for graceful shutdown
-struct LogEngineHolder {
-    engine: Option<Arc<LogEngine>>,
-}
-
-impl LogEngineHolder {
-    fn new() -> Self {
-        LogEngineHolder { engine: None }
-    }
-
-    fn set(&mut self, engine: Arc<LogEngine>) {
-        self.engine = Some(engine);
-    }
-
-    async fn shutdown(&self) {
-        if let Some(ref engine) = self.engine {
-            engine.shutdown().await;
-        }
-    }
-}
-
-/// Wrapper to hold BTree engine reference for graceful shutdown
-struct BTreeEngineHolder {
-    engine: Option<Arc<BTreeEngine>>,
-}
-
-impl BTreeEngineHolder {
-    fn new() -> Self {
-        BTreeEngineHolder { engine: None }
-    }
-
-    fn set(&mut self, engine: Arc<BTreeEngine>) {
-        self.engine = Some(engine);
-    }
-
-    fn shutdown(&self) {
-        if let Some(ref engine) = self.engine {
-            // Flush all dirty pages and close WAL
-            if let Err(e) = engine.flush() {
-                eprintln!("Error flushing BTree engine during shutdown: {}", e);
-            }
-            println!("BTree engine shutdown complete.");
-        }
-    }
 }
 
 impl MyKeyValue {
@@ -143,81 +78,6 @@ impl MyKeyValue {
             engine,
             lsm_engine: lsm_engine_ref,
         }
-    }
-}
-
-/// Wrapper to implement Engine for Arc<LogEngine>
-struct LogEngineWrapper(Arc<LogEngine>);
-
-impl Engine for LogEngineWrapper {
-    fn set(&self, key: String, value: String) -> Result<(), Status> {
-        self.0.set(key, value)
-    }
-
-    fn get(&self, key: String) -> Result<String, Status> {
-        self.0.get(key)
-    }
-
-    fn delete(&self, key: String) -> Result<(), Status> {
-        self.0.delete(key)
-    }
-}
-
-/// Wrapper to implement Engine for Arc<LsmTreeEngine>
-struct LsmTreeEngineWrapper(Arc<LsmTreeEngine>);
-
-impl Engine for LsmTreeEngineWrapper {
-    fn set(&self, key: String, value: String) -> Result<(), Status> {
-        self.0.set(key, value)
-    }
-
-    fn get(&self, key: String) -> Result<String, Status> {
-        self.0.get(key)
-    }
-
-    fn delete(&self, key: String) -> Result<(), Status> {
-        self.0.delete(key)
-    }
-
-    fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
-        self.0.batch_set(items)
-    }
-
-    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
-        self.0.batch_get(keys)
-    }
-
-    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
-        self.0.batch_delete(keys)
-    }
-}
-
-/// Wrapper to implement Engine for Arc<BTreeEngine>
-struct BTreeEngineWrapper(Arc<BTreeEngine>);
-
-impl Engine for BTreeEngineWrapper {
-    fn set(&self, key: String, value: String) -> Result<(), Status> {
-        self.0.set(key, value)
-    }
-
-    fn get(&self, key: String) -> Result<String, Status> {
-        self.0.get(key)
-    }
-
-    fn delete(&self, key: String) -> Result<(), Status> {
-        self.0.delete(key)
-    }
-
-    fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
-        self.0.batch_set(items)
-    }
-
-    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
-        self.0.batch_get(keys)
-    }
-
-    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
-        self.0.batch_delete(keys)
     }
 }
 
@@ -389,10 +249,8 @@ pub async fn run_server(
     println!("Server listening on {}", addr);
 
     // Get snapshot lock from LSM engine if available
-    let snapshot_lock: Option<SnapshotLock> = lsm_holder
-        .engine
-        .as_ref()
-        .map(|engine| engine.snapshot_lock());
+    let snapshot_lock: Option<SnapshotLock> =
+        lsm_holder.engine().map(|engine| engine.snapshot_lock());
 
     // Start replication service if enabled
     let replication_handle = if let Some(repl_addr) = replication_addr {
