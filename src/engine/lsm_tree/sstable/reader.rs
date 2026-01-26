@@ -23,6 +23,27 @@ use super::{DATA_VERSION, FOOTER_MAGIC, FOOTER_SIZE, HEADER_SIZE, MAGIC_BYTES, c
 // Entry with timestamp for merge-sorting during compaction
 pub type TimestampedEntry = (u64, Option<String>); // (timestamp, value)
 
+/// Find the block offset for a key using binary search in the index.
+///
+/// The index contains (first_key, block_offset) pairs sorted by key.
+/// This function finds the block that might contain the given key:
+/// - If the key matches an index entry exactly, returns that block's offset
+/// - Otherwise, returns the offset of the previous block (which could contain the key)
+fn find_block_offset(index: &[(String, u64)], key: &str) -> u64 {
+    match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+        Ok(idx) => index[idx].1,
+        Err(idx) => {
+            if idx == 0 {
+                // Key is smaller than the first block's first key.
+                // If it exists, it must be in the first block.
+                index[0].1
+            } else {
+                index[idx - 1].1
+            }
+        }
+    }
+}
+
 /// Memory-mapped SSTable reader
 ///
 /// Provides zero-copy access to SSTable data via mmap.
@@ -380,19 +401,8 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     // Read index (v5+ uses prefix compression)
     let index = prefix_index::read_index(&mut file, index_offset)?;
 
-    // Binary search in index
-    let start_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
-        Ok(idx) => index[idx].1,
-        Err(idx) => {
-            if idx == 0 {
-                // Key is smaller than the first block's first key.
-                // If it exists, it must be in the first block.
-                index[0].1
-            } else {
-                index[idx - 1].1
-            }
-        }
-    };
+    // Binary search in index to find the block that might contain the key
+    let start_offset = find_block_offset(&index, key);
 
     file.seek(SeekFrom::Start(start_offset))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -492,17 +502,8 @@ pub fn search_key_mmap(
     // Get or load index from cache
     let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
 
-    // Binary search in index to find the right block
-    let block_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
-        Ok(idx) => index[idx].1,
-        Err(idx) => {
-            if idx == 0 {
-                index[0].1
-            } else {
-                index[idx - 1].1
-            }
-        }
-    };
+    // Binary search in index to find the block that might contain the key
+    let block_offset = find_block_offset(&index, key);
 
     // Get or load parsed block from cache
     let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
