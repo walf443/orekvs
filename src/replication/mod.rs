@@ -2,6 +2,9 @@ mod proto {
     tonic::include_proto!("replication");
 }
 
+pub mod follower;
+
+pub use follower::run_follower;
 pub use proto::replication_client::ReplicationClient;
 pub use proto::replication_server::{Replication, ReplicationServer};
 pub use proto::{
