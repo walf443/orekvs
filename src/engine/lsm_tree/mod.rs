@@ -71,9 +71,9 @@ impl LeveledSstables {
             self.levels[0].insert(0, handle);
         } else {
             // L1+: insert in sorted order by min_key
-            let min_key = handle.mmap.min_key().unwrap_or(&[]);
+            let min_key = handle.mmap.min_key();
             let pos = self.levels[level]
-                .binary_search_by(|h| h.mmap.min_key().unwrap_or(&[]).cmp(min_key))
+                .binary_search_by(|h| h.mmap.min_key().cmp(min_key))
                 .unwrap_or_else(|p| p);
             self.levels[level].insert(pos, handle);
         }
@@ -125,8 +125,8 @@ impl LeveledSstables {
         let mut result = Vec::new();
 
         for handle in level_sstables {
-            let sst_min = handle.mmap.min_key().unwrap_or(&[]);
-            let sst_max = handle.mmap.max_key().unwrap_or(&[]);
+            let sst_min = handle.mmap.min_key();
+            let sst_max = handle.mmap.max_key();
 
             // Check if ranges overlap: [sst_min, sst_max] overlaps [min_key, max_key]
             // Overlap occurs when: sst_min <= max_key AND sst_max >= min_key
@@ -152,10 +152,7 @@ impl LeveledSstables {
 
         // Binary search by min_key to find the rightmost SSTable where min_key <= key
         let pos = level_sstables
-            .binary_search_by(|h| {
-                let min = h.mmap.min_key().unwrap_or(&[]);
-                min.cmp(key)
-            })
+            .binary_search_by(|h| h.mmap.min_key().cmp(key))
             .unwrap_or_else(|p| p.saturating_sub(1));
 
         if pos < level_sstables.len() {
@@ -593,8 +590,8 @@ impl LsmTreeEngine {
         let mmap = MappedSSTable::open(&sst_path)?;
 
         // Get min/max keys and entry count for manifest
-        let min_key = mmap.min_key().map(|k| k.to_vec()).unwrap_or_default();
-        let max_key = mmap.max_key().map(|k| k.to_vec()).unwrap_or_default();
+        let min_key = mmap.min_key().to_vec();
+        let max_key = mmap.max_key().to_vec();
         let entry_count = mmap.entry_count();
         let file_size = std::fs::metadata(&sst_path).map(|m| m.len()).unwrap_or(0);
         let filename = sst_path
@@ -619,7 +616,7 @@ impl LsmTreeEngine {
                 &min_key,
                 &max_key,
                 file_size,
-                entry_count,
+                Some(entry_count),
             ));
             // Record the current WAL sequence for LSN-based recovery
             // All entries with seq <= this value are now persisted in SSTables

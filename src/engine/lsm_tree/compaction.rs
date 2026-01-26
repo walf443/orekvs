@@ -343,8 +343,8 @@ impl LeveledCompaction {
     fn get_key_range_for_file(&self, path: &Path) -> Result<(Vec<u8>, Vec<u8>), Status> {
         let mmap = MappedSSTable::open(path)?;
 
-        let min_key = mmap.min_key().map(|k| k.to_vec()).unwrap_or_default();
-        let max_key = mmap.max_key().map(|k| k.to_vec()).unwrap_or_default();
+        let min_key = mmap.min_key().to_vec();
+        let max_key = mmap.max_key().to_vec();
 
         Ok((min_key, max_key))
     }
