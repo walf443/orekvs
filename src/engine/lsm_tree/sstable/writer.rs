@@ -25,6 +25,31 @@ const COMPRESSION_LEVEL_COMPACTION: i32 = 6;
 // Index: use higher compression since index is read once per search
 const COMPRESSION_LEVEL_INDEX: i32 = 6;
 
+/// Write a compressed block to file and return the number of bytes written.
+///
+/// Block format: [len: u32][compressed_data][checksum: u32]
+#[allow(clippy::result_large_err)]
+fn write_compressed_block<W: Write>(
+    file: &mut W,
+    block_buffer: &[u8],
+    compression_level: i32,
+) -> Result<u64, Status> {
+    let compressed = zstd::encode_all(Cursor::new(block_buffer), compression_level)
+        .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
+
+    let len = compressed.len() as u32;
+    let checksum = crc32(&compressed);
+
+    file.write_all(&len.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&compressed)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    file.write_all(&checksum.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok(4 + len as u64 + 4) // len + data + checksum
+}
+
 /// Write a MemTable to an SSTable file
 #[allow(clippy::result_large_err)]
 pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFilter, Status> {
@@ -65,22 +90,9 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         write_entry(&mut block_buffer, key, value_opt, None)?;
 
         if block_buffer.len() >= BLOCK_SIZE {
-            // Compress and write block with checksum
             index.push((first_key_in_block.clone(), current_offset));
-
-            let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_FLUSH)
-                .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
-
-            let len = compressed.len() as u32;
-            let checksum = crc32(&compressed);
-            file.write_all(&len.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.write_all(&compressed)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.write_all(&checksum.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            current_offset += 4 + len as u64 + 4; // len + data + checksum
+            current_offset +=
+                write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_FLUSH)?;
             block_buffer.clear();
         }
     }
@@ -88,20 +100,8 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
     // Write remaining block
     if !block_buffer.is_empty() {
         index.push((first_key_in_block, current_offset));
-
-        let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_FLUSH)
-            .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
-
-        let len = compressed.len() as u32;
-        let checksum = crc32(&compressed);
-        file.write_all(&len.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        file.write_all(&compressed)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        file.write_all(&checksum.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        current_offset += 4 + len as u64 + 4;
+        current_offset +=
+            write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_FLUSH)?;
     }
 
     // Write index with prefix compression (V6 with checksum)
@@ -211,21 +211,8 @@ pub fn write_timestamped_entries(
 
         if block_buffer.len() >= BLOCK_SIZE {
             index.push((first_key_in_block.clone(), current_offset));
-
-            let compressed =
-                zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_COMPACTION)
-                    .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
-
-            let len = compressed.len() as u32;
-            let checksum = crc32(&compressed);
-            file.write_all(&len.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.write_all(&compressed)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.write_all(&checksum.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            current_offset += 4 + len as u64 + 4; // len + data + checksum
+            current_offset +=
+                write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_COMPACTION)?;
             block_buffer.clear();
         }
     }
@@ -233,20 +220,8 @@ pub fn write_timestamped_entries(
     // Write remaining block
     if !block_buffer.is_empty() {
         index.push((first_key_in_block, current_offset));
-
-        let compressed = zstd::encode_all(Cursor::new(&block_buffer), COMPRESSION_LEVEL_COMPACTION)
-            .map_err(|e| Status::internal(format!("Compression error: {}", e)))?;
-
-        let len = compressed.len() as u32;
-        let checksum = crc32(&compressed);
-        file.write_all(&len.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        file.write_all(&compressed)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        file.write_all(&checksum.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        current_offset += 4 + len as u64 + 4;
+        current_offset +=
+            write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_COMPACTION)?;
     }
 
     // Write index with prefix compression (V6 with checksum)
