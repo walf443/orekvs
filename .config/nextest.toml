@@ -1,0 +1,15 @@
+[profile.default]
+# Reduce test threads to avoid resource contention in I/O-heavy tests
+test-threads = 4
+
+# Longer timeout for slow tests
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Group compaction-related tests to run serially to avoid resource contention
+[[profile.default.overrides]]
+filter = "test(test_compaction)"
+test-group = "compaction-tests"
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[test-groups.compaction-tests]
+max-threads = 1

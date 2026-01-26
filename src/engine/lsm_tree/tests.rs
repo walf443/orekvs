@@ -114,11 +114,10 @@ async fn test_compaction_merges_sstables() {
         engine
             .set(format!("key{}", i), format!("value{}", i))
             .unwrap();
-        wait_for_flush(&engine, 2000).await;
+        wait_for_flush(&engine, 5000).await;
     }
 
     // Wait for all data to be accessible (compaction may be in progress)
-    // Use longer timeout since compaction can take time under load
     let engine_ref = &engine;
     let all_accessible = wait_for_condition(
         || (0..10).all(|i| engine_ref.get(format!("key{}", i)).is_ok()),
@@ -153,22 +152,21 @@ async fn test_compaction_removes_deleted_keys() {
     engine
         .set("delete_me".to_string(), "will_be_deleted".to_string())
         .unwrap();
-    wait_for_flush(&engine, 2000).await;
+    wait_for_flush(&engine, 5000).await;
 
     // Delete one key
     engine.delete("delete_me".to_string()).unwrap();
-    wait_for_flush(&engine, 2000).await;
+    wait_for_flush(&engine, 5000).await;
 
     // Add more data to trigger compaction
     for i in 0..5 {
         engine
             .set(format!("extra{}", i), format!("extra_value{}", i))
             .unwrap();
-        wait_for_flush(&engine, 1000).await;
+        wait_for_flush(&engine, 5000).await;
     }
 
     // Wait for compaction to complete and "keep" key to be accessible
-    // Use longer timeout since compaction can take time under load
     let engine_ref = &engine;
     let found = wait_for_condition(|| engine_ref.get("keep".to_string()).is_ok(), 30000).await;
     assert!(found, "keep key should be accessible after compaction");
