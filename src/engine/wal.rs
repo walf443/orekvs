@@ -3,7 +3,34 @@
 //! Shared functionality for Write-Ahead Log implementations across different
 //! storage engines (LSM-Tree, B-Tree).
 
+use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Common trait for WAL writers
+///
+/// Provides a common interface for WAL state queries and management operations.
+/// Write operations are not included in this trait because B-Tree uses
+/// synchronous I/O while LSM-Tree uses asynchronous I/O.
+pub trait WalWriter {
+    /// Get current WAL ID
+    fn current_id(&self) -> u64;
+
+    /// Get current sequence number (next to be allocated)
+    fn current_seq(&self) -> u64;
+
+    /// Get data directory path
+    fn data_dir(&self) -> &Path;
+
+    /// Rotate to a new WAL file
+    ///
+    /// Creates a new WAL file with an incremented ID and switches to it.
+    /// Returns the new WAL ID.
+    fn rotate(&self) -> io::Result<u64>;
+
+    /// Delete WAL files up to (and including) the given ID
+    fn delete_wals_up_to(&self, max_id: u64) -> io::Result<()>;
+}
 
 /// Compute CRC32 checksum using crc32fast
 pub fn crc32(data: &[u8]) -> u32 {

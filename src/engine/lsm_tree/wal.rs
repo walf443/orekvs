@@ -10,7 +10,7 @@ use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
-use crate::engine::wal::{SeqGenerator, crc32};
+use crate::engine::wal::{SeqGenerator, WalWriter, crc32};
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 /// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
@@ -176,6 +176,31 @@ impl GroupCommitWalWriter {
     /// Get current WAL ID
     pub fn current_id(&self) -> u64 {
         self.current_id.load(Ordering::SeqCst)
+    }
+
+    /// Get data directory path
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Delete WAL files up to (and including) the given ID
+    pub fn delete_wals_up_to(&self, max_id: u64) -> std::io::Result<()> {
+        use crate::engine::wal::parse_wal_filename;
+
+        for entry in std::fs::read_dir(&self.data_dir)? {
+            let entry = entry?;
+            let filename = entry.file_name();
+            let filename_str = filename.to_string_lossy();
+
+            if let Some(id) = parse_wal_filename(&filename_str)
+                && id <= max_id
+            {
+                std::fs::remove_file(entry.path())?;
+                println!("Deleted old WAL: {:?}", entry.path());
+            }
+        }
+
+        Ok(())
     }
 
     /// Create a new WAL file and return the file handle
@@ -765,6 +790,28 @@ impl GroupCommitWalWriter {
     /// Delegates to the common WAL utility function.
     pub fn parse_wal_filename(filename: &str) -> Option<u64> {
         crate::engine::wal::parse_wal_filename(filename)
+    }
+}
+
+impl WalWriter for GroupCommitWalWriter {
+    fn current_id(&self) -> u64 {
+        self.current_id.load(Ordering::SeqCst)
+    }
+
+    fn current_seq(&self) -> u64 {
+        self.seq_gen.current()
+    }
+
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    fn rotate(&self) -> std::io::Result<u64> {
+        GroupCommitWalWriter::rotate(self).map_err(|e| std::io::Error::other(e.message()))
+    }
+
+    fn delete_wals_up_to(&self, max_id: u64) -> std::io::Result<()> {
+        GroupCommitWalWriter::delete_wals_up_to(self, max_id)
     }
 }
 

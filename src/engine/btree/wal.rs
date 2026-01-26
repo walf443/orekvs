@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine::wal::{SeqGenerator, crc32};
+use crate::engine::wal::{SeqGenerator, WalWriter, crc32};
 
 /// WAL magic number
 const WAL_MAGIC: u32 = 0x4257_414C; // "BWAL"
@@ -1110,6 +1110,28 @@ impl Drop for GroupCommitWalWriter {
                 guard.take();
             }
         }
+    }
+}
+
+impl WalWriter for GroupCommitWalWriter {
+    fn current_id(&self) -> u64 {
+        self.current_id.load(Ordering::SeqCst)
+    }
+
+    fn current_seq(&self) -> u64 {
+        self.seq_gen.current()
+    }
+
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    fn rotate(&self) -> io::Result<u64> {
+        GroupCommitWalWriter::rotate(self)
+    }
+
+    fn delete_wals_up_to(&self, max_id: u64) -> io::Result<()> {
+        GroupCommitWalWriter::delete_wals_up_to(self, max_id)
     }
 }
 
