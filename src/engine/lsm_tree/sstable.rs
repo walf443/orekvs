@@ -9,6 +9,7 @@ use tonic::Status;
 use super::block_cache::{BlockCache, BlockCacheKey, CacheEntry, ParsedBlockEntry};
 use super::bloom::BloomFilter;
 use super::buffer_pool::PooledBuffer;
+use super::common_prefix_compression_index as prefix_index;
 use super::memtable::MemTable;
 use super::mmap::MappedFile;
 
@@ -27,9 +28,6 @@ pub const HEADER_SIZE: u64 = 10;
 // Footer size: index_offset(8) + bloom_offset(8) + keyrange_offset(8) + footer_magic(8)
 pub const FOOTER_SIZE: u64 = 32;
 
-// Prefix compression restart interval for index
-// Every N entries, store full key for random access
-const INDEX_RESTART_INTERVAL: u32 = 16;
 // Footer magic bytes
 pub const FOOTER_MAGIC: u64 = 0x4F52454C534D4654; // "ORELSMFT" in hex
 // Target block size for compression (bytes)
@@ -273,67 +271,8 @@ impl MappedSSTable {
         let decompressed = zstd::decode_all(Cursor::new(compressed))
             .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
 
-        // Parse index entries (v5+ uses prefix compression)
-        self.parse_index_v5(&decompressed)
-    }
-
-    /// Parse V5 index format (with prefix compression)
-    /// Unified format: every entry uses prefix_len (u16) + suffix_len (u16) + suffix
-    #[allow(clippy::result_large_err)]
-    fn parse_index_v5(&self, decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
-        let mut cursor = Cursor::new(decompressed);
-
-        // Read header
-        let mut num_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut num_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let num_entries = u64::from_le_bytes(num_bytes);
-
-        // Read restart_interval (stored but not needed for reading with unified format)
-        let mut interval_bytes = [0u8; 4];
-        cursor
-            .read_exact(&mut interval_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let mut index = Vec::with_capacity(num_entries as usize);
-        let mut prev_key = Vec::new();
-
-        for _ in 0..num_entries {
-            // Unified format: prefix_len (u16) + suffix_len (u16) + suffix
-            let mut prefix_len_bytes = [0u8; 2];
-            cursor
-                .read_exact(&mut prefix_len_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let prefix_len = u16::from_le_bytes(prefix_len_bytes) as usize;
-
-            let mut suffix_len_bytes = [0u8; 2];
-            cursor
-                .read_exact(&mut suffix_len_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let suffix_len = u16::from_le_bytes(suffix_len_bytes) as usize;
-
-            let mut suffix = vec![0u8; suffix_len];
-            cursor
-                .read_exact(&mut suffix)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Reconstruct key from prefix + suffix
-            let mut key_buf = prev_key[..prefix_len].to_vec();
-            key_buf.extend_from_slice(&suffix);
-
-            let mut off_bytes = [0u8; 8];
-            cursor
-                .read_exact(&mut off_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let offset = u64::from_le_bytes(off_bytes);
-
-            let key_string = String::from_utf8_lossy(&key_buf).to_string();
-            prev_key = key_buf;
-            index.push((key_string, offset));
-        }
-
-        Ok(index)
+        // Parse index entries using prefix compression module
+        prefix_index::parse_index(&decompressed)
     }
 
     /// Read and decompress a block at the given offset
@@ -465,7 +404,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     let index_offset = u64::from_le_bytes(footer);
 
     // Read index (v5+ uses prefix compression)
-    let index = read_index_prefix_compressed(&mut file, index_offset)?;
+    let index = prefix_index::read_index(&mut file, index_offset)?;
 
     // Binary search in index
     let start_offset = match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
@@ -569,6 +508,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
 /// Search for a key in an SSTable file with block cache support
 /// Uses binary search on parsed block entries for O(log n) lookup within blocks
 #[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::result_large_err)]
 pub fn search_key_cached(
     path: &Path,
@@ -686,6 +626,7 @@ fn get_or_load_parsed_block_mmap(
 
 /// Get index from cache or load from file
 #[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::result_large_err)]
 fn get_or_load_index(
     path: &Path,
@@ -744,7 +685,7 @@ fn get_or_load_index(
     let index_offset = u64::from_le_bytes(footer);
 
     // Read and decompress index (v5+ uses prefix compression)
-    let index = read_index_prefix_compressed(&mut file, index_offset)?;
+    let index = prefix_index::read_index(&mut file, index_offset)?;
     let arc_index = Arc::new(index);
 
     // Cache it
@@ -756,6 +697,7 @@ fn get_or_load_index(
 /// Get parsed block from cache or load and parse from file
 /// Returns parsed entries sorted by key for binary search
 #[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::result_large_err)]
 fn get_or_load_parsed_block(
     path: &Path,
@@ -1204,7 +1146,7 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
 
     // Write index with prefix compression (V6 with checksum)
     let index_offset = current_offset;
-    let index_size = write_index_prefix_compressed_v6(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = prefix_index::write_index(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
     current_offset += index_size;
 
     // Write Bloom filter
@@ -1349,7 +1291,7 @@ pub fn write_timestamped_entries(
 
     // Write index with prefix compression (V6 with checksum)
     let index_offset = current_offset;
-    let index_size = write_index_prefix_compressed_v6(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
+    let index_size = prefix_index::write_index(&mut file, &index, COMPRESSION_LEVEL_INDEX)?;
     current_offset += index_size;
 
     // Write Bloom filter
@@ -1554,6 +1496,7 @@ pub fn read_bloom_filter(path: &Path) -> Result<BloomFilter, Status> {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::result_large_err)]
 fn write_index_compressed(
     file: &mut File,
@@ -1593,217 +1536,6 @@ fn write_index_compressed(
 
     // Return total bytes written: 8 (size) + len (compressed data)
     Ok(8 + len)
-}
-
-/// Compute the length of the common prefix between two byte slices
-fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-/// Write index with prefix compression (V5 format)
-/// Format:
-/// - num_entries: u64
-/// - restart_interval: u32
-/// - For each entry (unified format):
-///   - prefix_len (u16) + suffix_len (u16) + suffix + offset (u64)
-///   - Restart points have prefix_len = 0, suffix = full key
-#[cfg(test)]
-#[allow(clippy::result_large_err)]
-fn write_index_prefix_compressed(
-    file: &mut File,
-    index: &[(String, u64)],
-    compression_level: i32,
-) -> Result<u64, Status> {
-    let mut buffer = Vec::new();
-    let num_entries = index.len() as u64;
-
-    buffer
-        .write_all(&num_entries.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-    buffer
-        .write_all(&INDEX_RESTART_INTERVAL.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut prev_key: &[u8] = &[];
-
-    for (i, (key, offset)) in index.iter().enumerate() {
-        let key_bytes = key.as_bytes();
-
-        // Unified format: prefix_len (u16) + suffix_len (u16) + suffix
-        // Restart points use prefix_len = 0
-        let prefix_len = if (i as u32).is_multiple_of(INDEX_RESTART_INTERVAL) {
-            0
-        } else {
-            common_prefix_len(prev_key, key_bytes)
-        };
-        let suffix = &key_bytes[prefix_len..];
-
-        buffer
-            .write_all(&(prefix_len as u16).to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        buffer
-            .write_all(&(suffix.len() as u16).to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        buffer
-            .write_all(suffix)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        buffer
-            .write_all(&offset.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        prev_key = key_bytes;
-    }
-
-    let compressed = zstd::encode_all(Cursor::new(&buffer), compression_level)
-        .map_err(|e| Status::internal(format!("Index compression error: {}", e)))?;
-
-    // Write compressed size then data
-    let len = compressed.len() as u64;
-    file.write_all(&len.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(&compressed)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok(8 + len)
-}
-
-/// Write index with prefix compression and checksum (V6 format)
-#[allow(clippy::result_large_err)]
-fn write_index_prefix_compressed_v6(
-    file: &mut File,
-    index: &[(String, u64)],
-    compression_level: i32,
-) -> Result<u64, Status> {
-    let mut buffer = Vec::new();
-    let num_entries = index.len() as u64;
-
-    buffer
-        .write_all(&num_entries.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-    buffer
-        .write_all(&INDEX_RESTART_INTERVAL.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut prev_key: &[u8] = &[];
-
-    for (i, (key, offset)) in index.iter().enumerate() {
-        let key_bytes = key.as_bytes();
-
-        let prefix_len = if (i as u32).is_multiple_of(INDEX_RESTART_INTERVAL) {
-            0
-        } else {
-            common_prefix_len(prev_key, key_bytes)
-        };
-        let suffix = &key_bytes[prefix_len..];
-
-        buffer
-            .write_all(&(prefix_len as u16).to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        buffer
-            .write_all(&(suffix.len() as u16).to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        buffer
-            .write_all(suffix)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        buffer
-            .write_all(&offset.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        prev_key = key_bytes;
-    }
-
-    let compressed = zstd::encode_all(Cursor::new(&buffer), compression_level)
-        .map_err(|e| Status::internal(format!("Index compression error: {}", e)))?;
-
-    // Write compressed size, data, and checksum
-    let len = compressed.len() as u64;
-    let checksum = crc32(&compressed);
-    file.write_all(&len.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(&compressed)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(&checksum.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok(8 + len + 4) // size + data + checksum
-}
-
-/// Read index with prefix compression (V5 format)
-/// Unified format: every entry uses prefix_len (u16) + suffix_len (u16) + suffix
-#[cfg(test)]
-#[allow(clippy::result_large_err)]
-fn read_index_prefix_compressed(
-    file: &mut File,
-    index_offset: u64,
-) -> Result<Vec<(String, u64)>, Status> {
-    file.seek(SeekFrom::Start(index_offset))
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut len_bytes = [0u8; 8];
-    file.read_exact(&mut len_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let len = u64::from_le_bytes(len_bytes);
-
-    let mut compressed = vec![0u8; len as usize];
-    file.read_exact(&mut compressed)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let decompressed = zstd::decode_all(Cursor::new(&compressed))
-        .map_err(|e| Status::internal(format!("Index decompression error: {}", e)))?;
-
-    let mut cursor = Cursor::new(decompressed);
-
-    // Read header
-    let mut num_bytes = [0u8; 8];
-    cursor
-        .read_exact(&mut num_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let num_entries = u64::from_le_bytes(num_bytes);
-
-    // Read restart_interval (stored but not needed for reading with unified format)
-    let mut interval_bytes = [0u8; 4];
-    cursor
-        .read_exact(&mut interval_bytes)
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut index = Vec::with_capacity(num_entries as usize);
-    let mut prev_key = Vec::new();
-
-    for _ in 0..num_entries {
-        // Unified format: prefix_len (u16) + suffix_len (u16) + suffix
-        let mut prefix_len_bytes = [0u8; 2];
-        cursor
-            .read_exact(&mut prefix_len_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let prefix_len = u16::from_le_bytes(prefix_len_bytes) as usize;
-
-        let mut suffix_len_bytes = [0u8; 2];
-        cursor
-            .read_exact(&mut suffix_len_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let suffix_len = u16::from_le_bytes(suffix_len_bytes) as usize;
-
-        let mut suffix = vec![0u8; suffix_len];
-        cursor
-            .read_exact(&mut suffix)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        // Reconstruct key from prefix + suffix
-        let mut key_buf = prev_key[..prefix_len].to_vec();
-        key_buf.extend_from_slice(&suffix);
-
-        let mut off_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut off_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let offset = u64::from_le_bytes(off_bytes);
-
-        let key_string = String::from_utf8_lossy(&key_buf).to_string();
-        prev_key = key_buf;
-        index.push((key_string, offset));
-    }
-
-    Ok(index)
 }
 
 #[cfg(test)]
@@ -2034,108 +1766,6 @@ mod tests {
 
         let result = search_key(&sst_path, "key1");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_prefix_compression_roundtrip() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join("index_test.data");
-
-        // Create index with keys that have common prefixes
-        let index: Vec<(String, u64)> = (0..50)
-            .map(|i| (format!("user:profile:{:05}", i), i * 100))
-            .collect();
-
-        // Write index with prefix compression
-        {
-            let mut file = File::create(&index_path).unwrap();
-            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
-        }
-
-        // Read it back
-        let read_index = {
-            let mut file = File::open(&index_path).unwrap();
-            read_index_prefix_compressed(&mut file, 0).unwrap()
-        };
-
-        // Verify all entries match
-        assert_eq!(index.len(), read_index.len());
-        for (original, read) in index.iter().zip(read_index.iter()) {
-            assert_eq!(original.0, read.0, "Key mismatch");
-            assert_eq!(original.1, read.1, "Offset mismatch");
-        }
-    }
-
-    #[test]
-    fn test_prefix_compression_restart_points() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join("restart_test.data");
-
-        // Create index with 20 entries (more than restart interval of 16)
-        // to verify restart points work correctly
-        let index: Vec<(String, u64)> =
-            (0..20).map(|i| (format!("key:{:03}", i), i * 50)).collect();
-
-        {
-            let mut file = File::create(&index_path).unwrap();
-            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
-        }
-
-        let read_index = {
-            let mut file = File::open(&index_path).unwrap();
-            read_index_prefix_compressed(&mut file, 0).unwrap()
-        };
-
-        // Entry 0 and 16 are restart points (prefix_len = 0)
-        // Verify they are correctly reconstructed
-        assert_eq!(read_index[0].0, "key:000");
-        assert_eq!(read_index[16].0, "key:016");
-        assert_eq!(read_index.len(), 20);
-    }
-
-    #[test]
-    fn test_prefix_compression_no_common_prefix() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join("no_prefix_test.data");
-
-        // Keys with no common prefix
-        let index: Vec<(String, u64)> = vec![
-            ("apple".to_string(), 100),
-            ("banana".to_string(), 200),
-            ("cherry".to_string(), 300),
-        ];
-
-        {
-            let mut file = File::create(&index_path).unwrap();
-            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
-        }
-
-        let read_index = {
-            let mut file = File::open(&index_path).unwrap();
-            read_index_prefix_compressed(&mut file, 0).unwrap()
-        };
-
-        assert_eq!(read_index, index);
-    }
-
-    #[test]
-    fn test_prefix_compression_empty_index() {
-        let dir = tempdir().unwrap();
-        let index_path = dir.path().join("empty_index_test.data");
-
-        let index: Vec<(String, u64)> = vec![];
-
-        {
-            let mut file = File::create(&index_path).unwrap();
-            write_index_prefix_compressed(&mut file, &index, 3).unwrap();
-        }
-
-        let read_index = {
-            let mut file = File::open(&index_path).unwrap();
-            read_index_prefix_compressed(&mut file, 0).unwrap()
-        };
-
-        assert!(read_index.is_empty());
     }
 
     #[test]
