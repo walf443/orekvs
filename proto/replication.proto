@@ -29,6 +29,7 @@ message WALBatch {
   uint64 end_offset = 3;
   bytes compressed_data = 4;  // zstd圧縮されたWALエントリ群
   uint32 entry_count = 5;
+  bool snapshot_required = 6; // WALギャップ検出時にスナップショットが必要
 }
 
 message LeaderInfo {

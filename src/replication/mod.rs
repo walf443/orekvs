@@ -41,6 +41,8 @@ const REALTIME_POLL_INTERVAL_MS: u64 = 10;
 const MAX_ENTRY_SIZE: u64 = 1024 * 1024 * 1024;
 /// Chunk size for snapshot file transfer (64KB)
 const SNAPSHOT_CHUNK_SIZE: usize = 64 * 1024;
+/// Error code for WAL gap detection (used to signal snapshot required)
+const WAL_GAP_ERROR_CODE: &str = "WAL_GAP_DETECTED";
 
 /// Leader-side replication service
 pub struct ReplicationService {
@@ -152,9 +154,10 @@ impl ReplicationService {
 
         let Some(path) = wal_path else {
             // WAL file not found, check if there's a newer one
-            if let Some((newer_id, _)) = wal_files.iter().find(|(id, _)| *id > wal_id) {
-                // Start from beginning of newer file
-                return self.read_wal_entries_from(*newer_id, 0, max_entries, max_bytes);
+            if wal_files.iter().any(|(id, _)| *id > wal_id) {
+                // WAL gap detected! The requested WAL was deleted but newer ones exist.
+                // This means the follower is too far behind and needs a snapshot.
+                return Err(Status::failed_precondition(WAL_GAP_ERROR_CODE));
             }
             // Also check if there's an older file we should start from (for initial sync)
             if wal_id == 0
@@ -683,6 +686,7 @@ impl Replication for ReplicationService {
                             end_offset: new_offset,
                             compressed_data: compressed,
                             entry_count,
+                            snapshot_required: false,
                         };
 
                         if tx.send(Ok(batch)).await.is_err() {
@@ -695,7 +699,25 @@ impl Replication for ReplicationService {
                         current_offset = new_offset;
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        // Check if this is a WAL gap error (follower is too far behind)
+                        if e.message() == WAL_GAP_ERROR_CODE {
+                            println!(
+                                "WAL gap detected for follower {}, sending snapshot_required signal",
+                                peer_addr_str
+                            );
+                            // Send a special batch to signal snapshot is required
+                            let batch = WalBatch {
+                                wal_id: current_wal_id,
+                                start_offset: current_offset,
+                                end_offset: current_offset,
+                                compressed_data: vec![],
+                                entry_count: 0,
+                                snapshot_required: true,
+                            };
+                            let _ = tx.send(Ok(batch)).await;
+                        } else {
+                            let _ = tx.send(Err(e)).await;
+                        }
                         break;
                     }
                 }
@@ -1067,6 +1089,30 @@ impl FollowerReplicator {
 
         while let Some(result) = tokio_stream::StreamExt::next(&mut stream).await {
             let batch = result?;
+
+            // Check if snapshot is required (WAL gap detected on leader)
+            if batch.snapshot_required {
+                println!("Leader signaled snapshot required due to WAL gap");
+                // Reconnect and download snapshot
+                drop(stream);
+                let mut client = ReplicationClient::connect(self.leader_addr.clone())
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to reconnect to leader: {}", e))
+                    })?;
+
+                if let Some((resume_wal_id, resume_offset)) = self
+                    .check_and_download_snapshot(&mut client, *wal_id)
+                    .await?
+                {
+                    return Ok(ReplicationResult::SnapshotApplied {
+                        resume_wal_id,
+                        resume_offset,
+                    });
+                }
+                // If snapshot wasn't required after all, continue
+                return Ok(ReplicationResult::Continue);
+            }
 
             // Decompress
             let decompressed = zstd::decode_all(Cursor::new(&batch.compressed_data))
