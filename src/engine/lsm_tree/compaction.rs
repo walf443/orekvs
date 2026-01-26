@@ -398,12 +398,28 @@ mod tests {
     use tempfile::tempdir;
 
     fn create_test_sstable(dir: &Path, filename: &str, entries: &[(&str, &str)]) -> PathBuf {
+        create_test_sstable_with_timestamp(dir, filename, entries, None)
+    }
+
+    /// Create a test SSTable with explicit timestamp to avoid flaky tests
+    fn create_test_sstable_with_timestamp(
+        dir: &Path,
+        filename: &str,
+        entries: &[(&str, &str)],
+        timestamp: Option<u64>,
+    ) -> PathBuf {
         let path = dir.join(filename);
-        let mut memtable: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let ts = timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+        let mut timestamped: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
         for (k, v) in entries {
-            memtable.insert(k.to_string(), Some(v.to_string()));
+            timestamped.insert(k.to_string(), (ts, Some(v.to_string())));
         }
-        sstable::create_from_memtable(&path, &memtable).unwrap();
+        sstable::write_timestamped_entries(&path, &timestamped).unwrap();
         path
     }
 
@@ -472,17 +488,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let data_dir = dir.path();
 
-        // Create L0 files with overlapping keys
-        let l0_file1 =
-            create_test_sstable(data_dir, "sst_1_0.data", &[("a", "new_a"), ("b", "new_b")]);
-        let l0_file2 =
-            create_test_sstable(data_dir, "sst_2_0.data", &[("c", "new_c"), ("d", "new_d")]);
+        // Use explicit timestamps to ensure deterministic ordering
+        // L1 (old) has timestamp 1000, L0 (new) has timestamp 2000
+        let old_ts = 1000u64;
+        let new_ts = 2000u64;
 
-        // Create L1 file with some overlapping keys
-        let l1_file1 = create_test_sstable(
+        // Create L0 files with overlapping keys (newer timestamp)
+        let l0_file1 = create_test_sstable_with_timestamp(
+            data_dir,
+            "sst_1_0.data",
+            &[("a", "new_a"), ("b", "new_b")],
+            Some(new_ts),
+        );
+        let l0_file2 = create_test_sstable_with_timestamp(
+            data_dir,
+            "sst_2_0.data",
+            &[("c", "new_c"), ("d", "new_d")],
+            Some(new_ts),
+        );
+
+        // Create L1 file with some overlapping keys (older timestamp)
+        let l1_file1 = create_test_sstable_with_timestamp(
             data_dir,
             "sst_3_0.data",
             &[("b", "old_b"), ("c", "old_c"), ("e", "old_e")],
+            Some(old_ts),
         );
 
         let compaction =
@@ -667,15 +697,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let data_dir = dir.path();
 
-        // Create L1 file
-        let l1_file =
-            create_test_sstable(data_dir, "sst_1_0.data", &[("b", "new_b"), ("c", "new_c")]);
+        // Use explicit timestamps to ensure deterministic ordering
+        // L2 (old) has timestamp 1000, L1 (new) has timestamp 2000
+        let old_ts = 1000u64;
+        let new_ts = 2000u64;
 
-        // Create L2 file with some overlapping keys
-        let l2_file = create_test_sstable(
+        // Create L1 file (newer timestamp)
+        let l1_file = create_test_sstable_with_timestamp(
+            data_dir,
+            "sst_1_0.data",
+            &[("b", "new_b"), ("c", "new_c")],
+            Some(new_ts),
+        );
+
+        // Create L2 file with some overlapping keys (older timestamp)
+        let l2_file = create_test_sstable_with_timestamp(
             data_dir,
             "sst_2_0.data",
             &[("a", "old_a"), ("b", "old_b"), ("d", "old_d")],
+            Some(old_ts),
         );
 
         let compaction =

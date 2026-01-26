@@ -447,17 +447,25 @@ impl LsmTreeEngine {
             .iter()
             .any(|p| sstable::extract_wal_id_from_sstable(p).is_some());
 
+        // Get last flushed WAL sequence from manifest for LSN-based recovery
+        let last_flushed_wal_seq = manifest.last_flushed_wal_seq;
+        let mut max_wal_seq = last_flushed_wal_seq;
+
         for (wal_id, wal_path) in &wal_files {
             // Recover WAL files that are newer than the latest flushed WAL ID
             // If no SSTables have WAL ID info, recover all WAL files
             let should_recover = !has_sstables_with_wal_id || *wal_id > max_wal_id_in_sst;
             if should_recover {
-                match GroupCommitWalWriter::read_entries(wal_path) {
+                // Try LSN-based recovery first (v4 WAL format)
+                // If WAL is older version, fall back to full recovery
+                match GroupCommitWalWriter::read_entries_with_seq(wal_path, last_flushed_wal_seq) {
                     Ok(entries) => {
-                        for (key, value) in entries {
-                            let entry_size = memtable::estimate_entry_size(&key, &value);
-                            if let Some(old_value) = recovered_memtable.get(&key) {
-                                let old_size = memtable::estimate_entry_size(&key, old_value);
+                        for entry in entries {
+                            max_wal_seq = max_wal_seq.max(entry.seq);
+                            let entry_size =
+                                memtable::estimate_entry_size(&entry.key, &entry.value);
+                            if let Some(old_value) = recovered_memtable.get(&entry.key) {
+                                let old_size = memtable::estimate_entry_size(&entry.key, old_value);
                                 if entry_size > old_size {
                                     recovered_size += entry_size - old_size;
                                 } else {
@@ -466,16 +474,44 @@ impl LsmTreeEngine {
                             } else {
                                 recovered_size += entry_size;
                             }
-                            recovered_memtable.insert(key, value);
+                            recovered_memtable.insert(entry.key, entry.value);
                         }
                         println!(
-                            "Recovered {} entries from WAL: {:?}",
+                            "Recovered {} entries from WAL (LSN > {}): {:?}",
                             recovered_memtable.len(),
+                            last_flushed_wal_seq,
                             wal_path
                         );
                     }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to read WAL {:?}: {}", wal_path, e);
+                    Err(_) => {
+                        // Fall back to reading all entries for older WAL versions
+                        match GroupCommitWalWriter::read_entries(wal_path) {
+                            Ok(entries) => {
+                                for (key, value) in entries {
+                                    let entry_size = memtable::estimate_entry_size(&key, &value);
+                                    if let Some(old_value) = recovered_memtable.get(&key) {
+                                        let old_size =
+                                            memtable::estimate_entry_size(&key, old_value);
+                                        if entry_size > old_size {
+                                            recovered_size += entry_size - old_size;
+                                        } else {
+                                            recovered_size -= old_size - entry_size;
+                                        }
+                                    } else {
+                                        recovered_size += entry_size;
+                                    }
+                                    recovered_memtable.insert(key, value);
+                                }
+                                println!(
+                                    "Recovered {} entries from WAL (full replay): {:?}",
+                                    recovered_memtable.len(),
+                                    wal_path
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Failed to read WAL {:?}: {}", wal_path, e);
+                            }
+                        }
                     }
                 }
             }
@@ -484,9 +520,14 @@ impl LsmTreeEngine {
         // Determine next WAL ID
         let next_wal_id = if max_wal_id > 0 { max_wal_id } else { 0 };
 
-        // Create new WAL file with group commit
-        let wal = GroupCommitWalWriter::new(&data_dir, next_wal_id, wal_batch_interval_micros)
-            .expect("Failed to create initial WAL");
+        // Create new WAL file with group commit, starting from max recovered sequence number
+        let wal = GroupCommitWalWriter::new_with_seq(
+            &data_dir,
+            next_wal_id,
+            wal_batch_interval_micros,
+            max_wal_seq,
+        )
+        .expect("Failed to create initial WAL");
 
         // Re-write recovered entries to new WAL for safety
         if !recovered_memtable.is_empty() {
@@ -569,7 +610,7 @@ impl LsmTreeEngine {
             leveled.add_to_level(0, handle);
         }
 
-        // Update manifest with new SSTable
+        // Update manifest with new SSTable and current WAL sequence
         {
             let mut manifest = self.manifest.lock().unwrap();
             manifest.add_entry(ManifestEntry::new(
@@ -580,6 +621,9 @@ impl LsmTreeEngine {
                 file_size,
                 entry_count,
             ));
+            // Record the current WAL sequence for LSN-based recovery
+            // All entries with seq <= this value are now persisted in SSTables
+            manifest.set_last_flushed_wal_seq(self.wal.current_seq().saturating_sub(1));
             if let Err(e) = manifest.save(&self.data_dir) {
                 eprintln!("Warning: Failed to save manifest: {}", e);
             }
@@ -973,6 +1017,7 @@ impl Engine for LsmTreeEngine {
             tokio::runtime::Handle::current()
                 .block_on(synced_rx)
                 .map_err(|_| Status::internal("WAL synced channel closed"))?
+                .map(|_seq| ()) // Discard the sequence number
         })
     }
 
@@ -1057,6 +1102,7 @@ impl Engine for LsmTreeEngine {
             tokio::runtime::Handle::current()
                 .block_on(synced_rx)
                 .map_err(|_| Status::internal("WAL synced channel closed"))?
+                .map(|_seq| ()) // Discard the sequence number
         })
     }
 
@@ -1098,6 +1144,7 @@ impl Engine for LsmTreeEngine {
             tokio::runtime::Handle::current()
                 .block_on(synced_rx)
                 .map_err(|_| Status::internal("WAL synced channel closed"))?
+                .map(|_seq| ()) // Discard the sequence number
         })?;
 
         Ok(count)
@@ -1215,6 +1262,7 @@ impl Engine for LsmTreeEngine {
             tokio::runtime::Handle::current()
                 .block_on(synced_rx)
                 .map_err(|_| Status::internal("WAL synced channel closed"))?
+                .map(|_seq| ()) // Discard the sequence number
         })?;
 
         Ok(count)

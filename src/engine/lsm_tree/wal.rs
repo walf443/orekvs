@@ -12,11 +12,22 @@ use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
-const WAL_VERSION: u32 = 3;
+/// WAL format version
+/// v3: Block-based with optional compression
+/// v4: Added per-entry sequence numbers for LSN-based recovery
+const WAL_VERSION: u32 = 4;
 /// Minimum batch size in bytes to enable compression
 const COMPRESSION_THRESHOLD: usize = 512;
 /// Block flag: compressed
 const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
+
+/// WAL entry with sequence number for recovery filtering
+#[derive(Debug, Clone)]
+pub struct WalEntry {
+    pub seq: u64,
+    pub key: String,
+    pub value: Option<String>,
+}
 
 /// Compute CRC32C checksum
 fn crc32(data: &[u8]) -> u32 {
@@ -27,21 +38,22 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// Write request for group commit with pipelining
 struct WriteRequest {
+    seq: u64,
     key: String,
     value: Option<String>,
     /// Notified when data is written to OS buffer
     written_tx: Option<oneshot::Sender<()>>,
-    /// Notified when data is synced to disk
-    synced_tx: oneshot::Sender<Result<(), Status>>,
+    /// Notified when data is synced to disk (returns the sequence number)
+    synced_tx: oneshot::Sender<Result<u64, Status>>,
 }
 
 /// Batch write request - multiple entries with single notification
 struct BatchWriteRequest {
-    entries: Vec<(String, Option<String>)>,
+    entries: Vec<(u64, String, Option<String>)>, // (seq, key, value)
     /// Notified when all data is written to OS buffer
     written_tx: Option<oneshot::Sender<()>>,
-    /// Notified when all data is synced to disk
-    synced_tx: oneshot::Sender<Result<(), Status>>,
+    /// Notified when all data is synced to disk (returns the max sequence number)
+    synced_tx: oneshot::Sender<Result<u64, Status>>,
 }
 
 /// Request type sent to the background flusher
@@ -63,6 +75,8 @@ pub struct GroupCommitWalWriter {
     request_tx: Arc<Mutex<Option<mpsc::Sender<FlushRequest>>>>,
     /// Current WAL ID
     current_id: Arc<AtomicU64>,
+    /// Next sequence number for WAL entries (LSN)
+    next_seq: Arc<AtomicU64>,
     /// Data directory
     data_dir: PathBuf,
     /// Inner state shared with background task
@@ -77,6 +91,7 @@ impl std::fmt::Debug for GroupCommitWalWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupCommitWalWriter")
             .field("current_id", &self.current_id)
+            .field("next_seq", &self.next_seq)
             .field("data_dir", &self.data_dir)
             .field("batch_interval_micros", &self.batch_interval_micros)
             .finish()
@@ -88,6 +103,7 @@ impl Clone for GroupCommitWalWriter {
         GroupCommitWalWriter {
             request_tx: Arc::clone(&self.request_tx),
             current_id: Arc::clone(&self.current_id),
+            next_seq: Arc::clone(&self.next_seq),
             data_dir: self.data_dir.clone(),
             inner: Arc::clone(&self.inner),
             batch_interval_micros: self.batch_interval_micros,
@@ -100,6 +116,17 @@ impl GroupCommitWalWriter {
     /// Create a new group commit WAL writer
     #[allow(clippy::result_large_err)]
     pub fn new(data_dir: &Path, wal_id: u64, batch_interval_micros: u64) -> Result<Self, Status> {
+        Self::new_with_seq(data_dir, wal_id, batch_interval_micros, 0)
+    }
+
+    /// Create a new group commit WAL writer with initial sequence number
+    #[allow(clippy::result_large_err)]
+    pub fn new_with_seq(
+        data_dir: &Path,
+        wal_id: u64,
+        batch_interval_micros: u64,
+        initial_seq: u64,
+    ) -> Result<Self, Status> {
         let (file, path) = Self::create_wal_file(data_dir, wal_id)?;
 
         let inner = Arc::new(Mutex::new(WalWriterInner { writer: file, path }));
@@ -115,11 +142,22 @@ impl GroupCommitWalWriter {
         Ok(GroupCommitWalWriter {
             request_tx: Arc::new(Mutex::new(Some(tx))),
             current_id: Arc::new(AtomicU64::new(wal_id)),
+            next_seq: Arc::new(AtomicU64::new(initial_seq + 1)),
             data_dir: data_dir.to_path_buf(),
             inner,
             batch_interval_micros,
             flusher_handle: Arc::new(Mutex::new(Some(handle))),
         })
+    }
+
+    /// Get the current (next) sequence number
+    pub fn current_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::SeqCst)
+    }
+
+    /// Allocate the next sequence number
+    fn allocate_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Shutdown the WAL writer gracefully, flushing all pending writes
@@ -221,19 +259,25 @@ impl GroupCommitWalWriter {
 
         // Stage 1: Serialize all entries to a pooled buffer (reduces allocation overhead)
         let mut entries_buf = PooledBuffer::new(4096);
+        let mut max_seq = 0u64;
         for req in pending.iter() {
             match req {
                 FlushRequest::Single(single) => {
-                    if let Err(e) =
-                        Self::serialize_entry(&mut entries_buf, &single.key, &single.value)
-                    {
+                    max_seq = max_seq.max(single.seq);
+                    if let Err(e) = Self::serialize_entry(
+                        &mut entries_buf,
+                        single.seq,
+                        &single.key,
+                        &single.value,
+                    ) {
                         Self::notify_all_error(pending, e);
                         return;
                     }
                 }
                 FlushRequest::Batch(batch) => {
-                    for (key, value) in &batch.entries {
-                        if let Err(e) = Self::serialize_entry(&mut entries_buf, key, value) {
+                    for (seq, key, value) in &batch.entries {
+                        max_seq = max_seq.max(*seq);
+                        if let Err(e) = Self::serialize_entry(&mut entries_buf, *seq, key, value) {
                             Self::notify_all_error(pending, e);
                             return;
                         }
@@ -270,14 +314,23 @@ impl GroupCommitWalWriter {
             .sync_data()
             .map_err(|e| Status::internal(e.to_string()));
 
-        // Stage 4: Notify "synced"
+        // Stage 4: Notify "synced" with their sequence numbers
         for req in pending.drain(..) {
             match req {
                 FlushRequest::Single(single) => {
-                    let _ = single.synced_tx.send(sync_result.clone());
+                    let result = sync_result.clone().map(|()| single.seq);
+                    let _ = single.synced_tx.send(result);
                 }
                 FlushRequest::Batch(batch) => {
-                    let _ = batch.synced_tx.send(sync_result.clone());
+                    // Return the max sequence number for the batch
+                    let batch_max_seq = batch
+                        .entries
+                        .iter()
+                        .map(|(seq, _, _)| *seq)
+                        .max()
+                        .unwrap_or(0);
+                    let result = sync_result.clone().map(|()| batch_max_seq);
+                    let _ = batch.synced_tx.send(result);
                 }
             }
         }
@@ -298,8 +351,14 @@ impl GroupCommitWalWriter {
     }
 
     /// Serialize a single entry to a buffer
+    /// v4 format: [seq: u64][timestamp: u64][key_len: u64][value_len: u64][key][value]
     #[allow(clippy::result_large_err)]
-    fn serialize_entry(buf: &mut Vec<u8>, key: &str, value: &Option<String>) -> Result<(), Status> {
+    fn serialize_entry(
+        buf: &mut Vec<u8>,
+        seq: u64,
+        key: &str,
+        value: &Option<String>,
+    ) -> Result<(), Status> {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u64;
         let (val_len, val_bytes): (u64, &[u8]) = match value {
@@ -312,6 +371,7 @@ impl GroupCommitWalWriter {
             .unwrap()
             .as_secs();
 
+        buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&timestamp.to_le_bytes());
         buf.extend_from_slice(&key_len.to_le_bytes());
         buf.extend_from_slice(&val_len.to_le_bytes());
@@ -387,16 +447,24 @@ impl GroupCommitWalWriter {
     }
 
     /// Append an entry to the WAL with pipelining support.
-    /// Returns two receivers: one for when it's written to OS buffer, one for when it's synced to disk.
+    /// Returns two receivers: one for when it's written to OS buffer, one for when it's synced to disk (with seq number).
     pub async fn append_pipelined(
         &self,
         key: &str,
         value: &Option<String>,
-    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<Result<(), Status>>), Status> {
+    ) -> Result<
+        (
+            oneshot::Receiver<()>,
+            oneshot::Receiver<Result<u64, Status>>,
+        ),
+        Status,
+    > {
         let (written_tx, written_rx) = oneshot::channel();
         let (synced_tx, synced_rx) = oneshot::channel();
 
+        let seq = self.allocate_seq();
         let request = FlushRequest::Single(WriteRequest {
+            seq,
             key: key.to_string(),
             value: value.clone(),
             written_tx: Some(written_tx),
@@ -420,16 +488,31 @@ impl GroupCommitWalWriter {
     }
 
     /// Append multiple entries to the WAL as a batch with pipelining support.
-    /// Returns two receivers: one for when all data is written to OS buffer, one for when it's synced to disk.
+    /// Returns two receivers: one for when all data is written to OS buffer, one for when it's synced to disk (with max seq number).
     pub async fn append_batch_pipelined(
         &self,
         entries: Vec<(String, Option<String>)>,
-    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<Result<(), Status>>), Status> {
+    ) -> Result<
+        (
+            oneshot::Receiver<()>,
+            oneshot::Receiver<Result<u64, Status>>,
+        ),
+        Status,
+    > {
         let (written_tx, written_rx) = oneshot::channel();
         let (synced_tx, synced_rx) = oneshot::channel();
 
+        // Allocate sequence numbers for each entry
+        let entries_with_seq: Vec<(u64, String, Option<String>)> = entries
+            .into_iter()
+            .map(|(key, value)| {
+                let seq = self.allocate_seq();
+                (seq, key, value)
+            })
+            .collect();
+
         let request = FlushRequest::Batch(BatchWriteRequest {
-            entries,
+            entries: entries_with_seq,
             written_tx: Some(written_tx),
             synced_tx,
         });
@@ -451,14 +534,18 @@ impl GroupCommitWalWriter {
     }
 
     /// Write multiple entries to the WAL (used for recovery re-write)
+    /// Returns the maximum sequence number written
     #[allow(clippy::result_large_err)]
-    pub fn write_entries(&self, entries: &MemTable) -> Result<(), Status> {
+    pub fn write_entries(&self, entries: &MemTable) -> Result<u64, Status> {
         let mut guard = self.inner.lock().unwrap();
 
-        // Serialize all entries to buffer
+        // Serialize all entries to buffer with sequence numbers
         let mut buf = Vec::new();
+        let mut max_seq = 0u64;
         for (key, value) in entries {
-            Self::serialize_entry(&mut buf, key, value)?;
+            let seq = self.allocate_seq();
+            max_seq = max_seq.max(seq);
+            Self::serialize_entry(&mut buf, seq, key, value)?;
         }
 
         // Write as a block
@@ -469,7 +556,7 @@ impl GroupCommitWalWriter {
             .sync_data()
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(())
+        Ok(max_seq)
     }
 
     /// Rotate WAL: create a new WAL file (old WAL is preserved for replication)
@@ -527,10 +614,57 @@ impl GroupCommitWalWriter {
         match version {
             2 => Self::read_entries_v2(&mut file),
             3 => Self::read_entries_v3(&mut file),
+            4 => Self::read_entries_v4(&mut file)
+                .map(|entries| entries.into_iter().map(|e| (e.key, e.value)).collect()),
             _ => Err(Status::internal(format!(
-                "Unsupported WAL version: {}. Only versions 2-3 are supported.",
+                "Unsupported WAL version: {}. Only versions 2-4 are supported.",
                 version
             ))),
+        }
+    }
+
+    /// Read all entries from a WAL file with their sequence numbers (v4 only)
+    /// Returns entries with seq > min_seq for incremental recovery
+    #[allow(clippy::result_large_err)]
+    pub fn read_entries_with_seq(path: &Path, min_seq: u64) -> Result<Vec<WalEntry>, Status> {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(Status::internal(e.to_string())),
+        };
+
+        // Verify header
+        let mut magic = [0u8; 9];
+        if file.read_exact(&mut magic).is_err() {
+            return Ok(Vec::new()); // Empty file
+        }
+        if &magic != WAL_MAGIC_BYTES {
+            return Err(Status::internal("Invalid WAL magic bytes"));
+        }
+
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let version = u32::from_le_bytes(version_bytes);
+
+        match version {
+            4 => {
+                let all_entries = Self::read_entries_v4(&mut file)?;
+                // Filter by sequence number for incremental recovery
+                Ok(all_entries
+                    .into_iter()
+                    .filter(|e| e.seq > min_seq)
+                    .collect())
+            }
+            _ => {
+                // For older versions, we can't filter by sequence - return error or fallback
+                Err(Status::internal(format!(
+                    "WAL version {} does not support sequence-based recovery. Version 4 required.",
+                    version
+                )))
+            }
         }
     }
 
@@ -637,6 +771,64 @@ impl GroupCommitWalWriter {
         Ok(memtable)
     }
 
+    /// Read entries from WAL v4 format (with sequence numbers)
+    #[allow(clippy::result_large_err)]
+    fn read_entries_v4(file: &mut File) -> Result<Vec<WalEntry>, Status> {
+        let mut entries = Vec::new();
+
+        loop {
+            // Read block header
+            let mut flags = [0u8; 1];
+            if file.read_exact(&mut flags).is_err() {
+                break; // End of file
+            }
+
+            let mut uncompressed_size_bytes = [0u8; 4];
+            let mut data_size_bytes = [0u8; 4];
+
+            file.read_exact(&mut uncompressed_size_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            file.read_exact(&mut data_size_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
+            let data_size = u32::from_le_bytes(data_size_bytes) as usize;
+
+            // Read block data
+            let mut data = vec![0u8; data_size];
+            file.read_exact(&mut data)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Read and verify checksum
+            let mut checksum_bytes = [0u8; 4];
+            file.read_exact(&mut checksum_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let stored_checksum = u32::from_le_bytes(checksum_bytes);
+            let computed_checksum = crc32(&data);
+
+            if stored_checksum != computed_checksum {
+                eprintln!(
+                    "WAL checksum mismatch: expected {:08x}, got {:08x}. Stopping recovery.",
+                    stored_checksum, computed_checksum
+                );
+                break;
+            }
+
+            // Decompress if needed
+            let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
+                zstd::decode_all(Cursor::new(&data))
+                    .map_err(|e| Status::internal(format!("Decompression error: {}", e)))?
+            } else {
+                data
+            };
+
+            // Parse entries from buffer (v4 format with sequence numbers)
+            Self::parse_entries_from_buffer_v4(&entries_data, &mut entries)?;
+        }
+
+        Ok(entries)
+    }
+
     /// Parse entries from a buffer into a memtable
     #[allow(clippy::result_large_err)]
     fn parse_entries_from_buffer(buf: &[u8], memtable: &mut MemTable) -> Result<(), Status> {
@@ -683,6 +875,59 @@ impl GroupCommitWalWriter {
         Ok(())
     }
 
+    /// Parse entries from a v4 buffer into a list of WalEntry (with sequence numbers)
+    #[allow(clippy::result_large_err)]
+    fn parse_entries_from_buffer_v4(buf: &[u8], entries: &mut Vec<WalEntry>) -> Result<(), Status> {
+        let mut cursor = Cursor::new(buf);
+
+        loop {
+            // v4 format: [seq: u64][timestamp: u64][key_len: u64][value_len: u64][key][value]
+            let mut seq_bytes = [0u8; 8];
+            if cursor.read_exact(&mut seq_bytes).is_err() {
+                break; // End of buffer
+            }
+            let seq = u64::from_le_bytes(seq_bytes);
+
+            let mut ts_bytes = [0u8; 8];
+            cursor
+                .read_exact(&mut ts_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let mut klen_bytes = [0u8; 8];
+            let mut vlen_bytes = [0u8; 8];
+
+            cursor
+                .read_exact(&mut klen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            cursor
+                .read_exact(&mut vlen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let key_len = u64::from_le_bytes(klen_bytes);
+            let val_len = u64::from_le_bytes(vlen_bytes);
+
+            let mut key_buf = vec![0u8; key_len as usize];
+            cursor
+                .read_exact(&mut key_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let key = String::from_utf8_lossy(&key_buf).to_string();
+
+            let value = if val_len == u64::MAX {
+                None // Tombstone
+            } else {
+                let mut val_buf = vec![0u8; val_len as usize];
+                cursor
+                    .read_exact(&mut val_buf)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Some(String::from_utf8_lossy(&val_buf).to_string())
+            };
+
+            entries.push(WalEntry { seq, key, value });
+        }
+
+        Ok(())
+    }
+
     /// Parse WAL filename and return WAL ID
     pub fn parse_wal_filename(filename: &str) -> Option<u64> {
         if filename.starts_with("wal_") && filename.ends_with(".log") {
@@ -703,6 +948,7 @@ mod tests {
         writer: Arc<Mutex<File>>,
         path: Arc<Mutex<PathBuf>>,
         current_id: Arc<AtomicU64>,
+        next_seq: Arc<AtomicU64>,
         data_dir: PathBuf,
     }
 
@@ -713,6 +959,7 @@ mod tests {
                 writer: Arc::new(Mutex::new(file)),
                 path: Arc::new(Mutex::new(path)),
                 current_id: Arc::new(AtomicU64::new(wal_id)),
+                next_seq: Arc::new(AtomicU64::new(1)),
                 data_dir: data_dir.to_path_buf(),
             })
         }
@@ -744,9 +991,12 @@ mod tests {
         fn append(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
             let mut wal = self.writer.lock().unwrap();
 
-            // Serialize entry to buffer (v2 format)
+            // Allocate sequence number
+            let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+
+            // Serialize entry to buffer (v4 format with sequence number)
             let mut buf = Vec::new();
-            GroupCommitWalWriter::serialize_entry(&mut buf, key, value)?;
+            GroupCommitWalWriter::serialize_entry(&mut buf, seq, key, value)?;
 
             // Write as uncompressed block (test data is small)
             GroupCommitWalWriter::write_block(&mut wal, &buf)?;

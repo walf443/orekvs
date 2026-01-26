@@ -219,11 +219,155 @@ impl ReplicationService {
                 &wal_files,
                 true, // with checksum
             ),
+            4 => self.read_wal_entries_v4(
+                &mut file,
+                wal_id,
+                start_offset,
+                file_len,
+                max_entries,
+                max_bytes,
+                &wal_files,
+            ),
             _ => Err(Status::internal(format!(
-                "Unsupported WAL version: {}. Only versions 2-3 are supported.",
+                "Unsupported WAL version: {}. Only versions 2-4 are supported.",
                 version
             ))),
         }
+    }
+
+    /// Read WAL entries in v4 format (with sequence numbers)
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    fn read_wal_entries_v4(
+        &self,
+        file: &mut File,
+        wal_id: u64,
+        start_offset: u64,
+        file_len: u64,
+        max_entries: usize,
+        max_bytes: usize,
+        wal_files: &[(u64, PathBuf)],
+    ) -> Result<(Vec<WalEntry>, u64, u64, bool), Status> {
+        const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
+        const MIN_TIMESTAMP: u64 = 1577836800; // 2020-01-01
+        const MAX_TIMESTAMP: u64 = 4102444800; // 2100-01-01
+
+        let mut entries = Vec::new();
+        let mut current_offset = start_offset;
+        let mut bytes_read = 0usize;
+
+        while entries.len() < max_entries && bytes_read < max_bytes && current_offset < file_len {
+            // Read block header: flags(1) + uncompressed_size(4) + data_size(4) = 9 bytes
+            let mut flags = [0u8; 1];
+            if file.read_exact(&mut flags).is_err() {
+                break;
+            }
+
+            let mut uncompressed_size_bytes = [0u8; 4];
+            let mut data_size_bytes = [0u8; 4];
+
+            if file.read_exact(&mut uncompressed_size_bytes).is_err() {
+                break;
+            }
+            if file.read_exact(&mut data_size_bytes).is_err() {
+                break;
+            }
+
+            let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
+            let data_size = u32::from_le_bytes(data_size_bytes) as usize;
+
+            // Read block data
+            let mut data = vec![0u8; data_size];
+            if file.read_exact(&mut data).is_err() {
+                break;
+            }
+
+            // Read and verify checksum (v4 always has checksum)
+            let mut _checksum_bytes = [0u8; 4];
+            if file.read_exact(&mut _checksum_bytes).is_err() {
+                break;
+            }
+
+            // Decompress if needed
+            let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
+                zstd::decode_all(Cursor::new(&data))
+                    .map_err(|e| Status::internal(format!("Decompression error: {}", e)))?
+            } else {
+                data.clone()
+            };
+
+            // Update offset to point to next block
+            let block_size = 9 + data_size + 4; // +4 for checksum
+            current_offset += block_size as u64;
+            bytes_read += block_size;
+
+            // Parse entries from buffer (v4 format: seq + timestamp + key_len + value_len + key + value)
+            let mut cursor = Cursor::new(&entries_data);
+            loop {
+                // v4 format starts with sequence number
+                let mut seq_bytes = [0u8; 8];
+                if cursor.read_exact(&mut seq_bytes).is_err() {
+                    break;
+                }
+                let _seq = u64::from_le_bytes(seq_bytes);
+
+                let mut ts_bytes = [0u8; 8];
+                if cursor.read_exact(&mut ts_bytes).is_err() {
+                    break;
+                }
+                let timestamp = u64::from_le_bytes(ts_bytes);
+
+                // Validate timestamp
+                if !(MIN_TIMESTAMP..=MAX_TIMESTAMP).contains(&timestamp) {
+                    return Err(Status::internal(format!(
+                        "Invalid timestamp {} in WAL block",
+                        timestamp
+                    )));
+                }
+
+                let mut klen_bytes = [0u8; 8];
+                let mut vlen_bytes = [0u8; 8];
+                if cursor.read_exact(&mut klen_bytes).is_err() {
+                    break;
+                }
+                if cursor.read_exact(&mut vlen_bytes).is_err() {
+                    break;
+                }
+
+                let key_len = u64::from_le_bytes(klen_bytes);
+                let val_len = u64::from_le_bytes(vlen_bytes);
+
+                let mut key_buf = vec![0u8; key_len as usize];
+                if cursor.read_exact(&mut key_buf).is_err() {
+                    break;
+                }
+                let key = String::from_utf8_lossy(&key_buf).to_string();
+
+                let value = if val_len == u64::MAX {
+                    None
+                } else {
+                    let mut val_buf = vec![0u8; val_len as usize];
+                    if cursor.read_exact(&mut val_buf).is_err() {
+                        break;
+                    }
+                    Some(String::from_utf8_lossy(&val_buf).to_string())
+                };
+
+                entries.push(WalEntry {
+                    timestamp,
+                    key,
+                    value,
+                });
+
+                if entries.len() >= max_entries {
+                    break;
+                }
+            }
+        }
+
+        // Check if there are more entries
+        let has_more = current_offset < file_len || wal_files.iter().any(|(id, _)| *id > wal_id);
+
+        Ok((entries, wal_id, current_offset, has_more))
     }
 
     /// Read WAL entries in v2/v3 format (block-based with optional compression)

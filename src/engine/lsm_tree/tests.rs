@@ -1132,3 +1132,97 @@ fn test_leveled_sstables_from_flat_list() {
     let flat = leveled.to_flat_list();
     assert!(flat.is_empty());
 }
+
+/// Test LSN-based incremental WAL recovery
+/// Only entries with seq > last_flushed_wal_seq should be recovered
+#[tokio::test(flavor = "multi_thread")]
+async fn test_lsn_based_incremental_recovery() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Phase 1: Write some data and flush to SSTable
+    // This will update manifest.last_flushed_wal_seq
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+
+        // k1 and k2 will be flushed to SSTable
+        engine.set("k1".to_string(), "v1".to_string()).unwrap();
+        engine.set("k2".to_string(), "v2".to_string()).unwrap();
+        wait_for_flush(&engine, 2000).await;
+
+        // Verify data is accessible
+        assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+        assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+
+        // Check that manifest has the last_flushed_wal_seq updated
+        let manifest_seq = {
+            let manifest = engine.manifest.lock().unwrap();
+            manifest.last_flushed_wal_seq
+        };
+        assert!(
+            manifest_seq > 0,
+            "last_flushed_wal_seq should be > 0 after flush"
+        );
+
+        engine.shutdown().await;
+    }
+
+    // Phase 2: Write more data WITHOUT flushing (only in WAL)
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        // k1 and k2 are already persisted in SSTables
+        assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+        assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+
+        // Add new data (will be in WAL only)
+        engine.set("k3".to_string(), "v3".to_string()).unwrap();
+        engine.set("k4".to_string(), "v4".to_string()).unwrap();
+
+        // Update existing key (new value should be in WAL only)
+        engine
+            .set("k1".to_string(), "v1_updated".to_string())
+            .unwrap();
+
+        // Wait for WAL group commit
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Don't flush - simulate crash
+        engine.shutdown().await;
+    }
+
+    // Phase 3: Reopen and verify incremental recovery
+    // Only k3, k4, and updated k1 should be recovered from WAL
+    // k1's old value and k2 should come from SSTable (not replayed from WAL)
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        // k1 should have the updated value from WAL
+        assert_eq!(
+            engine.get("k1".to_string()).unwrap(),
+            "v1_updated",
+            "k1 should be updated from WAL"
+        );
+
+        // k2 should still be accessible (from SSTable)
+        assert_eq!(
+            engine.get("k2".to_string()).unwrap(),
+            "v2",
+            "k2 should be from SSTable"
+        );
+
+        // k3 and k4 should be recovered from WAL
+        assert_eq!(
+            engine.get("k3".to_string()).unwrap(),
+            "v3",
+            "k3 should be recovered from WAL"
+        );
+        assert_eq!(
+            engine.get("k4".to_string()).unwrap(),
+            "v4",
+            "k4 should be recovered from WAL"
+        );
+
+        engine.shutdown().await;
+    }
+}

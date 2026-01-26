@@ -31,7 +31,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Current manifest format version
-const MANIFEST_VERSION: u32 = 1;
+/// v2: Added last_flushed_wal_seq for LSN-based recovery
+const MANIFEST_VERSION: u32 = 2;
 
 /// Manifest file name
 const MANIFEST_FILENAME: &str = "MANIFEST";
@@ -97,6 +98,10 @@ pub struct Manifest {
     pub version: u32,
     /// List of all SSTable entries with their level assignments
     pub entries: Vec<ManifestEntry>,
+    /// Last flushed WAL sequence number (for LSN-based recovery)
+    /// Records with seq <= this value have been persisted to SSTables
+    #[serde(default)]
+    pub last_flushed_wal_seq: u64,
 }
 
 impl Default for Manifest {
@@ -111,7 +116,13 @@ impl Manifest {
         Self {
             version: MANIFEST_VERSION,
             entries: Vec::new(),
+            last_flushed_wal_seq: 0,
         }
+    }
+
+    /// Update the last flushed WAL sequence number
+    pub fn set_last_flushed_wal_seq(&mut self, seq: u64) {
+        self.last_flushed_wal_seq = seq;
     }
 
     /// Load manifest from the data directory
