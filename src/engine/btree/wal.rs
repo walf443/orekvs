@@ -330,8 +330,8 @@ impl BTreeWalWriter {
         self.next_seq.load(Ordering::SeqCst)
     }
 
-    /// Append a record
-    fn append_record(&self, record: &WalRecord) -> io::Result<u64> {
+    /// Append a record and sync to disk
+    fn append_record(&self, record: &WalRecord, sync: bool) -> io::Result<u64> {
         let mut guard = self.writer.lock().unwrap();
         let writer = guard
             .as_mut()
@@ -341,28 +341,37 @@ impl BTreeWalWriter {
         writer.write_all(&data)?;
         writer.flush()?;
 
+        if sync {
+            // fdatasync - sync data to disk (not metadata)
+            writer.get_ref().sync_data()?;
+        }
+
         Ok(record.seq)
     }
 
-    /// Log an insert operation
+    /// Log an insert operation (syncs to disk for durability)
     pub fn log_insert(&self, key: &str, value: &str) -> io::Result<u64> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let record = WalRecord::insert(seq, key.to_string(), value.to_string());
-        self.append_record(&record)
+        // Sync immediately for durability (not in batch mode)
+        let sync = !self.in_batch();
+        self.append_record(&record, sync)
     }
 
-    /// Log a delete operation
+    /// Log a delete operation (syncs to disk for durability)
     pub fn log_delete(&self, key: &str) -> io::Result<u64> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let record = WalRecord::delete(seq, key.to_string());
-        self.append_record(&record)
+        // Sync immediately for durability (not in batch mode)
+        let sync = !self.in_batch();
+        self.append_record(&record, sync)
     }
 
     /// Log a checkpoint
     pub fn log_checkpoint(&self) -> io::Result<u64> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         let record = WalRecord::checkpoint(seq);
-        self.append_record(&record)
+        self.append_record(&record, true) // Always sync checkpoint
     }
 
     /// Begin a batch operation
@@ -370,17 +379,15 @@ impl BTreeWalWriter {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         self.batch_seq.store(seq, Ordering::SeqCst);
         let record = WalRecord::begin_batch(seq);
-        self.append_record(&record)
+        self.append_record(&record, false) // Don't sync yet
     }
 
-    /// End a batch operation
+    /// End a batch operation (syncs to disk)
     pub fn end_batch(&self) -> io::Result<u64> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
         self.batch_seq.store(0, Ordering::SeqCst);
         let record = WalRecord::end_batch(seq);
-        self.append_record(&record)?;
-        self.sync()?;
-        Ok(seq)
+        self.append_record(&record, true) // Sync at end of batch
     }
 
     /// Check if currently in a batch
