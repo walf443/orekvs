@@ -16,6 +16,7 @@ use kv::{
 
 use crate::engine::{
     Engine,
+    btree::BTreeEngine,
     log::LogEngine,
     lsm_tree::{LsmTreeEngine, SnapshotLock, WalArchiveConfig},
     memory::MemoryEngine,
@@ -104,6 +105,11 @@ impl MyKeyValue {
                 lsm_engine_ref = Some(Arc::clone(&lsm_engine));
                 Box::new(LsmTreeEngineWrapper(lsm_engine))
             }
+            EngineType::BTree => {
+                let btree_engine =
+                    Arc::new(BTreeEngine::open(data_dir).expect("Failed to open BTree engine"));
+                Box::new(BTreeEngineWrapper(btree_engine))
+            }
         };
         MyKeyValue {
             engine,
@@ -133,6 +139,35 @@ impl Engine for LogEngineWrapper {
 struct LsmTreeEngineWrapper(Arc<LsmTreeEngine>);
 
 impl Engine for LsmTreeEngineWrapper {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.0.set(key, value)
+    }
+
+    fn get(&self, key: String) -> Result<String, Status> {
+        self.0.get(key)
+    }
+
+    fn delete(&self, key: String) -> Result<(), Status> {
+        self.0.delete(key)
+    }
+
+    fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
+        self.0.batch_set(items)
+    }
+
+    fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
+        self.0.batch_get(keys)
+    }
+
+    fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
+        self.0.batch_delete(keys)
+    }
+}
+
+/// Wrapper to implement Engine for Arc<BTreeEngine>
+struct BTreeEngineWrapper(Arc<BTreeEngine>);
+
+impl Engine for BTreeEngineWrapper {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
         self.0.set(key, value)
     }
@@ -291,6 +326,7 @@ pub enum EngineType {
     Memory,
     Log,
     LsmTree,
+    BTree,
 }
 
 pub async fn run_server(

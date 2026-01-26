@@ -3,7 +3,7 @@
 ## 実行環境
 - **OS**: Darwin (Mac)
 - **ビルド**: Release (`cargo build --release`)
-- **日付**: 2026-01-26 (Index Block Cache 導入後)
+- **日付**: 2026-01-26 (BTree Engine 導入)
 
 ## ベンチマーク
 - **ワークロード**: 10,000 Random Set / 10,000 Random Get
@@ -19,6 +19,7 @@
 | **Memory** | 27,020 | 26,726 | ベースライン (メモリ上のHashMap) |
 | **Log** | 221* | 25,388 | *永続性のために `sync_all()` を使用 |
 | **LSM-tree** | 1,244** | 26,468*** | **Leveled Compaction + Index Cache |
+| **BTree** | 24,240 | 24,930 | ディスクベースB-Tree (WAL + BufferPool) |
 
 ### 2. レイテンシ (リクエストあたりの平均)
 
@@ -27,8 +28,14 @@
 | **Memory** | 0.34 ms | 0.35 ms |
 | **Log** | 45.18 ms* | 0.37 ms |
 | **LSM-tree** | 8.01 ms** | 0.35 ms*** |
+| **BTree** | 0.41 ms | 0.40 ms |
 
 ***LSM-tree の Get が Memory とほぼ同等** - Leveled Compaction と Index Block Cache の効果で、SSTable の検索効率が向上しています。
+
+**BTree の特徴**:
+- **Set**: Memory とほぼ同等の性能 (24,240 vs 27,020 req/sec) - インプレース更新と BufferPool の効果
+- **Get**: Memory に近い性能 (24,930 vs 26,726 req/sec) - B-Tree の O(log N) 検索
+- **LSM-tree との比較**: Set が約 19.5x 高速、Get は同等レベル
 
 ## 今回の最適化内容
 
@@ -127,7 +134,40 @@ SSTable の読み取りをメモリマップと LRU キャッシュで高速化�
 | ファイルI/O直接 | 39,677/sec | 1.0x |
 | mmap + Block Cache | 105,060/sec | **2.65x** |
 
-### 6. SkipList MemTable (`crossbeam-skiplist`)
+### 6. BTree Engine (新規)
+
+ディスクベースの B-Tree ストレージエンジンを新規実装しました。
+
+**コンポーネント**:
+- **Page**: 4KB 固定サイズページ (ヘッダー 18バイト + データ)
+- **Node**: LeafNode (キー・値) と InternalNode (キー・子ポインタ)
+- **BufferPool**: LRU ページキャッシュ (デフォルト 64MB)
+- **WAL**: クラッシュリカバリ用 Write-Ahead Logging
+- **Freelist**: 削除ページの再利用
+
+**ファイル構造**:
+```
+src/engine/btree/
+├── mod.rs           # BTreeEngine 本体
+├── page.rs          # ページ構造・シリアライズ
+├── node.rs          # ノード操作・分割
+├── buffer_pool.rs   # LRU キャッシュ
+├── page_manager.rs  # ディスク I/O
+├── freelist.rs      # フリーリスト
+├── wal.rs           # WAL 実装
+└── tests.rs         # テストスイート
+```
+
+**LSM-tree との比較**:
+| 項目 | BTree | LSM-tree |
+|------|-------|----------|
+| 書き込み | O(log N) ディスクI/O | O(1) メモリ + 非同期flush |
+| 読み取り | O(log N) 単一パス | O(log N) × レベル数 |
+| 空間効率 | インプレース更新 | compaction必要 |
+| 書き込み増幅 | 高い（ページ単位更新） | 低い〜中 |
+| 読み取り増幅 | 低い（1パス） | 高い（複数SSTable検索） |
+
+### 7. SkipList MemTable (`crossbeam-skiplist`)
 
 従来の `BTreeMap + Mutex` から `crossbeam-skiplist::SkipMap` に変更しました。
 
@@ -180,21 +220,36 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 
 2. **書き込み性能**: 小規模ベンチマークでは従来とほぼ同じスループット。Leveled Compaction の書き込み増幅は大規模データで顕在化しますが、読み取り性能の向上とのトレードオフです。
 
-3. **スケーラビリティ**: Leveled Compaction の真価は大規模データセットで発揮されます。
+3. **BTree vs LSM-tree**:
+   - **書き込み**: BTree が 19.5x 高速 (24,240 vs 1,244 req/sec)。LSM-tree は `sync_all()` による同期 I/O がボトルネック。
+   - **読み取り**: ほぼ同等 (24,930 vs 26,468 req/sec)。
+   - **理由**: BTree は BufferPool でページをキャッシュし、WAL 書き込みのみ同期。LSM-tree はグループコミットで複数書き込みをバッチ化するが、小規模ベンチマークでは効果が限定的。
+
+4. **スケーラビリティ**: Leveled Compaction の真価は大規模データセットで発揮されます。
    - **Tiered**: 読み取り時に全 SSTable をスキャン → O(n)
    - **Leveled**: L1+ でバイナリサーチ → O(log n)
 
-4. **永続性と性能のトレードオフ**:
+5. **永続性と性能のトレードオフ**:
     | エンジン | 永続性 | 書き込み性能 | 読み取り性能 | 並行性 |
     | :--- | :--- | :--- | :--- | :--- |
     | Memory | なし | 最高 | 高 | 高 |
     | Log | 完全 (逐次) | 最低 | 高 | 低 |
-    | LSM-tree | 完全 (グループ) | 中間 | **最高** | **最高** |
+    | LSM-tree | 完全 (グループ) | 低 | **最高** | **最高** |
+    | BTree | 完全 (WAL) | **高** | 高 | 中 |
 
 ## 結論
 
-Index Block Cache (OnceLock) の導入により、同じ SSTable への繰り返しアクセスが劇的に高速化されました。gRPC ベンチマークではオーバーヘッドが支配的なため顕著な差は見られませんが、マイクロベンチマークでは 36,000x の高速化を確認しています。
+**BTree Engine**: 新規実装したディスクベースB-Treeエンジンは、永続性を維持しながら Memory エンジンに近い性能を達成しました。特に書き込み性能で LSM-tree を大幅に上回っています (19.5x)。BufferPool による効率的なページキャッシュと、WAL による軽量な永続化が効果を発揮しています。
+
+**LSM-tree**: Index Block Cache (OnceLock) の導入により、同じ SSTable への繰り返しアクセスが劇的に高速化されました。gRPC ベンチマークではオーバーヘッドが支配的なため顕著な差は見られませんが、マイクロベンチマークでは 36,000x の高速化を確認しています。
 
 SSTable v8 で追加した entry_count により、将来的な統計機能（概算 COUNT、近似 Rank）の基盤が整いました。
 
-Leveled Compaction、Block Cache (mmap + LRU)、SkipList MemTable と組み合わせることで、永続性を維持したまま高い性能を実現しています。
+**使い分けの指針**:
+| ユースケース | 推奨エンジン | 理由 |
+|-------------|-------------|------|
+| 読み書きバランス | BTree | 両方で高性能 |
+| 読み取り中心 | LSM-tree / BTree | 同等性能 |
+| 書き込み中心 (小〜中規模) | BTree | 19.5x 高速 |
+| 書き込み中心 (大規模) | LSM-tree | Compaction による空間効率 |
+| 開発・テスト | Memory | 最速、永続性不要 |

@@ -1,5 +1,6 @@
 use tonic::Status;
 
+pub mod btree;
 pub mod log;
 pub mod lsm_tree;
 pub mod memory;

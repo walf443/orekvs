@@ -354,7 +354,10 @@ async fn bench_index_cache() {
 
     let improvement = cold_duration.as_secs_f64() / warm_duration.as_secs_f64();
     println!("\n=== Results ===");
-    println!("Index cache speedup: {:.2}x faster with OnceLock cache", improvement);
+    println!(
+        "Index cache speedup: {:.2}x faster with OnceLock cache",
+        improvement
+    );
     println!(
         "Cold: {:.3} ms/read, Warm: {:.3} ms/read",
         cold_duration.as_secs_f64() * 1000.0 / (iterations * sst_files.len()) as f64,
