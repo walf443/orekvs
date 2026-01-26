@@ -282,6 +282,51 @@ fn test_btree_wal_recovery() {
 }
 
 #[test]
+fn test_btree_incremental_wal_recovery() {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: Write some data and flush (persists last_wal_seq)
+    {
+        let engine = BTreeEngine::open(dir.path()).unwrap();
+        engine
+            .set("key1".to_string(), "value1".to_string())
+            .unwrap();
+        engine
+            .set("key2".to_string(), "value2".to_string())
+            .unwrap();
+        // Flush to persist the data and update last_wal_seq
+        engine.flush().unwrap();
+    }
+
+    // Phase 2: Write more data WITHOUT flushing (only in WAL)
+    {
+        let engine = BTreeEngine::open(dir.path()).unwrap();
+        // These are already persisted, so they shouldn't be replayed
+        assert_eq!(engine.get("key1".to_string()).unwrap(), "value1");
+        assert_eq!(engine.get("key2".to_string()).unwrap(), "value2");
+
+        // Add new data (will be in WAL only)
+        engine
+            .set("key3".to_string(), "value3".to_string())
+            .unwrap();
+        engine
+            .set("key4".to_string(), "value4".to_string())
+            .unwrap();
+        // Don't flush - simulate crash
+    }
+
+    // Phase 3: Reopen and verify incremental recovery
+    // Only key3 and key4 should be recovered from WAL
+    {
+        let engine = BTreeEngine::open(dir.path()).unwrap();
+        assert_eq!(engine.get("key1".to_string()).unwrap(), "value1");
+        assert_eq!(engine.get("key2".to_string()).unwrap(), "value2");
+        assert_eq!(engine.get("key3".to_string()).unwrap(), "value3");
+        assert_eq!(engine.get("key4".to_string()).unwrap(), "value4");
+    }
+}
+
+#[test]
 fn test_btree_without_wal() {
     let dir = tempdir().unwrap();
     let config = BTreeConfig {

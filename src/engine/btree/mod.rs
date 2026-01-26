@@ -26,6 +26,7 @@ use self::page_manager::PageManager;
 use self::wal::{GroupCommitWalWriter, RecordType, recover_from_wal};
 use crate::engine::Engine;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use tonic::Status;
 
@@ -82,6 +83,8 @@ pub struct BTreeEngine {
     /// Configuration
     #[allow(dead_code)]
     config: BTreeConfig,
+    /// Latest WAL sequence number written (for tracking during flush)
+    current_wal_seq: AtomicU64,
 }
 
 #[allow(clippy::result_large_err)]
@@ -145,6 +148,9 @@ impl BTreeEngine {
             None
         };
 
+        // Initialize current_wal_seq from meta (for tracking during operation)
+        let current_wal_seq = AtomicU64::new(meta.last_wal_seq);
+
         let mut engine = Self {
             data_dir,
             buffer_pool,
@@ -152,6 +158,7 @@ impl BTreeEngine {
             meta: RwLock::new(meta),
             wal,
             config,
+            current_wal_seq,
         };
 
         // Perform recovery if needed
@@ -162,7 +169,10 @@ impl BTreeEngine {
         Ok(engine)
     }
 
-    /// Perform WAL recovery
+    /// Perform WAL recovery using LSN-based filtering
+    ///
+    /// Only replays records with sequence number > last_wal_seq stored in meta page.
+    /// This allows incremental recovery instead of full WAL replay.
     fn recover(&mut self) -> Result<(), Status> {
         let wal_path = self.data_dir.join("btree.wal");
 
@@ -170,15 +180,37 @@ impl BTreeEngine {
             return Ok(());
         }
 
+        // Get the last persisted WAL sequence from meta page
+        let last_persisted_seq = {
+            let meta = self.meta.read().unwrap();
+            meta.last_wal_seq
+        };
+
         let records = recover_from_wal(&wal_path)
             .map_err(|e| Status::internal(format!("Failed to read WAL: {}", e)))?;
 
-        if records.is_empty() {
+        // Filter records to only replay those after the last persisted sequence
+        let records_to_replay: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.seq > last_persisted_seq)
+            .collect();
+
+        if records_to_replay.is_empty() {
             return Ok(());
         }
 
+        println!(
+            "Recovering {} WAL records (seq > {})",
+            records_to_replay.len(),
+            last_persisted_seq
+        );
+
+        // Track the max sequence number we're replaying
+        let mut max_replayed_seq = last_persisted_seq;
+
         // Replay records
-        for record in records {
+        for record in records_to_replay {
+            max_replayed_seq = max_replayed_seq.max(record.seq);
             match record.record_type {
                 RecordType::Insert => {
                     if let Some(value) = record.value {
@@ -186,15 +218,22 @@ impl BTreeEngine {
                     }
                 }
                 RecordType::Delete => {
-                    self.delete_internal(record.key, false)?;
+                    // Ignore not found errors during recovery (key may have been deleted before crash)
+                    let _ = self.delete_internal(record.key, false);
                 }
                 _ => {}
             }
         }
 
-        // Flush and checkpoint
+        // Update current_wal_seq to reflect the replayed records
+        self.current_wal_seq
+            .store(max_replayed_seq, Ordering::SeqCst);
+
+        // Flush recovered data to persist the changes
         self.flush()?;
 
+        // Optionally truncate WAL after successful recovery
+        // This is safe because we've persisted all data and updated last_wal_seq
         if let Some(wal) = &self.wal {
             wal.log_checkpoint()
                 .map_err(|e| Status::internal(format!("Failed to write checkpoint: {}", e)))?;
@@ -209,8 +248,11 @@ impl BTreeEngine {
     fn set_internal(&self, key: String, value: String, log_wal: bool) -> Result<(), Status> {
         // Log to WAL first
         if log_wal && let Some(wal) = &self.wal {
-            wal.log_insert(&key, &value)
+            let seq = wal
+                .log_insert(&key, &value)
                 .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
+            // Track the latest WAL sequence number
+            self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
         }
 
         let entry = LeafEntry::new(key, value);
@@ -337,8 +379,11 @@ impl BTreeEngine {
     fn delete_internal(&self, key: String, log_wal: bool) -> Result<(), Status> {
         // Log to WAL first
         if log_wal && let Some(wal) = &self.wal {
-            wal.log_delete(&key)
+            let seq = wal
+                .log_delete(&key)
                 .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
+            // Track the latest WAL sequence number
+            self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
         }
 
         let mut meta = self.meta.write().unwrap();
@@ -419,11 +464,16 @@ impl BTreeEngine {
             .flush_all()
             .map_err(|e| Status::internal(format!("Failed to flush buffer pool: {}", e)))?;
 
-        // Update and write metadata
-        let meta = self.meta.read().unwrap();
+        // Update last_wal_seq to record which WAL records have been persisted
+        let flushed_seq = self.current_wal_seq.load(Ordering::SeqCst);
+
+        // Update and write metadata with the flushed WAL sequence
+        let mut meta = self.meta.write().unwrap();
+        meta.last_wal_seq = flushed_seq;
         self.buffer_pool
             .with_page_manager(|pm| pm.write_meta(&meta))
             .map_err(|e| Status::internal(format!("Failed to write metadata: {}", e)))?;
+        drop(meta);
 
         // Sync to disk
         self.buffer_pool
