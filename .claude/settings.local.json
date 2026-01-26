@@ -12,7 +12,10 @@
       "Bash(./target/debug/orelsm test:*)",
       "Bash(grep:*)",
       "Bash(find:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(for:*)",
+      "Bash(do echo \"Run $i:\")",
+      "Bash(done)"
     ]
   }
 }

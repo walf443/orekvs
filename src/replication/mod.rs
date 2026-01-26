@@ -509,14 +509,7 @@ impl ReplicationService {
     }
 }
 
-/// Parse WAL filename to extract ID
-fn parse_wal_filename(filename: &str) -> Option<u64> {
-    if filename.starts_with("wal_") && filename.ends_with(".log") {
-        filename[4..filename.len() - 4].parse::<u64>().ok()
-    } else {
-        None
-    }
-}
+use crate::engine::wal::parse_wal_filename;
 
 /// Serialize WAL entries to bytes
 fn serialize_entries(entries: &[WalEntry]) -> Vec<u8> {

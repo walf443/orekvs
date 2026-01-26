@@ -15,6 +15,18 @@ pub fn verify_checksum(data: &[u8], expected: u32) -> bool {
     crc32(data) == expected
 }
 
+/// Parse WAL filename and extract the WAL ID
+///
+/// Expected format: `wal_NNNNN.log` where NNNNN is a zero-padded number.
+/// Returns `None` if the filename doesn't match the expected format.
+pub fn parse_wal_filename(filename: &str) -> Option<u64> {
+    if filename.starts_with("wal_") && filename.ends_with(".log") {
+        filename[4..filename.len() - 4].parse::<u64>().ok()
+    } else {
+        None
+    }
+}
+
 /// Sequence number generator using atomic operations
 ///
 /// Thread-safe generator for allocating monotonically increasing sequence numbers.
@@ -82,5 +94,14 @@ mod tests {
         assert_eq!(seq_gen.current(), 100);
         assert_eq!(seq_gen.allocate(), 100);
         assert_eq!(seq_gen.allocate(), 101);
+    }
+
+    #[test]
+    fn test_parse_wal_filename() {
+        assert_eq!(parse_wal_filename("wal_00001.log"), Some(1));
+        assert_eq!(parse_wal_filename("wal_12345.log"), Some(12345));
+        assert_eq!(parse_wal_filename("wal_00000.log"), Some(0));
+        assert_eq!(parse_wal_filename("other.log"), None);
+        assert_eq!(parse_wal_filename("wal_123.data"), None);
     }
 }
