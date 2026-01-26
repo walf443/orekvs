@@ -12,9 +12,7 @@ use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
-/// WAL format version
-/// v3: Block-based with optional compression
-/// v4: Added per-entry sequence numbers for LSN-based recovery
+/// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
 const WAL_VERSION: u32 = 4;
 /// Minimum batch size in bytes to enable compression
 const COMPRESSION_THRESHOLD: usize = 512;
@@ -605,16 +603,15 @@ impl GroupCommitWalWriter {
             .map_err(|e| Status::internal(e.to_string()))?;
         let version = u32::from_le_bytes(version_bytes);
 
-        match version {
-            2 => Self::read_entries_v2(&mut file),
-            3 => Self::read_entries_v3(&mut file),
-            4 => Self::read_entries_v4(&mut file)
-                .map(|entries| entries.into_iter().map(|e| (e.key, e.value)).collect()),
-            _ => Err(Status::internal(format!(
-                "Unsupported WAL version: {}. Only versions 2-4 are supported.",
-                version
-            ))),
+        if version != WAL_VERSION {
+            return Err(Status::internal(format!(
+                "Unsupported WAL version: {}. Only version {} is supported.",
+                version, WAL_VERSION
+            )));
         }
+
+        Self::read_entries_v4(&mut file)
+            .map(|entries| entries.into_iter().map(|e| (e.key, e.value)).collect())
     }
 
     /// Read all entries from a WAL file with their sequence numbers (v4 only)
@@ -643,126 +640,19 @@ impl GroupCommitWalWriter {
             .map_err(|e| Status::internal(e.to_string()))?;
         let version = u32::from_le_bytes(version_bytes);
 
-        match version {
-            4 => {
-                let all_entries = Self::read_entries_v4(&mut file)?;
-                // Filter by sequence number for incremental recovery
-                Ok(all_entries
-                    .into_iter()
-                    .filter(|e| e.seq > min_seq)
-                    .collect())
-            }
-            _ => {
-                // For older versions, we can't filter by sequence - return error or fallback
-                Err(Status::internal(format!(
-                    "WAL version {} does not support sequence-based recovery. Version 4 required.",
-                    version
-                )))
-            }
-        }
-    }
-
-    /// Read entries from WAL v2 format (block-based with optional compression)
-    #[allow(clippy::result_large_err)]
-    fn read_entries_v2(file: &mut File) -> Result<MemTable, Status> {
-        let mut memtable = BTreeMap::new();
-
-        loop {
-            // Read block header
-            let mut flags = [0u8; 1];
-            if file.read_exact(&mut flags).is_err() {
-                break; // End of file
-            }
-
-            let mut uncompressed_size_bytes = [0u8; 4];
-            let mut data_size_bytes = [0u8; 4];
-
-            file.read_exact(&mut uncompressed_size_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.read_exact(&mut data_size_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
-            let data_size = u32::from_le_bytes(data_size_bytes) as usize;
-
-            // Read block data
-            let mut data = vec![0u8; data_size];
-            file.read_exact(&mut data)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Decompress if needed
-            let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
-                zstd::decode_all(Cursor::new(&data))
-                    .map_err(|e| Status::internal(format!("Decompression error: {}", e)))?
-            } else {
-                data
-            };
-
-            // Parse entries from buffer
-            Self::parse_entries_from_buffer(&entries_data, &mut memtable)?;
+        if version != WAL_VERSION {
+            return Err(Status::internal(format!(
+                "Unsupported WAL version: {}. Only version {} is supported.",
+                version, WAL_VERSION
+            )));
         }
 
-        Ok(memtable)
-    }
-
-    /// Read entries from WAL v3 format (block-based with optional compression and checksum)
-    #[allow(clippy::result_large_err)]
-    fn read_entries_v3(file: &mut File) -> Result<MemTable, Status> {
-        let mut memtable = BTreeMap::new();
-
-        loop {
-            // Read block header
-            let mut flags = [0u8; 1];
-            if file.read_exact(&mut flags).is_err() {
-                break; // End of file
-            }
-
-            let mut uncompressed_size_bytes = [0u8; 4];
-            let mut data_size_bytes = [0u8; 4];
-
-            file.read_exact(&mut uncompressed_size_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.read_exact(&mut data_size_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
-            let data_size = u32::from_le_bytes(data_size_bytes) as usize;
-
-            // Read block data
-            let mut data = vec![0u8; data_size];
-            file.read_exact(&mut data)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Read and verify checksum
-            let mut checksum_bytes = [0u8; 4];
-            file.read_exact(&mut checksum_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let stored_checksum = u32::from_le_bytes(checksum_bytes);
-            let computed_checksum = crc32(&data);
-
-            if stored_checksum != computed_checksum {
-                // Checksum mismatch - skip this corrupted block
-                // In recovery, we stop at the first corrupted block
-                eprintln!(
-                    "WAL checksum mismatch: expected {:08x}, got {:08x}. Stopping recovery.",
-                    stored_checksum, computed_checksum
-                );
-                break;
-            }
-
-            // Decompress if needed
-            let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
-                zstd::decode_all(Cursor::new(&data))
-                    .map_err(|e| Status::internal(format!("Decompression error: {}", e)))?
-            } else {
-                data
-            };
-
-            // Parse entries from buffer
-            Self::parse_entries_from_buffer(&entries_data, &mut memtable)?;
-        }
-
-        Ok(memtable)
+        let all_entries = Self::read_entries_v4(&mut file)?;
+        // Filter by sequence number for incremental recovery
+        Ok(all_entries
+            .into_iter()
+            .filter(|e| e.seq > min_seq)
+            .collect())
     }
 
     /// Read entries from WAL v4 format (with sequence numbers)
@@ -821,52 +711,6 @@ impl GroupCommitWalWriter {
         }
 
         Ok(entries)
-    }
-
-    /// Parse entries from a buffer into a memtable
-    #[allow(clippy::result_large_err)]
-    fn parse_entries_from_buffer(buf: &[u8], memtable: &mut MemTable) -> Result<(), Status> {
-        let mut cursor = Cursor::new(buf);
-
-        loop {
-            let mut ts_bytes = [0u8; 8];
-            if cursor.read_exact(&mut ts_bytes).is_err() {
-                break; // End of buffer
-            }
-
-            let mut klen_bytes = [0u8; 8];
-            let mut vlen_bytes = [0u8; 8];
-
-            cursor
-                .read_exact(&mut klen_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            cursor
-                .read_exact(&mut vlen_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let key_len = u64::from_le_bytes(klen_bytes);
-            let val_len = u64::from_le_bytes(vlen_bytes);
-
-            let mut key_buf = vec![0u8; key_len as usize];
-            cursor
-                .read_exact(&mut key_buf)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let key = String::from_utf8_lossy(&key_buf).to_string();
-
-            let value = if val_len == u64::MAX {
-                None // Tombstone
-            } else {
-                let mut val_buf = vec![0u8; val_len as usize];
-                cursor
-                    .read_exact(&mut val_buf)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                Some(String::from_utf8_lossy(&val_buf).to_string())
-            };
-
-            memtable.insert(key, value);
-        }
-
-        Ok(())
     }
 
     /// Parse entries from a v4 buffer into a list of WalEntry (with sequence numbers)
