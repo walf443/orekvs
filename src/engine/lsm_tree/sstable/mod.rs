@@ -3,7 +3,9 @@
 //! This module provides SSTable functionality split into reader and writer components:
 //! - `reader`: Memory-mapped SSTable reading with block cache support
 //! - `writer`: SSTable creation from MemTable and timestamped entries
+//! - `levels`: Level management for L0 and L1+ SSTables
 
+pub mod levels;
 mod reader;
 mod writer;
 

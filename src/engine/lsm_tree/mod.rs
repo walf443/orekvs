@@ -21,6 +21,7 @@ use memtable::{MemTable, MemTableState};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
 use sstable::MappedSSTable;
+use sstable::levels::{Level0, SortedLevel, SstableLevel};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,62 +46,63 @@ const MAX_LEVELS: usize = 7;
 
 /// Manages SSTables organized by levels for leveled compaction.
 ///
-/// - L0: Recently flushed SSTables with potentially overlapping key ranges
-/// - L1+: Non-overlapping key ranges within each level, sorted by min_key
+/// Uses separate implementations for L0 (overlapping, time-ordered) and
+/// L1+ (non-overlapping, key-sorted) levels.
 pub(crate) struct LeveledSstables {
-    /// SSTables organized by level. levels[0] = L0, levels[1] = L1, etc.
-    /// L0: sorted by creation time (newest first)
-    /// L1+: sorted by min_key (for binary search)
-    pub(crate) levels: Vec<Vec<Arc<SstableHandle>>>,
+    /// Level 0: overlapping SSTables sorted by creation time (newest first)
+    l0: Level0,
+    /// Levels 1+: non-overlapping SSTables sorted by min_key
+    sorted_levels: Vec<SortedLevel>,
 }
 
 impl LeveledSstables {
     /// Create a new empty LeveledSstables structure
     pub(crate) fn new() -> Self {
+        let sorted_levels = (1..MAX_LEVELS).map(SortedLevel::new).collect();
         Self {
-            levels: vec![Vec::new(); MAX_LEVELS],
+            l0: Level0::new(),
+            sorted_levels,
         }
     }
 
     /// Add an SSTable to a specific level
     pub(crate) fn add_to_level(&mut self, level: usize, handle: Arc<SstableHandle>) {
-        if level >= self.levels.len() {
-            self.levels.resize(level + 1, Vec::new());
-        }
-
         if level == 0 {
-            // L0: insert at the beginning (newest first)
-            self.levels[0].insert(0, handle);
+            self.l0.add(handle);
         } else {
-            // L1+: insert in sorted order by min_key
-            let min_key = handle.mmap.min_key();
-            let pos = self.levels[level]
-                .binary_search_by(|h| h.mmap.min_key().cmp(min_key))
-                .unwrap_or_else(|p| p);
-            self.levels[level].insert(pos, handle);
+            // Ensure we have enough levels
+            while self.sorted_levels.len() < level {
+                self.sorted_levels
+                    .push(SortedLevel::new(self.sorted_levels.len() + 1));
+            }
+            self.sorted_levels[level - 1].add(handle);
         }
     }
 
     /// Remove an SSTable from its level
     #[cfg(test)]
     fn remove(&mut self, handle: &Arc<SstableHandle>) {
-        for level in &mut self.levels {
-            if let Some(pos) = level.iter().position(|h| Arc::ptr_eq(h, handle)) {
-                level.remove(pos);
+        if self.l0.remove(handle) {
+            return;
+        }
+        for level in &mut self.sorted_levels {
+            if level.remove(handle) {
                 return;
             }
         }
     }
 
-    /// Get the level count
+    /// Get the level count (including L0)
     fn level_count(&self) -> usize {
-        self.levels.len()
+        1 + self.sorted_levels.len()
     }
 
     /// Get SSTables at a specific level
     fn get_level(&self, level: usize) -> &[Arc<SstableHandle>] {
-        if level < self.levels.len() {
-            &self.levels[level]
+        if level == 0 {
+            self.l0.sstables()
+        } else if level <= self.sorted_levels.len() {
+            self.sorted_levels[level - 1].sstables()
         } else {
             &[]
         }
@@ -108,7 +110,7 @@ impl LeveledSstables {
 
     /// Get all L0 SSTables (for scanning during reads)
     fn l0_sstables(&self) -> &[Arc<SstableHandle>] {
-        self.get_level(0)
+        self.l0.sstables()
     }
 
     /// Get SSTables in L1+ that overlap with the given key range
@@ -119,72 +121,71 @@ impl LeveledSstables {
         min_key: &[u8],
         max_key: &[u8],
     ) -> Vec<Arc<SstableHandle>> {
-        if level == 0 || level >= self.levels.len() {
+        if level == 0 || level > self.sorted_levels.len() {
             return Vec::new();
         }
-
-        let level_sstables = &self.levels[level];
-        let mut result = Vec::new();
-
-        for handle in level_sstables {
-            let sst_min = handle.mmap.min_key();
-            let sst_max = handle.mmap.max_key();
-
-            // Check if ranges overlap: [sst_min, sst_max] overlaps [min_key, max_key]
-            // Overlap occurs when: sst_min <= max_key AND sst_max >= min_key
-            if sst_min <= max_key && sst_max >= min_key {
-                result.push(Arc::clone(handle));
-            }
-        }
-
-        result
+        self.sorted_levels[level - 1].get_overlapping(min_key, max_key)
     }
 
-    /// Binary search for the SSTable that might contain the key in L1+
-    /// Returns None if no SSTable could contain the key
-    fn binary_search_level(&self, level: usize, key: &[u8]) -> Option<Arc<SstableHandle>> {
-        if level == 0 || level >= self.levels.len() {
-            return None;
+    /// Get candidates for a key lookup at a specific level
+    fn candidates_for_key(&self, level: usize, key: &[u8]) -> Vec<Arc<SstableHandle>> {
+        if level == 0 {
+            self.l0.candidates_for_key(key)
+        } else if level <= self.sorted_levels.len() {
+            self.sorted_levels[level - 1].candidates_for_key(key)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remove an SSTable by filename from any level
+    fn remove_by_filename(&mut self, filename: &str) -> bool {
+        // Check L0
+        if let Some(pos) = self.l0.sstables().iter().position(|h| {
+            h.mmap
+                .path()
+                .file_name()
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .unwrap_or("")
+                == filename
+        }) {
+            let handle = self.l0.sstables()[pos].clone();
+            return self.l0.remove(&handle);
         }
 
-        let level_sstables = &self.levels[level];
-        if level_sstables.is_empty() {
-            return None;
-        }
-
-        // Binary search by min_key to find the rightmost SSTable where min_key <= key
-        let pos = level_sstables
-            .binary_search_by(|h| h.mmap.min_key().cmp(key))
-            .unwrap_or_else(|p| p.saturating_sub(1));
-
-        if pos < level_sstables.len() {
-            let handle = &level_sstables[pos];
-            // Verify key is within this SSTable's range
-            if handle.mmap.key_in_range(key) {
-                return Some(Arc::clone(handle));
+        // Check sorted levels
+        for level in &mut self.sorted_levels {
+            if let Some(pos) = level.sstables().iter().position(|h| {
+                h.mmap
+                    .path()
+                    .file_name()
+                    .and_then(|n: &std::ffi::OsStr| n.to_str())
+                    .unwrap_or("")
+                    == filename
+            }) {
+                let handle = level.sstables()[pos].clone();
+                return level.remove(&handle);
             }
         }
 
-        None
+        false
     }
 
     /// Get total number of SSTables across all levels
     #[cfg(test)]
     fn total_sstable_count(&self) -> usize {
-        self.levels.iter().map(|l| l.len()).sum()
+        self.l0.len() + self.sorted_levels.iter().map(|l| l.len()).sum::<usize>()
     }
 
     /// Get the total size of a level in bytes
     fn level_size(&self, level: usize) -> u64 {
-        if level >= self.levels.len() {
-            return 0;
+        if level == 0 {
+            self.l0.size_bytes()
+        } else if level <= self.sorted_levels.len() {
+            self.sorted_levels[level - 1].size_bytes()
+        } else {
+            0
         }
-
-        self.levels[level]
-            .iter()
-            .filter_map(|h| std::fs::metadata(h.mmap.path()).ok())
-            .map(|m| m.len())
-            .sum()
     }
 
     /// Convert from flat SSTable list (for migration)
@@ -193,7 +194,7 @@ impl LeveledSstables {
     fn from_flat_list(sstables: Vec<Arc<SstableHandle>>) -> Self {
         let mut leveled = Self::new();
         for handle in sstables {
-            leveled.levels[0].push(handle);
+            leveled.l0.add(handle);
         }
         leveled
     }
@@ -202,9 +203,9 @@ impl LeveledSstables {
     /// Returns all SSTables from all levels, L0 first (newest first),
     /// then L1, L2, etc.
     fn to_flat_list(&self) -> Vec<Arc<SstableHandle>> {
-        let mut result = Vec::new();
-        for level in &self.levels {
-            result.extend(level.iter().cloned());
+        let mut result: Vec<Arc<SstableHandle>> = self.l0.sstables().to_vec();
+        for level in &self.sorted_levels {
+            result.extend(level.sstables().iter().cloned());
         }
         result
     }
@@ -788,22 +789,8 @@ impl LsmTreeEngine {
 
             // Remove compacted files from their levels
             for path in &result.files_to_delete {
-                // Find and remove the handle
                 let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                for level_idx in 0..leveled.level_count() {
-                    let level = &mut leveled.levels[level_idx];
-                    if let Some(pos) = level.iter().position(|h| {
-                        h.mmap
-                            .path()
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            == filename
-                    }) {
-                        level.remove(pos);
-                        break;
-                    }
-                }
+                leveled.remove_by_filename(filename);
             }
 
             // Add new SSTables to their target levels
@@ -903,27 +890,9 @@ impl Engine for LsmTreeEngine {
         let leveled = self.leveled_sstables.lock().unwrap();
         let key_bytes = key.as_bytes();
 
-        // 2. Check L0 SSTables (scan all, newest first - they may have overlapping keys)
-        for handle in leveled.l0_sstables() {
-            if !handle.bloom.contains(&key) {
-                self.metrics.record_bloom_filter_hit();
-                continue;
-            }
-            self.metrics.record_sstable_search();
-            match sstable::search_key_mmap(&handle.mmap, &key, &self.block_cache) {
-                Ok(Some(v)) => return Ok(v),
-                Ok(None) => return Err(Status::not_found("Key deleted")),
-                Err(e) if e.code() == tonic::Code::NotFound => {
-                    self.metrics.record_bloom_filter_false_positive();
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        // 3. Check L1+ (non-overlapping, use binary search by key range)
-        for level in 1..leveled.level_count() {
-            if let Some(handle) = leveled.binary_search_level(level, key_bytes) {
+        // 2. Check all levels (L0 scans all, L1+ uses binary search)
+        for level in 0..leveled.level_count() {
+            for handle in leveled.candidates_for_key(level, key_bytes) {
                 if !handle.bloom.contains(&key) {
                     self.metrics.record_bloom_filter_hit();
                     continue;

@@ -1023,19 +1023,19 @@ async fn test_leveled_sstables_binary_search() {
     leveled.add_to_level(1, Arc::clone(&handle2));
     leveled.add_to_level(1, Arc::clone(&handle3));
 
-    // Binary search should find the right SSTable
-    let found = leveled.binary_search_level(1, b"aaa");
-    assert!(found.is_some());
+    // candidates_for_key should find the right SSTable (at most 1 for L1+)
+    let found = leveled.candidates_for_key(1, b"aaa");
+    assert_eq!(found.len(), 1);
 
-    let found = leveled.binary_search_level(1, b"ccc");
-    assert!(found.is_some());
+    let found = leveled.candidates_for_key(1, b"ccc");
+    assert_eq!(found.len(), 1);
 
-    let found = leveled.binary_search_level(1, b"fff");
-    assert!(found.is_some());
+    let found = leveled.candidates_for_key(1, b"fff");
+    assert_eq!(found.len(), 1);
 
-    // Key outside all ranges should return None
-    let found = leveled.binary_search_level(1, b"zzz");
-    assert!(found.is_none());
+    // Key outside all ranges should return empty
+    let found = leveled.candidates_for_key(1, b"zzz");
+    assert!(found.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
