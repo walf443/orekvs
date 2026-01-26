@@ -10,15 +10,11 @@ use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
-use crate::engine::wal::{GroupCommitConfig, SeqGenerator, WalWriter, crc32};
+use crate::engine::wal::{GroupCommitConfig, SeqGenerator, WalWriter, read_block, write_block};
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 /// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
 const WAL_VERSION: u32 = 4;
-/// Minimum batch size in bytes to enable compression
-const COMPRESSION_THRESHOLD: usize = 512;
-/// Block flag: compressed
-const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
 
 /// WAL entry with sequence number for recovery filtering
 #[derive(Debug, Clone)]
@@ -300,7 +296,7 @@ impl GroupCommitWalWriter {
         }
 
         // Stage 2: Write block (compressed if large enough)
-        if let Err(e) = Self::write_block(&mut guard.writer, &entries_buf) {
+        if let Err(e) = Self::write_block_internal(&mut guard.writer, &entries_buf) {
             Self::notify_all_error(pending, e);
             return;
         }
@@ -397,66 +393,11 @@ impl GroupCommitWalWriter {
     }
 
     /// Write a block to the file, compressing if size exceeds threshold
-    /// V3 format: [flags][uncompressed_size][data_size][data][crc32]
+    ///
+    /// Uses the common block format from `crate::engine::wal::write_block`.
     #[allow(clippy::result_large_err)]
-    fn write_block(writer: &mut File, data: &[u8]) -> Result<(), Status> {
-        let uncompressed_size = data.len() as u32;
-
-        if data.len() >= COMPRESSION_THRESHOLD {
-            // Try to compress
-            match zstd::encode_all(Cursor::new(data), 3) {
-                Ok(compressed) if compressed.len() < data.len() => {
-                    // Compression was beneficial
-                    let flags = BLOCK_FLAG_COMPRESSED;
-                    let data_size = compressed.len() as u32;
-                    let checksum = crc32(&compressed);
-
-                    writer
-                        .write_all(&[flags])
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    writer
-                        .write_all(&uncompressed_size.to_le_bytes())
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    writer
-                        .write_all(&data_size.to_le_bytes())
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    writer
-                        .write_all(&compressed)
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    writer
-                        .write_all(&checksum.to_le_bytes())
-                        .map_err(|e| Status::internal(e.to_string()))?;
-
-                    return Ok(());
-                }
-                _ => {
-                    // Compression failed or didn't reduce size, fall through to uncompressed
-                }
-            }
-        }
-
-        // Write uncompressed block
-        let flags = 0u8;
-        let data_size = data.len() as u32;
-        let checksum = crc32(data);
-
-        writer
-            .write_all(&[flags])
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&uncompressed_size.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&data_size.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(data)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&checksum.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(())
+    fn write_block_internal(writer: &mut File, data: &[u8]) -> Result<(), Status> {
+        write_block(writer, data, true).map_err(|e| Status::internal(e.to_string()))
     }
 
     /// Append an entry to the WAL with pipelining support.
@@ -562,7 +503,7 @@ impl GroupCommitWalWriter {
         }
 
         // Write as a block
-        Self::write_block(&mut guard.writer, &buf)?;
+        Self::write_block_internal(&mut guard.writer, &buf)?;
 
         guard
             .writer
@@ -677,58 +618,28 @@ impl GroupCommitWalWriter {
     }
 
     /// Read entries from WAL v4 format (with sequence numbers)
+    ///
+    /// Uses the common block format from `crate::engine::wal::read_block`.
     #[allow(clippy::result_large_err)]
     fn read_entries_v4(file: &mut File) -> Result<Vec<WalEntry>, Status> {
         let mut entries = Vec::new();
 
         loop {
-            // Read block header
-            let mut flags = [0u8; 1];
-            if file.read_exact(&mut flags).is_err() {
-                break; // End of file
+            match read_block(file) {
+                Ok(Some(entries_data)) => {
+                    // Parse entries from buffer (v4 format with sequence numbers)
+                    Self::parse_entries_from_buffer_v4(&entries_data, &mut entries)?;
+                }
+                Ok(None) => {
+                    // End of file
+                    break;
+                }
+                Err(e) => {
+                    // Checksum mismatch or other error - stop recovery
+                    eprintln!("WAL block read error: {}. Stopping recovery.", e);
+                    break;
+                }
             }
-
-            let mut uncompressed_size_bytes = [0u8; 4];
-            let mut data_size_bytes = [0u8; 4];
-
-            file.read_exact(&mut uncompressed_size_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            file.read_exact(&mut data_size_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
-            let data_size = u32::from_le_bytes(data_size_bytes) as usize;
-
-            // Read block data
-            let mut data = vec![0u8; data_size];
-            file.read_exact(&mut data)
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Read and verify checksum
-            let mut checksum_bytes = [0u8; 4];
-            file.read_exact(&mut checksum_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let stored_checksum = u32::from_le_bytes(checksum_bytes);
-            let computed_checksum = crc32(&data);
-
-            if stored_checksum != computed_checksum {
-                eprintln!(
-                    "WAL checksum mismatch: expected {:08x}, got {:08x}. Stopping recovery.",
-                    stored_checksum, computed_checksum
-                );
-                break;
-            }
-
-            // Decompress if needed
-            let entries_data = if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
-                zstd::decode_all(Cursor::new(&data))
-                    .map_err(|e| Status::internal(format!("Decompression error: {}", e)))?
-            } else {
-                data
-            };
-
-            // Parse entries from buffer (v4 format with sequence numbers)
-            Self::parse_entries_from_buffer_v4(&entries_data, &mut entries)?;
         }
 
         Ok(entries)
@@ -878,7 +789,7 @@ mod tests {
             GroupCommitWalWriter::serialize_entry(&mut buf, seq, key, value)?;
 
             // Write as uncompressed block (test data is small)
-            GroupCommitWalWriter::write_block(&mut wal, &buf)?;
+            write_block(&mut *wal, &buf, false).map_err(|e| Status::internal(e.to_string()))?;
 
             wal.sync_all()
                 .map_err(|e| Status::internal(e.to_string()))?;

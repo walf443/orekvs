@@ -3,7 +3,7 @@
 //! Shared functionality for Write-Ahead Log implementations across different
 //! storage engines (LSM-Tree, B-Tree).
 
-use std::io;
+use std::io::{self, Cursor, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -34,6 +34,123 @@ impl GroupCommitConfig {
         Self {
             batch_interval_micros,
         }
+    }
+}
+
+// ============================================================================
+// Block format for WAL entries
+// ============================================================================
+
+/// Block flag: data is compressed with zstd
+pub const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
+
+/// Minimum data size in bytes to attempt compression
+pub const COMPRESSION_THRESHOLD: usize = 512;
+
+/// Write a block of data with optional compression
+///
+/// Block format: `[flags: u8][uncompressed_size: u32][data_size: u32][data][crc32: u32]`
+///
+/// If `enable_compression` is true and the data size exceeds `COMPRESSION_THRESHOLD`,
+/// the data will be compressed with zstd. Compression is only used if it actually
+/// reduces the data size.
+pub fn write_block<W: Write>(
+    writer: &mut W,
+    data: &[u8],
+    enable_compression: bool,
+) -> io::Result<()> {
+    let uncompressed_size = data.len() as u32;
+
+    if enable_compression
+        && data.len() >= COMPRESSION_THRESHOLD
+        && let Ok(compressed) = zstd::encode_all(Cursor::new(data), 3)
+        && compressed.len() < data.len()
+    {
+        // Compression was beneficial
+        let flags = BLOCK_FLAG_COMPRESSED;
+        let data_size = compressed.len() as u32;
+        let checksum = crc32(&compressed);
+
+        writer.write_all(&[flags])?;
+        writer.write_all(&uncompressed_size.to_le_bytes())?;
+        writer.write_all(&data_size.to_le_bytes())?;
+        writer.write_all(&compressed)?;
+        writer.write_all(&checksum.to_le_bytes())?;
+
+        return Ok(());
+    }
+
+    // Write uncompressed block
+    let flags = 0u8;
+    let data_size = data.len() as u32;
+    let checksum = crc32(data);
+
+    writer.write_all(&[flags])?;
+    writer.write_all(&uncompressed_size.to_le_bytes())?;
+    writer.write_all(&data_size.to_le_bytes())?;
+    writer.write_all(data)?;
+    writer.write_all(&checksum.to_le_bytes())?;
+
+    Ok(())
+}
+
+/// Read a block of data and decompress if necessary
+///
+/// Returns the decompressed data, or an error if:
+/// - The block header is truncated
+/// - The checksum doesn't match
+/// - Decompression fails
+///
+/// Returns `Ok(None)` if EOF is reached (no more blocks).
+pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    // Read flags
+    let mut flags = [0u8; 1];
+    match reader.read_exact(&mut flags) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    // Read sizes
+    let mut uncompressed_size_bytes = [0u8; 4];
+    let mut data_size_bytes = [0u8; 4];
+    reader.read_exact(&mut uncompressed_size_bytes)?;
+    reader.read_exact(&mut data_size_bytes)?;
+
+    let _uncompressed_size = u32::from_le_bytes(uncompressed_size_bytes);
+    let data_size = u32::from_le_bytes(data_size_bytes) as usize;
+
+    // Read data
+    let mut data = vec![0u8; data_size];
+    reader.read_exact(&mut data)?;
+
+    // Read and verify checksum
+    let mut checksum_bytes = [0u8; 4];
+    reader.read_exact(&mut checksum_bytes)?;
+    let stored_checksum = u32::from_le_bytes(checksum_bytes);
+    let computed_checksum = crc32(&data);
+
+    if stored_checksum != computed_checksum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Block checksum mismatch: stored={:#x}, computed={:#x}",
+                stored_checksum, computed_checksum
+            ),
+        ));
+    }
+
+    // Decompress if needed
+    if flags[0] & BLOCK_FLAG_COMPRESSED != 0 {
+        let decompressed = zstd::decode_all(Cursor::new(&data)).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Decompression error: {}", e),
+            )
+        })?;
+        Ok(Some(decompressed))
+    } else {
+        Ok(Some(data))
     }
 }
 
@@ -160,5 +277,84 @@ mod tests {
         assert_eq!(parse_wal_filename("wal_00000.log"), Some(0));
         assert_eq!(parse_wal_filename("other.log"), None);
         assert_eq!(parse_wal_filename("wal_123.data"), None);
+    }
+
+    #[test]
+    fn test_write_read_block_uncompressed() {
+        let data = b"hello world";
+        let mut buf = Vec::new();
+
+        // Write block without compression
+        write_block(&mut buf, data, false).unwrap();
+
+        // Read it back
+        let mut cursor = std::io::Cursor::new(&buf);
+        let result = read_block(&mut cursor).unwrap().unwrap();
+
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_write_read_block_small_data_no_compress() {
+        // Data smaller than COMPRESSION_THRESHOLD should not be compressed
+        let data = b"small data";
+        let mut buf = Vec::new();
+
+        write_block(&mut buf, data, true).unwrap();
+
+        // First byte (flags) should be 0 (no compression)
+        assert_eq!(buf[0], 0);
+
+        // Read it back
+        let mut cursor = std::io::Cursor::new(&buf);
+        let result = read_block(&mut cursor).unwrap().unwrap();
+
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_write_read_block_large_data_compressed() {
+        // Create data larger than COMPRESSION_THRESHOLD that compresses well
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let mut buf = Vec::new();
+
+        write_block(&mut buf, &data, true).unwrap();
+
+        // First byte (flags) should indicate compression
+        assert_eq!(buf[0] & BLOCK_FLAG_COMPRESSED, BLOCK_FLAG_COMPRESSED);
+
+        // Compressed size should be smaller
+        let data_size = u32::from_le_bytes(buf[5..9].try_into().unwrap()) as usize;
+        assert!(data_size < data.len());
+
+        // Read it back
+        let mut cursor = std::io::Cursor::new(&buf);
+        let result = read_block(&mut cursor).unwrap().unwrap();
+
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_read_block_eof() {
+        let buf: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&buf);
+        let result = read_block(&mut cursor).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_block_checksum_error() {
+        let data = b"test data";
+        let mut buf = Vec::new();
+        write_block(&mut buf, data, false).unwrap();
+
+        // Corrupt the checksum (last 4 bytes)
+        let len = buf.len();
+        buf[len - 1] ^= 0xFF;
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let result = read_block(&mut cursor);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("checksum"));
     }
 }
