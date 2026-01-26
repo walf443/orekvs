@@ -10,18 +10,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::wal::{
-    GroupCommitConfig, SeqGenerator, WalWriter, crc32, read_block, write_block,
+    GroupCommitConfig, SeqGenerator, WAL_FORMAT_VERSION, WalWriter, read_block, read_wal_header,
+    write_block, write_wal_header,
 };
-
-/// WAL magic number
-const WAL_MAGIC: u32 = 0x4257_414C; // "BWAL"
-
-/// WAL version (v1: legacy per-record format with individual checksums)
-const WAL_VERSION_V1: u8 = 1;
-/// WAL version (v4: common block-based format, same as LSM-Tree)
-const WAL_VERSION_V4: u8 = 4;
-/// Current WAL version for new files
-const WAL_VERSION: u8 = WAL_VERSION_V4;
 
 /// Record types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,11 +107,11 @@ impl WalRecord {
         }
     }
 
-    /// Serialize record to bytes
-    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value][checksum: u32]
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-
+    /// Serialize record to a buffer
+    ///
+    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value]
+    /// Checksum is handled by the block writer.
+    pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.seq.to_le_bytes());
         buf.push(self.record_type as u8);
         buf.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
@@ -132,114 +123,12 @@ impl WalRecord {
         if let Some(value) = &self.value {
             buf.extend_from_slice(value.as_bytes());
         }
-
-        // Checksum
-        let checksum = crc32(&buf);
-        buf.extend_from_slice(&checksum.to_le_bytes());
-
-        buf
     }
 
     /// Deserialize record from bytes
+    ///
+    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value]
     pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
-        if data.len() < 21 {
-            // Minimum: 8 + 1 + 4 + 4 + 4 = 21 bytes
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Record too short",
-            ));
-        }
-
-        let seq = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let record_type = RecordType::try_from(data[8])?;
-        let key_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
-        let value_len = u32::from_le_bytes(data[13..17].try_into().unwrap());
-
-        let header_size = 17;
-        let key_end = header_size + key_len;
-
-        if data.len() < key_end {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Record truncated (key)",
-            ));
-        }
-
-        let key = String::from_utf8(data[header_size..key_end].to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let (value, value_end) = if value_len == u32::MAX {
-            (None, key_end)
-        } else {
-            let value_end = key_end + value_len as usize;
-            if data.len() < value_end {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Record truncated (value)",
-                ));
-            }
-            let value = String::from_utf8(data[key_end..value_end].to_vec())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            (Some(value), value_end)
-        };
-
-        let checksum_start = value_end;
-        let checksum_end = checksum_start + 4;
-
-        if data.len() < checksum_end {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Record truncated (checksum)",
-            ));
-        }
-
-        let stored_checksum =
-            u32::from_le_bytes(data[checksum_start..checksum_end].try_into().unwrap());
-        let computed_checksum = crc32(&data[0..checksum_start]);
-
-        if stored_checksum != computed_checksum {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Checksum mismatch: stored={:#x}, computed={:#x}",
-                    stored_checksum, computed_checksum
-                ),
-            ));
-        }
-
-        Ok((
-            Self {
-                seq,
-                record_type,
-                key,
-                value,
-            },
-            checksum_end,
-        ))
-    }
-
-    /// Serialize record to bytes in v4 format (no per-record checksum)
-    ///
-    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value]
-    /// Block checksum is handled by the block writer.
-    pub fn serialize_v4(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.seq.to_le_bytes());
-        buf.push(self.record_type as u8);
-        buf.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
-
-        let value_len = self.value.as_ref().map_or(u32::MAX, |v| v.len() as u32);
-        buf.extend_from_slice(&value_len.to_le_bytes());
-
-        buf.extend_from_slice(self.key.as_bytes());
-        if let Some(value) = &self.value {
-            buf.extend_from_slice(value.as_bytes());
-        }
-    }
-
-    /// Deserialize record from bytes in v4 format (no per-record checksum)
-    ///
-    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value]
-    pub fn deserialize_v4(data: &[u8]) -> io::Result<(Self, usize)> {
         if data.len() < 17 {
             // Minimum: 8 + 1 + 4 + 4 = 17 bytes
             return Err(io::Error::new(
@@ -293,71 +182,6 @@ impl WalRecord {
     }
 }
 
-/// WAL file header
-struct WalHeader {
-    magic: u32,
-    version: u8,
-    _reserved: [u8; 3],
-}
-
-impl WalHeader {
-    /// Create a new header with the current version (v2)
-    fn new() -> Self {
-        Self {
-            magic: WAL_MAGIC,
-            version: WAL_VERSION,
-            _reserved: [0; 3],
-        }
-    }
-
-    /// Create a header with v1 format (for BTreeWalWriter compatibility)
-    fn new_v1() -> Self {
-        Self {
-            magic: WAL_MAGIC,
-            version: WAL_VERSION_V1,
-            _reserved: [0; 3],
-        }
-    }
-
-    fn serialize(&self) -> [u8; 8] {
-        let mut buf = [0u8; 8];
-        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
-        buf[4] = self.version;
-        buf
-    }
-
-    fn deserialize(data: &[u8]) -> io::Result<Self> {
-        if data.len() < 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "WAL header too short",
-            ));
-        }
-
-        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        if magic != WAL_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid WAL magic: {:#x}", magic),
-            ));
-        }
-
-        let version = data[4];
-        if version != WAL_VERSION_V1 && version != WAL_VERSION_V4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unsupported WAL version: {}", version),
-            ));
-        }
-
-        Ok(Self {
-            magic,
-            version,
-            _reserved: [0; 3],
-        })
-    }
-}
-
 /// WAL writer for B-tree operations
 pub struct BTreeWalWriter {
     /// WAL file path
@@ -397,9 +221,8 @@ impl BTreeWalWriter {
             writer.seek(SeekFrom::End(0))?;
             max_seq
         } else {
-            // Write header (v1 format for BTreeWalWriter)
-            let header = WalHeader::new_v1();
-            writer.write_all(&header.serialize())?;
+            // Write header using common format (v4)
+            write_wal_header(&mut writer, WAL_FORMAT_VERSION)?;
             writer.flush()?;
             0
         };
@@ -422,15 +245,19 @@ impl BTreeWalWriter {
         self.seq_gen.current()
     }
 
-    /// Append a record and sync to disk
+    /// Append a record and sync to disk (v4 block format)
     fn append_record(&self, record: &WalRecord, sync: bool) -> io::Result<u64> {
         let mut guard = self.writer.lock().unwrap();
         let writer = guard
             .as_mut()
             .ok_or_else(|| io::Error::other("WAL writer closed"))?;
 
-        let data = record.serialize();
-        writer.write_all(&data)?;
+        // Serialize record using v4 format (no per-record checksum)
+        let mut buf = Vec::new();
+        record.serialize(&mut buf);
+
+        // Write as a block (checksum is in the block)
+        write_block(writer, &buf, false)?;
         writer.flush()?;
 
         if sync {
@@ -497,54 +324,25 @@ impl BTreeWalWriter {
         Ok(())
     }
 
-    /// Read all records from WAL file
-    ///
-    /// Supports both v1 (per-record) and v2 (block-based) formats.
+    /// Read all records from WAL file (v4 block-based format)
     fn read_records_internal<P: AsRef<Path>>(path: P) -> io::Result<Vec<WalRecord>> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        // Read and validate header
-        let mut header_buf = [0u8; 8];
-        reader.read_exact(&mut header_buf)?;
-        let header = WalHeader::deserialize(&header_buf)?;
+        // Read and validate header using common function
+        let version = read_wal_header(&mut reader)?;
 
-        match header.version {
-            WAL_VERSION_V1 => Self::read_records_v1(&mut reader),
-            WAL_VERSION_V4 => Self::read_records_v4(&mut reader),
-            _ => Err(io::Error::new(
+        if version != WAL_FORMAT_VERSION {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Unsupported WAL version: {}", header.version),
-            )),
-        }
-    }
-
-    /// Read records in v1 format (per-record with individual checksums)
-    fn read_records_v1<R: Read>(reader: &mut R) -> io::Result<Vec<WalRecord>> {
-        let mut records = Vec::new();
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
-
-        let mut offset = 0;
-        while offset < buf.len() {
-            match WalRecord::deserialize(&buf[offset..]) {
-                Ok((record, size)) => {
-                    records.push(record);
-                    offset += size;
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Truncated record at end, stop here
-                    break;
-                }
-                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                    // Corrupted record, stop here
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
+                format!(
+                    "Unsupported WAL version: {} (expected {})",
+                    version, WAL_FORMAT_VERSION
+                ),
+            ));
         }
 
-        Ok(records)
+        Self::read_records_v4(&mut reader)
     }
 
     /// Read records in v4 format (block-based, compatible with LSM-Tree)
@@ -557,7 +355,7 @@ impl BTreeWalWriter {
                     // Parse records from block
                     let mut offset = 0;
                     while offset < block_data.len() {
-                        match WalRecord::deserialize_v4(&block_data[offset..]) {
+                        match WalRecord::deserialize(&block_data[offset..]) {
                             Ok((record, size)) => {
                                 records.push(record);
                                 offset += size;
@@ -600,15 +398,14 @@ impl BTreeWalWriter {
             *guard = None;
         }
 
-        // Rewrite WAL with just header (v1 format for BTreeWalWriter)
+        // Rewrite WAL with just header using common format (v4)
         let file = OpenOptions::new()
             .write(true)
             .truncate(true)
             .open(&self.path)?;
 
         let mut writer = BufWriter::new(file);
-        let header = WalHeader::new_v1();
-        writer.write_all(&header.serialize())?;
+        write_wal_header(&mut writer, WAL_FORMAT_VERSION)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
 
@@ -808,9 +605,8 @@ impl GroupCommitWalWriter {
             writer.seek(SeekFrom::End(0))?;
             max_seq
         } else {
-            // Write header
-            let header = WalHeader::new();
-            writer.write_all(&header.serialize())?;
+            // Write header using common format (v4)
+            write_wal_header(&mut writer, WAL_FORMAT_VERSION)?;
             writer.flush()?;
             initial_seq
         };
@@ -908,9 +704,8 @@ impl GroupCommitWalWriter {
 
         let mut new_writer = BufWriter::new(file);
 
-        // Write header
-        let header = WalHeader::new();
-        new_writer.write_all(&header.serialize())?;
+        // Write header using common format (v4)
+        write_wal_header(&mut new_writer, WAL_FORMAT_VERSION)?;
         new_writer.flush()?;
 
         // Swap writer
@@ -981,7 +776,7 @@ impl GroupCommitWalWriter {
         // Stage 1: Serialize all records to a buffer (v4 format)
         let mut buf = Vec::new();
         for req in pending.iter() {
-            req.record.serialize_v4(&mut buf);
+            req.record.serialize(&mut buf);
         }
 
         // Stage 2: Write as a single block with optional compression
@@ -1174,8 +969,7 @@ impl GroupCommitWalWriter {
             .open(&new_path)?;
 
         let mut new_writer = BufWriter::new(file);
-        let header = WalHeader::new();
-        new_writer.write_all(&header.serialize())?;
+        write_wal_header(&mut new_writer, WAL_FORMAT_VERSION)?;
         new_writer.flush()?;
         new_writer.get_ref().sync_all()?;
 
@@ -1285,7 +1079,8 @@ mod tests {
     #[test]
     fn test_wal_record_roundtrip() {
         let record = WalRecord::insert(1, "key1".to_string(), "value1".to_string());
-        let data = record.serialize();
+        let mut data = Vec::new();
+        record.serialize(&mut data);
         let (decoded, _) = WalRecord::deserialize(&data).unwrap();
 
         assert_eq!(decoded.seq, 1);
