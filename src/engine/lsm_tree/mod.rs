@@ -631,9 +631,20 @@ impl LsmTreeEngine {
 
         self.mem_state.remove_immutable(&memtable);
 
+        // Record old WAL file's max sequence before rotating
+        let old_wal_id = self.wal.current_id();
+        let old_wal_max_seq = self.wal.current_seq().saturating_sub(1);
+
         // Rotate WAL: create a new WAL file
         if let Err(e) = self.wal.rotate() {
             eprintln!("Warning: Failed to rotate WAL: {}", e);
+        } else {
+            // Record the old WAL file's max sequence for LSN-based cleanup
+            let mut manifest = self.manifest.lock().unwrap();
+            manifest.record_wal_file_max_seq(old_wal_id, old_wal_max_seq);
+            if let Err(e) = manifest.save(&self.data_dir) {
+                eprintln!("Warning: Failed to save manifest after WAL rotation: {}", e);
+            }
         }
 
         // Archive old WAL files if configured
@@ -696,8 +707,8 @@ impl LsmTreeEngine {
         self.wal.shutdown().await;
     }
 
-    /// Archive old WAL files based on retention period and size limits.
-    /// Only archives WAL files that have been flushed to SSTables.
+    /// Archive old WAL files based on LSN, retention period and size limits.
+    /// Only archives WAL files where all entries have been flushed to SSTables.
     fn archive_old_wal_files(&self) {
         // Skip if archiving is disabled
         if self.wal_archive_config.retention_secs.is_none()
@@ -706,8 +717,11 @@ impl LsmTreeEngine {
             return;
         }
 
-        // Get the maximum WAL ID that has been flushed to SSTable
-        let max_flushed_wal_id = self.get_max_flushed_wal_id();
+        // Get WAL IDs that can be safely deleted based on LSN
+        let deletable_wal_ids: std::collections::HashSet<u64> = {
+            let manifest = self.manifest.lock().unwrap();
+            manifest.get_deletable_wal_ids().into_iter().collect()
+        };
 
         // Collect WAL files with their metadata
         let mut wal_files: Vec<(u64, PathBuf, u64, std::time::SystemTime)> = Vec::new();
@@ -718,8 +732,8 @@ impl LsmTreeEngine {
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str())
                     && let Some(wal_id) = GroupCommitWalWriter::parse_wal_filename(filename)
                 {
-                    // Only consider WAL files that have been flushed (wal_id <= max_flushed_wal_id)
-                    if wal_id <= max_flushed_wal_id
+                    // Only consider WAL files that have been fully flushed (based on LSN)
+                    if deletable_wal_ids.contains(&wal_id)
                         && let Ok(metadata) = fs::metadata(&path)
                     {
                         let size = metadata.len();
@@ -768,23 +782,40 @@ impl LsmTreeEngine {
             }
         }
 
-        // Delete the files
-        for (wal_id, path) in files_to_delete {
-            match fs::remove_file(&path) {
-                Ok(_) => {
-                    println!(
-                        "Archived (deleted) old WAL file: {:?} (id={})",
-                        path, wal_id
-                    );
+        // Delete the files and update manifest
+        if !files_to_delete.is_empty() {
+            let mut deleted_ids = Vec::new();
+            for (wal_id, path) in &files_to_delete {
+                match fs::remove_file(path) {
+                    Ok(_) => {
+                        println!(
+                            "Archived (deleted) old WAL file: {:?} (id={})",
+                            path, wal_id
+                        );
+                        deleted_ids.push(*wal_id);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to archive WAL file {:?}: {}", path, e);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Warning: Failed to archive WAL file {:?}: {}", path, e);
+            }
+
+            // Remove deleted WAL files from manifest tracking
+            if !deleted_ids.is_empty() {
+                let mut manifest = self.manifest.lock().unwrap();
+                for wal_id in deleted_ids {
+                    manifest.remove_wal_file_seq(wal_id);
+                }
+                if let Err(e) = manifest.save(&self.data_dir) {
+                    eprintln!("Warning: Failed to save manifest after WAL cleanup: {}", e);
                 }
             }
         }
     }
 
     /// Get the maximum WAL ID that has been flushed to SSTables
+    /// Note: Now using LSN-based cleanup via manifest.get_deletable_wal_ids()
+    #[allow(dead_code)]
     fn get_max_flushed_wal_id(&self) -> u64 {
         let leveled = self.leveled_sstables.lock().unwrap();
         let mut max_wal_id = 0u64;

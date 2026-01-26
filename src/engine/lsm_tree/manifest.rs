@@ -32,7 +32,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Current manifest format version
 /// v2: Added last_flushed_wal_seq for LSN-based recovery
-const MANIFEST_VERSION: u32 = 2;
+/// v3: Added wal_file_max_seq for LSN-based WAL cleanup
+const MANIFEST_VERSION: u32 = 3;
 
 /// Manifest file name
 const MANIFEST_FILENAME: &str = "MANIFEST";
@@ -102,6 +103,10 @@ pub struct Manifest {
     /// Records with seq <= this value have been persisted to SSTables
     #[serde(default)]
     pub last_flushed_wal_seq: u64,
+    /// Max sequence number for each WAL file (wal_id -> max_seq)
+    /// Used to determine which WAL files can be safely deleted
+    #[serde(default)]
+    pub wal_file_max_seq: std::collections::BTreeMap<u64, u64>,
 }
 
 impl Default for Manifest {
@@ -117,12 +122,33 @@ impl Manifest {
             version: MANIFEST_VERSION,
             entries: Vec::new(),
             last_flushed_wal_seq: 0,
+            wal_file_max_seq: std::collections::BTreeMap::new(),
         }
     }
 
     /// Update the last flushed WAL sequence number
     pub fn set_last_flushed_wal_seq(&mut self, seq: u64) {
         self.last_flushed_wal_seq = seq;
+    }
+
+    /// Record the max sequence number for a WAL file
+    /// Called when rotating WAL to track what entries are in each file
+    pub fn record_wal_file_max_seq(&mut self, wal_id: u64, max_seq: u64) {
+        self.wal_file_max_seq.insert(wal_id, max_seq);
+    }
+
+    /// Remove WAL file sequence tracking (called after WAL file is deleted)
+    pub fn remove_wal_file_seq(&mut self, wal_id: u64) {
+        self.wal_file_max_seq.remove(&wal_id);
+    }
+
+    /// Get WAL file IDs that can be safely deleted (max_seq <= last_flushed_wal_seq)
+    pub fn get_deletable_wal_ids(&self) -> Vec<u64> {
+        self.wal_file_max_seq
+            .iter()
+            .filter(|(_, max_seq)| **max_seq <= self.last_flushed_wal_seq)
+            .map(|(wal_id, _)| *wal_id)
+            .collect()
     }
 
     /// Load manifest from the data directory
