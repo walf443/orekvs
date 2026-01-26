@@ -1199,3 +1199,19 @@ impl Engine for LsmTreeEngineWrapper {
 mod benchmark;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod leveled_sstables_tests {
+    use super::*;
+
+    #[test]
+    fn test_from_flat_list_empty() {
+        let leveled = LeveledSstables::from_flat_list(Vec::new());
+        assert_eq!(leveled.total_sstable_count(), 0);
+        assert_eq!(leveled.l0_sstables().len(), 0);
+
+        // to_flat_list should work on empty
+        let flat = leveled.to_flat_list();
+        assert!(flat.is_empty());
+    }
+}

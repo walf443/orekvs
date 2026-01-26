@@ -401,4 +401,48 @@ mod tests {
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
         assert!(manifest_path.exists());
     }
+
+    #[test]
+    fn test_wal_file_seq_tracking() {
+        let mut manifest = Manifest::new();
+
+        // Initially empty
+        assert!(manifest.wal_file_max_seq.is_empty());
+        assert!(manifest.get_deletable_wal_ids().is_empty());
+
+        // Add some WAL files with their max sequences
+        manifest.record_wal_file_max_seq(0, 100);
+        manifest.record_wal_file_max_seq(1, 200);
+        manifest.record_wal_file_max_seq(2, 300);
+
+        assert_eq!(manifest.wal_file_max_seq.len(), 3);
+
+        // No WAL files are deletable yet (last_flushed_wal_seq is 0)
+        assert!(manifest.get_deletable_wal_ids().is_empty());
+
+        // Set last_flushed_wal_seq to 150 - only WAL 0 should be deletable
+        manifest.set_last_flushed_wal_seq(150);
+        let deletable = manifest.get_deletable_wal_ids();
+        assert_eq!(deletable.len(), 1);
+        assert!(deletable.contains(&0));
+
+        // Set last_flushed_wal_seq to 250 - WAL 0 and 1 should be deletable
+        manifest.set_last_flushed_wal_seq(250);
+        let deletable = manifest.get_deletable_wal_ids();
+        assert_eq!(deletable.len(), 2);
+        assert!(deletable.contains(&0));
+        assert!(deletable.contains(&1));
+
+        // Set last_flushed_wal_seq to 300 - all should be deletable
+        manifest.set_last_flushed_wal_seq(300);
+        let deletable = manifest.get_deletable_wal_ids();
+        assert_eq!(deletable.len(), 3);
+
+        // Remove a WAL file
+        manifest.remove_wal_file_seq(0);
+        assert_eq!(manifest.wal_file_max_seq.len(), 2);
+        let deletable = manifest.get_deletable_wal_ids();
+        assert_eq!(deletable.len(), 2);
+        assert!(!deletable.contains(&0));
+    }
 }

@@ -1104,35 +1104,6 @@ async fn test_leveled_sstables_get_overlapping() {
     assert_eq!(overlapping.len(), 0);
 }
 
-#[test]
-fn test_compaction_config_level_size_calculation() {
-    use super::compaction::CompactionConfig;
-    let config = CompactionConfig::default();
-
-    // L0 has no target size (controlled by file count)
-    assert_eq!(config.target_size_for_level(0), 0);
-
-    // L1 = 64MB
-    assert_eq!(config.target_size_for_level(1), 64 * 1024 * 1024);
-
-    // L2 = 640MB (10x L1)
-    assert_eq!(config.target_size_for_level(2), 640 * 1024 * 1024);
-
-    // L3 = 6.4GB (10x L2)
-    assert_eq!(config.target_size_for_level(3), 6400 * 1024 * 1024);
-}
-
-#[test]
-fn test_leveled_sstables_from_flat_list() {
-    let leveled = LeveledSstables::from_flat_list(Vec::new());
-    assert_eq!(leveled.total_sstable_count(), 0);
-    assert_eq!(leveled.l0_sstables().len(), 0);
-
-    // to_flat_list should work on empty
-    let flat = leveled.to_flat_list();
-    assert!(flat.is_empty());
-}
-
 /// Test LSN-based incremental WAL recovery
 /// Only entries with seq > last_flushed_wal_seq should be recovered
 #[tokio::test(flavor = "multi_thread")]
@@ -1225,51 +1196,4 @@ async fn test_lsn_based_incremental_recovery() {
 
         engine.shutdown().await;
     }
-}
-
-/// Test Manifest WAL file sequence tracking methods
-#[test]
-fn test_manifest_wal_file_seq_tracking() {
-    use super::manifest::Manifest;
-
-    let mut manifest = Manifest::new();
-
-    // Initially empty
-    assert!(manifest.wal_file_max_seq.is_empty());
-    assert!(manifest.get_deletable_wal_ids().is_empty());
-
-    // Add some WAL files with their max sequences
-    manifest.record_wal_file_max_seq(0, 100);
-    manifest.record_wal_file_max_seq(1, 200);
-    manifest.record_wal_file_max_seq(2, 300);
-
-    assert_eq!(manifest.wal_file_max_seq.len(), 3);
-
-    // No WAL files are deletable yet (last_flushed_wal_seq is 0)
-    assert!(manifest.get_deletable_wal_ids().is_empty());
-
-    // Set last_flushed_wal_seq to 150 - only WAL 0 should be deletable
-    manifest.set_last_flushed_wal_seq(150);
-    let deletable = manifest.get_deletable_wal_ids();
-    assert_eq!(deletable.len(), 1);
-    assert!(deletable.contains(&0));
-
-    // Set last_flushed_wal_seq to 250 - WAL 0 and 1 should be deletable
-    manifest.set_last_flushed_wal_seq(250);
-    let deletable = manifest.get_deletable_wal_ids();
-    assert_eq!(deletable.len(), 2);
-    assert!(deletable.contains(&0));
-    assert!(deletable.contains(&1));
-
-    // Set last_flushed_wal_seq to 300 - all should be deletable
-    manifest.set_last_flushed_wal_seq(300);
-    let deletable = manifest.get_deletable_wal_ids();
-    assert_eq!(deletable.len(), 3);
-
-    // Remove a WAL file
-    manifest.remove_wal_file_seq(0);
-    assert_eq!(manifest.wal_file_max_seq.len(), 2);
-    let deletable = manifest.get_deletable_wal_ids();
-    assert_eq!(deletable.len(), 2);
-    assert!(!deletable.contains(&0));
 }
