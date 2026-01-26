@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine::wal::crc32;
+use crate::engine::wal::{SeqGenerator, crc32};
 
 /// WAL magic number
 const WAL_MAGIC: u32 = 0x4257_414C; // "BWAL"
@@ -274,8 +274,8 @@ pub struct BTreeWalWriter {
     path: PathBuf,
     /// Buffered writer
     writer: Mutex<Option<BufWriter<File>>>,
-    /// Next sequence number
-    next_seq: AtomicU64,
+    /// Sequence number generator
+    seq_gen: SeqGenerator,
     /// Current batch sequence (0 if not in batch)
     batch_seq: AtomicU64,
 }
@@ -295,7 +295,7 @@ impl BTreeWalWriter {
 
         let mut writer = BufWriter::new(file);
 
-        let next_seq = if file_exists {
+        let max_seq = if file_exists {
             // Read existing WAL to find last sequence
             let mut max_seq = 0u64;
             if let Ok(records) = Self::read_records_internal(&path) {
@@ -305,19 +305,19 @@ impl BTreeWalWriter {
             }
             // Seek to end for appending
             writer.seek(SeekFrom::End(0))?;
-            max_seq + 1
+            max_seq
         } else {
             // Write header
             let header = WalHeader::new();
             writer.write_all(&header.serialize())?;
             writer.flush()?;
-            1
+            0
         };
 
         Ok(Self {
             path,
             writer: Mutex::new(Some(writer)),
-            next_seq: AtomicU64::new(next_seq),
+            seq_gen: SeqGenerator::new(max_seq),
             batch_seq: AtomicU64::new(0),
         })
     }
@@ -329,7 +329,7 @@ impl BTreeWalWriter {
 
     /// Get next sequence number
     pub fn next_seq(&self) -> u64 {
-        self.next_seq.load(Ordering::SeqCst)
+        self.seq_gen.current()
     }
 
     /// Append a record and sync to disk
@@ -353,7 +353,7 @@ impl BTreeWalWriter {
 
     /// Log an insert operation (syncs to disk for durability)
     pub fn log_insert(&self, key: &str, value: &str) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         let record = WalRecord::insert(seq, key.to_string(), value.to_string());
         // Sync immediately for durability (not in batch mode)
         let sync = !self.in_batch();
@@ -362,7 +362,7 @@ impl BTreeWalWriter {
 
     /// Log a delete operation (syncs to disk for durability)
     pub fn log_delete(&self, key: &str) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         let record = WalRecord::delete(seq, key.to_string());
         // Sync immediately for durability (not in batch mode)
         let sync = !self.in_batch();
@@ -371,14 +371,14 @@ impl BTreeWalWriter {
 
     /// Log a checkpoint
     pub fn log_checkpoint(&self) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         let record = WalRecord::checkpoint(seq);
         self.append_record(&record, true) // Always sync checkpoint
     }
 
     /// Begin a batch operation
     pub fn begin_batch(&self) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         self.batch_seq.store(seq, Ordering::SeqCst);
         let record = WalRecord::begin_batch(seq);
         self.append_record(&record, false) // Don't sync yet
@@ -386,7 +386,7 @@ impl BTreeWalWriter {
 
     /// End a batch operation (syncs to disk)
     pub fn end_batch(&self) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         self.batch_seq.store(0, Ordering::SeqCst);
         let record = WalRecord::end_batch(seq);
         self.append_record(&record, true) // Sync at end of batch
@@ -576,8 +576,8 @@ struct WriteRequest {
 pub struct GroupCommitWalWriter {
     /// Channel to send write requests to background flusher
     request_tx: mpsc::Sender<WriteRequest>,
-    /// Next sequence number
-    next_seq: AtomicU64,
+    /// Sequence number generator
+    seq_gen: SeqGenerator,
     /// WAL file path
     path: PathBuf,
     /// Shared writer (for truncate operations)
@@ -606,7 +606,7 @@ impl GroupCommitWalWriter {
 
         let mut writer = BufWriter::new(file);
 
-        let next_seq = if file_exists {
+        let max_seq = if file_exists {
             // Read existing WAL to find last sequence
             let mut max_seq = 0u64;
             if let Ok(records) = BTreeWalWriter::read_records_internal(&path) {
@@ -616,13 +616,13 @@ impl GroupCommitWalWriter {
             }
             // Seek to end for appending
             writer.seek(SeekFrom::End(0))?;
-            max_seq + 1
+            max_seq
         } else {
             // Write header
             let header = WalHeader::new();
             writer.write_all(&header.serialize())?;
             writer.flush()?;
-            1
+            0
         };
 
         let (request_tx, request_rx) = mpsc::channel::<WriteRequest>();
@@ -645,7 +645,7 @@ impl GroupCommitWalWriter {
 
         Ok(Self {
             request_tx,
-            next_seq: AtomicU64::new(next_seq),
+            seq_gen: SeqGenerator::new(max_seq),
             path,
             writer,
             flusher_handle: Mutex::new(Some(handle)),
@@ -752,21 +752,21 @@ impl GroupCommitWalWriter {
 
     /// Log an insert operation (batched with group commit)
     pub fn log_insert(&self, key: &str, value: &str) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         let record = WalRecord::insert(seq, key.to_string(), value.to_string());
         self.send_and_wait(record)
     }
 
     /// Log a delete operation (batched with group commit)
     pub fn log_delete(&self, key: &str) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         let record = WalRecord::delete(seq, key.to_string());
         self.send_and_wait(record)
     }
 
     /// Log a checkpoint
     pub fn log_checkpoint(&self) -> io::Result<u64> {
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq_gen.allocate();
         let record = WalRecord::checkpoint(seq);
         self.send_and_wait(record)
     }
@@ -842,7 +842,7 @@ impl GroupCommitWalWriter {
         *guard = new_writer;
 
         // Reset sequence number
-        self.next_seq.store(1, Ordering::SeqCst);
+        self.seq_gen.set(1);
 
         Ok(())
     }

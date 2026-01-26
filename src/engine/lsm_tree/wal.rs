@@ -10,7 +10,7 @@ use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
-use crate::engine::wal::crc32;
+use crate::engine::wal::{SeqGenerator, crc32};
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 /// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
@@ -67,8 +67,8 @@ pub struct GroupCommitWalWriter {
     request_tx: Arc<Mutex<Option<mpsc::Sender<FlushRequest>>>>,
     /// Current WAL ID
     current_id: Arc<AtomicU64>,
-    /// Next sequence number for WAL entries (LSN)
-    next_seq: Arc<AtomicU64>,
+    /// Sequence number generator for WAL entries (LSN)
+    seq_gen: Arc<SeqGenerator>,
     /// Data directory
     data_dir: PathBuf,
     /// Inner state shared with background task
@@ -83,7 +83,7 @@ impl std::fmt::Debug for GroupCommitWalWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroupCommitWalWriter")
             .field("current_id", &self.current_id)
-            .field("next_seq", &self.next_seq)
+            .field("seq_gen", &self.seq_gen)
             .field("data_dir", &self.data_dir)
             .field("batch_interval_micros", &self.batch_interval_micros)
             .finish()
@@ -95,7 +95,7 @@ impl Clone for GroupCommitWalWriter {
         GroupCommitWalWriter {
             request_tx: Arc::clone(&self.request_tx),
             current_id: Arc::clone(&self.current_id),
-            next_seq: Arc::clone(&self.next_seq),
+            seq_gen: Arc::clone(&self.seq_gen),
             data_dir: self.data_dir.clone(),
             inner: Arc::clone(&self.inner),
             batch_interval_micros: self.batch_interval_micros,
@@ -128,7 +128,7 @@ impl GroupCommitWalWriter {
         Ok(GroupCommitWalWriter {
             request_tx: Arc::new(Mutex::new(Some(tx))),
             current_id: Arc::new(AtomicU64::new(wal_id)),
-            next_seq: Arc::new(AtomicU64::new(initial_seq + 1)),
+            seq_gen: Arc::new(SeqGenerator::new(initial_seq)),
             data_dir: data_dir.to_path_buf(),
             inner,
             batch_interval_micros,
@@ -138,12 +138,12 @@ impl GroupCommitWalWriter {
 
     /// Get the current (next) sequence number
     pub fn current_seq(&self) -> u64 {
-        self.next_seq.load(Ordering::SeqCst)
+        self.seq_gen.current()
     }
 
     /// Allocate the next sequence number
     fn allocate_seq(&self) -> u64 {
-        self.next_seq.fetch_add(1, Ordering::SeqCst)
+        self.seq_gen.allocate()
     }
 
     /// Shutdown the WAL writer gracefully, flushing all pending writes
