@@ -357,6 +357,7 @@ pub enum EngineType {
     BTree,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     addr: std::net::SocketAddr,
     engine_type: EngineType,

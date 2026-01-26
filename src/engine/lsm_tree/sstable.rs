@@ -240,6 +240,7 @@ impl MappedSSTable {
     ///
     /// The index is decompressed and parsed on first access, then cached
     /// for subsequent lookups. This avoids repeated decompression overhead.
+    #[cfg(test)]
     #[allow(clippy::result_large_err)]
     pub fn read_index(&self) -> Result<&[(String, u64)], Status> {
         // Fast path: already cached

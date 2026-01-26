@@ -56,6 +56,7 @@ pub struct MemTableState {
     /// Lock to coordinate inserts and flush:
     /// - insert() takes read lock (concurrent inserts allowed)
     /// - needs_flush() takes write lock (exclusive, blocks inserts during swap+conversion)
+    ///
     /// This prevents data loss when skip_to_btree runs during concurrent inserts.
     flush_lock: Arc<RwLock<()>>,
     /// Current in-memory write buffer (lock-free SkipList with atomic swap)

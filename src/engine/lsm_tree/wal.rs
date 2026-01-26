@@ -113,12 +113,6 @@ impl Clone for GroupCommitWalWriter {
 }
 
 impl GroupCommitWalWriter {
-    /// Create a new group commit WAL writer
-    #[allow(clippy::result_large_err)]
-    pub fn new(data_dir: &Path, wal_id: u64, batch_interval_micros: u64) -> Result<Self, Status> {
-        Self::new_with_seq(data_dir, wal_id, batch_interval_micros, 0)
-    }
-
     /// Create a new group commit WAL writer with initial sequence number
     #[allow(clippy::result_large_err)]
     pub fn new_with_seq(
