@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::engine::wal::crc32;
+
 /// WAL magic number
 const WAL_MAGIC: u32 = 0x4257_414C; // "BWAL"
 
@@ -126,7 +128,7 @@ impl WalRecord {
         }
 
         // Checksum
-        let checksum = crc32fast::hash(&buf);
+        let checksum = crc32(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
 
         buf
@@ -187,7 +189,7 @@ impl WalRecord {
 
         let stored_checksum =
             u32::from_le_bytes(data[checksum_start..checksum_end].try_into().unwrap());
-        let computed_checksum = crc32fast::hash(&data[0..checksum_start]);
+        let computed_checksum = crc32(&data[0..checksum_start]);
 
         if stored_checksum != computed_checksum {
             return Err(io::Error::new(

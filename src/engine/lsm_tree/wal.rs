@@ -10,6 +10,7 @@ use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
+use crate::engine::wal::crc32;
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 /// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
@@ -25,13 +26,6 @@ pub struct WalEntry {
     pub seq: u64,
     pub key: String,
     pub value: Option<String>,
-}
-
-/// Compute CRC32C checksum
-fn crc32(data: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
 }
 
 /// Write request for group commit with pipelining

@@ -4,6 +4,7 @@ pub mod btree;
 pub mod log;
 pub mod lsm_tree;
 pub mod memory;
+pub mod wal;
 
 #[allow(clippy::result_large_err)]
 pub trait Engine: Send + Sync + 'static {
