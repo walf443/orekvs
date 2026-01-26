@@ -12,6 +12,7 @@ mod sstable;
 mod wal;
 
 use super::Engine;
+use crate::engine::wal::GroupCommitConfig;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use bloom::BloomFilter;
 use compaction::{CompactionConfig, LeveledCompaction};
@@ -353,10 +354,11 @@ impl LsmTreeEngine {
         let recovery_result = recovery::recover(&data_dir);
 
         // Create new WAL file with group commit, starting from max recovered sequence number
+        let wal_config = GroupCommitConfig::with_batch_interval(wal_batch_interval_micros);
         let wal = GroupCommitWalWriter::new_with_seq(
             &data_dir,
             recovery_result.next_wal_id,
-            wal_batch_interval_micros,
+            wal_config,
             recovery_result.max_wal_seq,
         )
         .expect("Failed to create initial WAL");

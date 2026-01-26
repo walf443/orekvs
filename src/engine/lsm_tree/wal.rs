@@ -10,7 +10,7 @@ use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
 use super::memtable::MemTable;
-use crate::engine::wal::{SeqGenerator, WalWriter, crc32};
+use crate::engine::wal::{GroupCommitConfig, SeqGenerator, WalWriter, crc32};
 
 const WAL_MAGIC_BYTES: &[u8; 9] = b"ORELSMWAL";
 /// WAL format version (v4: Block-based with compression, checksum, and per-entry sequence numbers)
@@ -73,8 +73,8 @@ pub struct GroupCommitWalWriter {
     data_dir: PathBuf,
     /// Inner state shared with background task
     inner: Arc<Mutex<WalWriterInner>>,
-    /// Batch interval in microseconds
-    batch_interval_micros: u64,
+    /// Group commit configuration
+    config: GroupCommitConfig,
     /// Handle to the background flusher task
     flusher_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -85,7 +85,7 @@ impl std::fmt::Debug for GroupCommitWalWriter {
             .field("current_id", &self.current_id)
             .field("seq_gen", &self.seq_gen)
             .field("data_dir", &self.data_dir)
-            .field("batch_interval_micros", &self.batch_interval_micros)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -98,7 +98,7 @@ impl Clone for GroupCommitWalWriter {
             seq_gen: Arc::clone(&self.seq_gen),
             data_dir: self.data_dir.clone(),
             inner: Arc::clone(&self.inner),
-            batch_interval_micros: self.batch_interval_micros,
+            config: self.config,
             flusher_handle: Arc::clone(&self.flusher_handle),
         }
     }
@@ -110,7 +110,7 @@ impl GroupCommitWalWriter {
     pub fn new_with_seq(
         data_dir: &Path,
         wal_id: u64,
-        batch_interval_micros: u64,
+        config: GroupCommitConfig,
         initial_seq: u64,
     ) -> Result<Self, Status> {
         let (file, path) = Self::create_wal_file(data_dir, wal_id)?;
@@ -121,8 +121,9 @@ impl GroupCommitWalWriter {
 
         // Start background flusher
         let inner_clone = Arc::clone(&inner);
+        let batch_interval = config.batch_interval_micros;
         let handle = tokio::spawn(async move {
-            Self::background_flusher(rx, inner_clone, batch_interval_micros).await;
+            Self::background_flusher(rx, inner_clone, batch_interval).await;
         });
 
         Ok(GroupCommitWalWriter {
@@ -131,7 +132,7 @@ impl GroupCommitWalWriter {
             seq_gen: Arc::new(SeqGenerator::new(initial_seq)),
             data_dir: data_dir.to_path_buf(),
             inner,
-            batch_interval_micros,
+            config,
             flusher_handle: Arc::new(Mutex::new(Some(handle))),
         })
     }
@@ -179,6 +180,7 @@ impl GroupCommitWalWriter {
     }
 
     /// Get data directory path
+    #[allow(dead_code)]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

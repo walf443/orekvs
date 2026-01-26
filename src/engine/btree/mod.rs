@@ -25,6 +25,7 @@ use self::page::MetaPage;
 use self::page_manager::PageManager;
 use self::wal::{GroupCommitWalWriter, RecordType};
 use crate::engine::Engine;
+use crate::engine::wal::GroupCommitConfig;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -71,6 +72,7 @@ impl Default for BTreeConfig {
 /// B-tree storage engine
 pub struct BTreeEngine {
     /// Data directory
+    #[allow(dead_code)]
     data_dir: PathBuf,
     /// Buffer pool for page caching
     buffer_pool: BufferPool,
@@ -146,8 +148,10 @@ impl BTreeEngine {
 
         // Open WAL if enabled (with group commit)
         let wal = if config.enable_wal {
+            let wal_config =
+                GroupCommitConfig::with_batch_interval(config.wal_batch_interval_micros);
             Some(
-                GroupCommitWalWriter::open(&wal_dir, config.wal_batch_interval_micros)
+                GroupCommitWalWriter::open(&wal_dir, wal_config)
                     .map_err(|e| Status::internal(format!("Failed to open WAL: {}", e)))?,
             )
         } else {

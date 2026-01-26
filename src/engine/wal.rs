@@ -7,6 +7,36 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Default batch interval in microseconds (1ms)
+pub const DEFAULT_BATCH_INTERVAL_MICROS: u64 = 1000;
+
+/// Configuration for group commit WAL writers
+#[derive(Debug, Clone, Copy)]
+pub struct GroupCommitConfig {
+    /// Batch interval in microseconds
+    ///
+    /// Controls how long to wait for batching writes before flushing.
+    /// Higher values increase throughput but also increase latency.
+    pub batch_interval_micros: u64,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            batch_interval_micros: DEFAULT_BATCH_INTERVAL_MICROS,
+        }
+    }
+}
+
+impl GroupCommitConfig {
+    /// Create a new config with the specified batch interval
+    pub fn with_batch_interval(batch_interval_micros: u64) -> Self {
+        Self {
+            batch_interval_micros,
+        }
+    }
+}
+
 /// Common trait for WAL writers
 ///
 /// Provides a common interface for WAL state queries and management operations.

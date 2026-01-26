@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine::wal::{SeqGenerator, WalWriter, crc32};
+use crate::engine::wal::{GroupCommitConfig, SeqGenerator, WalWriter, crc32};
 
 /// WAL magic number
 const WAL_MAGIC: u32 = 0x4257_414C; // "BWAL"
@@ -593,8 +593,8 @@ pub struct GroupCommitWalWriter {
     data_dir: PathBuf,
     /// Shared writer state
     inner: Arc<Mutex<WalWriterInner>>,
-    /// Batch interval in microseconds
-    batch_interval_micros: u64,
+    /// Group commit configuration
+    config: GroupCommitConfig,
     /// Handle to the background flusher thread
     flusher_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Flag to signal shutdown
@@ -609,7 +609,7 @@ impl Clone for GroupCommitWalWriter {
             current_id: Arc::clone(&self.current_id),
             data_dir: self.data_dir.clone(),
             inner: Arc::clone(&self.inner),
-            batch_interval_micros: self.batch_interval_micros,
+            config: self.config,
             flusher_handle: Arc::clone(&self.flusher_handle),
             shutdown: Arc::clone(&self.shutdown),
         }
@@ -624,24 +624,21 @@ impl GroupCommitWalWriter {
 
     /// Create or open a group commit WAL in a directory
     ///
-    /// `batch_interval_micros` controls how long to wait for batching writes.
-    /// Higher values increase throughput but also increase latency.
-    ///
     /// This will scan for existing WAL files and resume from the latest one.
-    pub fn open<P: AsRef<Path>>(data_dir: P, batch_interval_micros: u64) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(data_dir: P, config: GroupCommitConfig) -> io::Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
 
         // Scan for existing WAL files
         let (wal_id, max_seq) = Self::scan_existing_wals(&data_dir)?;
 
-        Self::open_with_id(&data_dir, wal_id, batch_interval_micros, max_seq)
+        Self::open_with_id(&data_dir, wal_id, config, max_seq)
     }
 
     /// Create a new WAL with a specific ID and initial sequence number
     pub fn open_with_id(
         data_dir: &Path,
         wal_id: u64,
-        batch_interval_micros: u64,
+        config: GroupCommitConfig,
         initial_seq: u64,
     ) -> io::Result<Self> {
         let path = Self::wal_path(data_dir, wal_id);
@@ -684,6 +681,7 @@ impl GroupCommitWalWriter {
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let inner_clone = inner.clone();
+        let batch_interval_micros = config.batch_interval_micros;
 
         // Start background flusher thread
         let handle = thread::spawn(move || {
@@ -701,7 +699,7 @@ impl GroupCommitWalWriter {
             current_id: Arc::new(AtomicU64::new(wal_id)),
             data_dir: data_dir.to_path_buf(),
             inner,
-            batch_interval_micros,
+            config,
             flusher_handle: Arc::new(Mutex::new(Some(handle))),
             shutdown,
         })
