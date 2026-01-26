@@ -7,6 +7,7 @@ mod manifest;
 mod memtable;
 mod metrics;
 mod mmap;
+mod recovery;
 mod sstable;
 mod wal;
 
@@ -19,7 +20,6 @@ use memtable::{MemTable, MemTableState};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
 use sstable::MappedSSTable;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,11 +32,11 @@ use wal::GroupCommitWalWriter;
 pub type SnapshotLock = Arc<RwLock<()>>;
 
 /// Handle to an SSTable with mmap reader and its Bloom filter
-struct SstableHandle {
+pub(crate) struct SstableHandle {
     /// Memory-mapped SSTable reader for zero-copy access
-    mmap: MappedSSTable,
+    pub(crate) mmap: MappedSSTable,
     /// Bloom filter for fast negative lookups
-    bloom: BloomFilter,
+    pub(crate) bloom: BloomFilter,
 }
 
 /// Default maximum level for leveled compaction
@@ -46,23 +46,23 @@ const MAX_LEVELS: usize = 7;
 ///
 /// - L0: Recently flushed SSTables with potentially overlapping key ranges
 /// - L1+: Non-overlapping key ranges within each level, sorted by min_key
-struct LeveledSstables {
+pub(crate) struct LeveledSstables {
     /// SSTables organized by level. levels[0] = L0, levels[1] = L1, etc.
     /// L0: sorted by creation time (newest first)
     /// L1+: sorted by min_key (for binary search)
-    levels: Vec<Vec<Arc<SstableHandle>>>,
+    pub(crate) levels: Vec<Vec<Arc<SstableHandle>>>,
 }
 
 impl LeveledSstables {
     /// Create a new empty LeveledSstables structure
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             levels: vec![Vec::new(); MAX_LEVELS],
         }
     }
 
     /// Add an SSTable to a specific level
-    fn add_to_level(&mut self, level: usize, handle: Arc<SstableHandle>) {
+    pub(crate) fn add_to_level(&mut self, level: usize, handle: Arc<SstableHandle>) {
         if level >= self.levels.len() {
             self.levels.resize(level + 1, Vec::new());
         }
@@ -349,192 +349,29 @@ impl LsmTreeEngine {
             fs::create_dir_all(&data_dir).expect("Failed to create data directory");
         }
 
-        let mut sst_files = Vec::new();
-        let mut max_sst_id = 0u64;
-        let mut max_wal_id_in_sst = 0u64;
-        let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
-        let mut max_wal_id = 0u64;
-
-        // Scan for SSTable and WAL files, and clean up any orphaned .tmp files
-        if let Ok(entries) = fs::read_dir(&data_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Some(filename) = p.file_name().and_then(|n| n.to_str()) {
-                    // Clean up orphaned .tmp files from interrupted SSTable writes
-                    if filename.ends_with(".tmp") {
-                        if let Err(e) = fs::remove_file(&p) {
-                            eprintln!("Warning: Failed to remove orphaned tmp file {:?}: {}", p, e);
-                        } else {
-                            println!("Cleaned up orphaned tmp file: {:?}", p);
-                        }
-                        continue;
-                    }
-
-                    // SSTable files (old format: sst_{id}.data, new format: sst_{sst_id}_{wal_id}.data)
-                    if let Some((sst_id, wal_id_opt)) = sstable::parse_filename(filename) {
-                        if sst_id >= max_sst_id {
-                            max_sst_id = sst_id + 1;
-                        }
-                        if let Some(wal_id) = wal_id_opt
-                            && wal_id > max_wal_id_in_sst
-                        {
-                            max_wal_id_in_sst = wal_id;
-                        }
-                        sst_files.push(p);
-                    } else if let Some(id) = GroupCommitWalWriter::parse_wal_filename(filename) {
-                        // WAL files: wal_{id}.log
-                        if id >= max_wal_id {
-                            max_wal_id = id + 1;
-                        }
-                        wal_files.push((id, p));
-                    }
-                }
-            }
-        }
-
-        sst_files.sort_by(|a, b| b.cmp(a));
-        wal_files.sort_by_key(|(id, _)| *id);
-
-        // Load manifest to get level assignments
-        let manifest = match Manifest::load(&data_dir) {
-            Ok(Some(m)) => {
-                println!("Loaded manifest with {} entries", m.entries.len());
-                m
-            }
-            Ok(None) => {
-                println!("No manifest found, creating new one");
-                Manifest::new()
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to load manifest: {}, creating new one", e);
-                Manifest::new()
-            }
-        };
-
-        // Build SstableHandles with mmap readers and Bloom filters for existing SSTables
-        // Organize by level according to manifest
-        let mut leveled_sstables = LeveledSstables::new();
-        for p in &sst_files {
-            // Open mmap for the SSTable
-            let mmap = match MappedSSTable::open(p) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Warning: Failed to mmap SSTable {:?}: {}", p, e);
-                    continue;
-                }
-            };
-
-            // Read embedded Bloom filter
-            let bloom = mmap
-                .read_bloom_filter()
-                .expect("Failed to read Bloom filter from SSTable");
-            let handle = Arc::new(SstableHandle { mmap, bloom });
-
-            // Get level from manifest, default to L0 if not found
-            let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let level = manifest.get_entry(filename).map(|e| e.level).unwrap_or(0);
-            leveled_sstables.add_to_level(level, handle);
-        }
-
-        // Recover MemTable from WAL files that are newer than the latest SSTable
-        let mut recovered_memtable: MemTable = BTreeMap::new();
-        let mut recovered_size: u64 = 0;
-
-        // Determine if we have any SSTables with WAL ID info
-        let has_sstables_with_wal_id = sst_files
-            .iter()
-            .any(|p| sstable::extract_wal_id_from_sstable(p).is_some());
-
-        // Get last flushed WAL sequence from manifest for LSN-based recovery
-        let last_flushed_wal_seq = manifest.last_flushed_wal_seq;
-        let mut max_wal_seq = last_flushed_wal_seq;
-
-        for (wal_id, wal_path) in &wal_files {
-            // Recover WAL files that are newer than the latest flushed WAL ID
-            // If no SSTables have WAL ID info, recover all WAL files
-            let should_recover = !has_sstables_with_wal_id || *wal_id > max_wal_id_in_sst;
-            if should_recover {
-                // Try LSN-based recovery first (v4 WAL format)
-                // If WAL is older version, fall back to full recovery
-                match GroupCommitWalWriter::read_entries_with_seq(wal_path, last_flushed_wal_seq) {
-                    Ok(entries) => {
-                        for entry in entries {
-                            max_wal_seq = max_wal_seq.max(entry.seq);
-                            let entry_size =
-                                memtable::estimate_entry_size(&entry.key, &entry.value);
-                            if let Some(old_value) = recovered_memtable.get(&entry.key) {
-                                let old_size = memtable::estimate_entry_size(&entry.key, old_value);
-                                if entry_size > old_size {
-                                    recovered_size += entry_size - old_size;
-                                } else {
-                                    recovered_size -= old_size - entry_size;
-                                }
-                            } else {
-                                recovered_size += entry_size;
-                            }
-                            recovered_memtable.insert(entry.key, entry.value);
-                        }
-                        println!(
-                            "Recovered {} entries from WAL (LSN > {}): {:?}",
-                            recovered_memtable.len(),
-                            last_flushed_wal_seq,
-                            wal_path
-                        );
-                    }
-                    Err(_) => {
-                        // Fall back to reading all entries for older WAL versions
-                        match GroupCommitWalWriter::read_entries(wal_path) {
-                            Ok(entries) => {
-                                for (key, value) in entries {
-                                    let entry_size = memtable::estimate_entry_size(&key, &value);
-                                    if let Some(old_value) = recovered_memtable.get(&key) {
-                                        let old_size =
-                                            memtable::estimate_entry_size(&key, old_value);
-                                        if entry_size > old_size {
-                                            recovered_size += entry_size - old_size;
-                                        } else {
-                                            recovered_size -= old_size - entry_size;
-                                        }
-                                    } else {
-                                        recovered_size += entry_size;
-                                    }
-                                    recovered_memtable.insert(key, value);
-                                }
-                                println!(
-                                    "Recovered {} entries from WAL (full replay): {:?}",
-                                    recovered_memtable.len(),
-                                    wal_path
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: Failed to read WAL {:?}: {}", wal_path, e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Determine next WAL ID
-        let next_wal_id = if max_wal_id > 0 { max_wal_id } else { 0 };
+        // Recover state from disk (SSTables, WAL, manifest)
+        let recovery_result = recovery::recover(&data_dir);
 
         // Create new WAL file with group commit, starting from max recovered sequence number
         let wal = GroupCommitWalWriter::new_with_seq(
             &data_dir,
-            next_wal_id,
+            recovery_result.next_wal_id,
             wal_batch_interval_micros,
-            max_wal_seq,
+            recovery_result.max_wal_seq,
         )
         .expect("Failed to create initial WAL");
 
         // Re-write recovered entries to new WAL for safety
-        if !recovered_memtable.is_empty() {
-            wal.write_entries(&recovered_memtable)
+        if !recovery_result.recovered_memtable.is_empty() {
+            wal.write_entries(&recovery_result.recovered_memtable)
                 .expect("Failed to write recovered entries to WAL");
         }
 
-        let mem_state =
-            MemTableState::new(memtable_capacity_bytes, recovered_memtable, recovered_size);
+        let mem_state = MemTableState::new(
+            memtable_capacity_bytes,
+            recovery_result.recovered_memtable,
+            recovery_result.recovered_size,
+        );
 
         let compaction_config = CompactionConfig {
             l0_compaction_threshold: compaction_trigger_file_count,
@@ -544,9 +381,9 @@ impl LsmTreeEngine {
 
         LsmTreeEngine {
             mem_state,
-            leveled_sstables: Arc::new(Mutex::new(leveled_sstables)),
+            leveled_sstables: Arc::new(Mutex::new(recovery_result.leveled_sstables)),
             data_dir,
-            next_sst_id: Arc::new(AtomicU64::new(max_sst_id)),
+            next_sst_id: Arc::new(AtomicU64::new(recovery_result.next_sst_id)),
             compaction_trigger_file_count,
             compaction_in_progress: Arc::new(Mutex::new(false)),
             wal,
@@ -554,7 +391,7 @@ impl LsmTreeEngine {
             metrics: Arc::new(EngineMetrics::new()),
             wal_archive_config,
             snapshot_lock: Arc::new(RwLock::new(())),
-            manifest: Arc::new(Mutex::new(manifest)),
+            manifest: Arc::new(Mutex::new(recovery_result.manifest)),
             compaction_handler,
         }
     }
