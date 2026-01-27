@@ -106,6 +106,9 @@ enum TestCommands {
         /// Value size in bytes
         #[arg(long, default_value_t = 20)]
         value_size: usize,
+        /// TTL in seconds (0 = no expiration)
+        #[arg(long, default_value_t = 0)]
+        ttl: u64,
     },
     /// Get multiple random keys
     RandomGet {
@@ -257,7 +260,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parallel,
                 key_range,
                 value_size,
-            } => run_test_set(addr.clone(), *count, *parallel, *key_range, *value_size).await,
+                ttl,
+            } => {
+                run_test_set(
+                    addr.clone(),
+                    *count,
+                    *parallel,
+                    *key_range,
+                    *value_size,
+                    *ttl,
+                )
+                .await
+            }
             TestCommands::RandomGet {
                 count,
                 parallel,
@@ -352,11 +366,19 @@ async fn run_test_set(
     parallel: usize,
     key_range: u32,
     value_size: usize,
+    ttl: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "Generating and setting {} random key-value pairs (range 1..={}, value_size={}) with parallelism {} to {}...",
-        count, key_range, value_size, parallel, addr
-    );
+    if ttl > 0 {
+        println!(
+            "Generating and setting {} random key-value pairs (range 1..={}, value_size={}, ttl={}s) with parallelism {} to {}...",
+            count, key_range, value_size, ttl, parallel, addr
+        );
+    } else {
+        println!(
+            "Generating and setting {} random key-value pairs (range 1..={}, value_size={}) with parallelism {} to {}...",
+            count, key_range, value_size, parallel, addr
+        );
+    }
 
     let client = KeyValueClient::connect(addr).await?;
     let semaphore = Arc::new(Semaphore::new(parallel));
@@ -379,7 +401,7 @@ async fn run_test_set(
             let request = tonic::Request::new(SetRequest {
                 key: key.clone(),
                 value: value.clone(),
-                ttl_seconds: 0,
+                ttl_seconds: ttl,
             });
 
             let req_start = Instant::now();
