@@ -228,7 +228,9 @@ impl KeyValue for MyKeyValue {
 pub enum EngineType {
     Memory,
     Log,
+    #[value(name = "lsm-tree")]
     LsmTree,
+    #[value(name = "btree")]
     BTree,
 }
 
