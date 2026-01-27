@@ -150,7 +150,7 @@ pub async fn run_follower(
                 };
 
                 if let Some(value) = entry.value {
-                    engine.set(entry.key, value)
+                    engine.set_with_expire_at(entry.key, value, entry.expire_at)
                 } else {
                     engine.delete(entry.key)
                 }

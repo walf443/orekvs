@@ -29,6 +29,25 @@ pub trait Engine: Send + Sync + 'static {
         self.set(key, value)
     }
 
+    /// Set a key-value pair with an absolute expiration timestamp.
+    /// expire_at: 0 = no expiration, >0 = Unix timestamp when key expires.
+    /// This is used for replication to preserve original TTL.
+    /// Default implementation calls set() if expire_at is 0, otherwise set_with_ttl().
+    fn set_with_expire_at(&self, key: String, value: String, expire_at: u64) -> Result<(), Status> {
+        if expire_at == 0 {
+            self.set(key, value)
+        } else {
+            let now = current_timestamp();
+            if expire_at <= now {
+                // Already expired, don't set
+                Ok(())
+            } else {
+                let ttl_secs = expire_at - now;
+                self.set_with_ttl(key, value, ttl_secs)
+            }
+        }
+    }
+
     /// Batch set multiple key-value pairs.
     /// Default implementation calls set() for each item.
     /// Engines can override this for optimized batch processing.

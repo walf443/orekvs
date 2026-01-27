@@ -27,6 +27,7 @@ pub struct WalEntry {
     pub timestamp: u64,
     pub key: String,
     pub value: Option<String>,
+    pub expire_at: u64, // 0 = no expiration, >0 = Unix timestamp when key expires
 }
 
 /// Threshold for switching between catch-up and real-time modes
@@ -332,7 +333,7 @@ impl ReplicationService {
                 if cursor.read_exact(&mut expire_at_bytes).is_err() {
                     break;
                 }
-                let _expire_at = u64::from_le_bytes(expire_at_bytes);
+                let expire_at = u64::from_le_bytes(expire_at_bytes);
 
                 let mut klen_bytes = [0u8; 8];
                 let mut vlen_bytes = [0u8; 8];
@@ -366,6 +367,7 @@ impl ReplicationService {
                     timestamp,
                     key,
                     value,
+                    expire_at,
                 });
 
                 if entries.len() >= max_entries {
@@ -471,7 +473,7 @@ impl ReplicationService {
                 if cursor.read_exact(&mut expire_at_bytes).is_err() {
                     break;
                 }
-                let _expire_at = u64::from_le_bytes(expire_at_bytes);
+                let expire_at = u64::from_le_bytes(expire_at_bytes);
 
                 let mut klen_bytes = [0u8; 8];
                 let mut vlen_bytes = [0u8; 8];
@@ -505,6 +507,7 @@ impl ReplicationService {
                     timestamp,
                     key,
                     value,
+                    expire_at,
                 });
 
                 if entries.len() >= max_entries {
@@ -523,10 +526,12 @@ impl ReplicationService {
 use crate::engine::wal::parse_wal_filename;
 
 /// Serialize WAL entries to bytes
+/// Format: [timestamp: u64][expire_at: u64][key_len: u64][val_len: u64][key][value]
 pub(crate) fn serialize_entries(entries: &[WalEntry]) -> Vec<u8> {
     let mut buf = Vec::new();
     for entry in entries {
         buf.extend_from_slice(&entry.timestamp.to_le_bytes());
+        buf.extend_from_slice(&entry.expire_at.to_le_bytes());
 
         let key_bytes = entry.key.as_bytes();
         buf.extend_from_slice(&(key_bytes.len() as u64).to_le_bytes());
@@ -548,6 +553,7 @@ pub(crate) fn serialize_entries(entries: &[WalEntry]) -> Vec<u8> {
 }
 
 /// Deserialize WAL entries from bytes
+/// Format: [timestamp: u64][expire_at: u64][key_len: u64][val_len: u64][key][value]
 #[allow(clippy::result_large_err)]
 pub fn deserialize_entries(data: &[u8]) -> Result<Vec<WalEntry>, Status> {
     let mut entries = Vec::new();
@@ -560,6 +566,13 @@ pub fn deserialize_entries(data: &[u8]) -> Result<Vec<WalEntry>, Status> {
             break;
         }
         let timestamp = u64::from_le_bytes(ts_bytes);
+
+        // Read expire_at
+        let mut expire_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut expire_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let expire_at = u64::from_le_bytes(expire_bytes);
 
         // Read key length
         let mut klen_bytes = [0u8; 8];
@@ -611,6 +624,7 @@ pub fn deserialize_entries(data: &[u8]) -> Result<Vec<WalEntry>, Status> {
             timestamp,
             key,
             value,
+            expire_at,
         });
     }
 
@@ -893,11 +907,13 @@ mod tests {
                 timestamp: 12345,
                 key: "key1".to_string(),
                 value: Some("value1".to_string()),
+                expire_at: 0,
             },
             WalEntry {
                 timestamp: 12346,
                 key: "key2".to_string(),
                 value: None, // Tombstone
+                expire_at: 0,
             },
         ];
 
