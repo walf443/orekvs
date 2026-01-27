@@ -1337,3 +1337,72 @@ async fn test_get_expire_at_from_sstable() {
 
     engine.shutdown().await;
 }
+
+/// Test that expired keys are filtered during WAL recovery
+/// This saves memory by not loading already-expired data into memtable
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wal_recovery_filters_expired_keys() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Phase 1: Write data with short TTL
+    {
+        // Large memtable to avoid flushing
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        // Set key with 1 second TTL
+        engine
+            .set_with_ttl("expired_key".to_string(), "value1".to_string(), 1)
+            .unwrap();
+        // Set key without TTL
+        engine
+            .set("permanent_key".to_string(), "value2".to_string())
+            .unwrap();
+        // Set key with long TTL
+        engine
+            .set_with_ttl("valid_ttl_key".to_string(), "value3".to_string(), 3600)
+            .unwrap();
+
+        // Wait for WAL group commit
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Don't flush - simulate crash
+        engine.shutdown().await;
+    }
+
+    // Wait for the 1-second TTL to expire
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Phase 2: Reopen and verify expired key is filtered during recovery
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        // expired_key should not be recovered (already expired)
+        let result = engine.get("expired_key".to_string());
+        assert!(
+            result.is_err(),
+            "Expired key should not be recovered from WAL"
+        );
+
+        // permanent_key should be recovered
+        assert_eq!(
+            engine.get("permanent_key".to_string()).unwrap(),
+            "value2",
+            "Permanent key should be recovered from WAL"
+        );
+
+        // valid_ttl_key should be recovered (not yet expired)
+        assert_eq!(
+            engine.get("valid_ttl_key".to_string()).unwrap(),
+            "value3",
+            "Valid TTL key should be recovered from WAL"
+        );
+
+        // Verify get_expire_at for valid_ttl_key
+        let (exists, expire_at) = engine.get_expire_at("valid_ttl_key".to_string()).unwrap();
+        assert!(exists, "valid_ttl_key should exist");
+        assert!(expire_at > 0, "valid_ttl_key should have TTL preserved");
+
+        engine.shutdown().await;
+    }
+}

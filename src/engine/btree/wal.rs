@@ -59,6 +59,8 @@ pub struct WalRecord {
     pub key: String,
     /// Value (None for delete/checkpoint/batch records)
     pub value: Option<String>,
+    /// Expiration timestamp (0 = no expiration)
+    pub expire_at: u64,
 }
 
 impl WalRecord {
@@ -68,6 +70,17 @@ impl WalRecord {
             record_type: RecordType::Insert,
             key,
             value: Some(value),
+            expire_at: 0,
+        }
+    }
+
+    pub fn insert_with_ttl(seq: u64, key: String, value: String, expire_at: u64) -> Self {
+        Self {
+            seq,
+            record_type: RecordType::Insert,
+            key,
+            value: Some(value),
+            expire_at,
         }
     }
 
@@ -77,6 +90,7 @@ impl WalRecord {
             record_type: RecordType::Delete,
             key,
             value: None,
+            expire_at: 0,
         }
     }
 
@@ -86,6 +100,7 @@ impl WalRecord {
             record_type: RecordType::Checkpoint,
             key: String::new(),
             value: None,
+            expire_at: 0,
         }
     }
 
@@ -95,6 +110,7 @@ impl WalRecord {
             record_type: RecordType::BeginBatch,
             key: String::new(),
             value: None,
+            expire_at: 0,
         }
     }
 
@@ -104,16 +120,18 @@ impl WalRecord {
             record_type: RecordType::EndBatch,
             key: String::new(),
             value: None,
+            expire_at: 0,
         }
     }
 
     /// Serialize record to a buffer
     ///
-    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value]
+    /// Format: [seq: u64][type: u8][expire_at: u64][key_len: u32][value_len: u32][key][value]
     /// Checksum is handled by the block writer.
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.seq.to_le_bytes());
         buf.push(self.record_type as u8);
+        buf.extend_from_slice(&self.expire_at.to_le_bytes());
         buf.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
 
         let value_len = self.value.as_ref().map_or(u32::MAX, |v| v.len() as u32);
@@ -127,10 +145,10 @@ impl WalRecord {
 
     /// Deserialize record from bytes
     ///
-    /// Format: [seq: u64][type: u8][key_len: u32][value_len: u32][key][value]
+    /// Format: [seq: u64][type: u8][expire_at: u64][key_len: u32][value_len: u32][key][value]
     pub fn deserialize(data: &[u8]) -> io::Result<(Self, usize)> {
-        if data.len() < 17 {
-            // Minimum: 8 + 1 + 4 + 4 = 17 bytes
+        if data.len() < 25 {
+            // Minimum: 8 + 1 + 8 + 4 + 4 = 25 bytes
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Record too short",
@@ -139,10 +157,11 @@ impl WalRecord {
 
         let seq = u64::from_le_bytes(data[0..8].try_into().unwrap());
         let record_type = RecordType::try_from(data[8])?;
-        let key_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
-        let value_len = u32::from_le_bytes(data[13..17].try_into().unwrap());
+        let expire_at = u64::from_le_bytes(data[9..17].try_into().unwrap());
+        let key_len = u32::from_le_bytes(data[17..21].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(data[21..25].try_into().unwrap());
 
-        let header_size = 17;
+        let header_size = 25;
         let key_end = header_size + key_len;
 
         if data.len() < key_end {
@@ -176,6 +195,7 @@ impl WalRecord {
                 record_type,
                 key,
                 value,
+                expire_at,
             },
             value_end,
         ))
@@ -638,8 +658,13 @@ impl GroupCommitWalWriter {
 
     /// Log an insert operation (batched with group commit)
     pub fn log_insert(&self, key: &str, value: &str) -> io::Result<u64> {
+        self.log_insert_with_ttl(key, value, 0)
+    }
+
+    /// Log an insert operation with TTL (batched with group commit)
+    pub fn log_insert_with_ttl(&self, key: &str, value: &str, expire_at: u64) -> io::Result<u64> {
         let seq = self.seq_gen.allocate();
-        let record = WalRecord::insert(seq, key.to_string(), value.to_string());
+        let record = WalRecord::insert_with_ttl(seq, key.to_string(), value.to_string(), expire_at);
         self.send_and_wait(record)
     }
 

@@ -183,6 +183,7 @@ impl BTreeEngine {
     ///
     /// Only replays records with sequence number > last_wal_seq stored in meta page.
     /// This allows incremental recovery instead of full WAL replay.
+    /// Expired entries are filtered out during recovery to save memory.
     fn recover(&mut self) -> Result<(), Status> {
         let wal = self.wal.as_ref().expect("WAL must be present for recovery");
 
@@ -214,14 +215,21 @@ impl BTreeEngine {
 
         // Track the max sequence number we're replaying
         let mut max_replayed_seq = last_persisted_seq;
+        let now = current_timestamp();
+        let mut skipped_expired = 0u64;
 
         // Replay records
         for record in records_to_replay {
             max_replayed_seq = max_replayed_seq.max(record.seq);
             match record.record_type {
                 RecordType::Insert => {
+                    // Skip expired entries during recovery
+                    if record.expire_at > 0 && record.expire_at <= now {
+                        skipped_expired += 1;
+                        continue;
+                    }
                     if let Some(value) = record.value {
-                        self.set_internal_with_ttl(record.key, value, 0, false)?;
+                        self.set_internal_with_ttl(record.key, value, record.expire_at, false)?;
                     }
                 }
                 RecordType::Delete => {
@@ -230,6 +238,13 @@ impl BTreeEngine {
                 }
                 _ => {}
             }
+        }
+
+        if skipped_expired > 0 {
+            println!(
+                "Skipped {} expired entries during WAL recovery",
+                skipped_expired
+            );
         }
 
         // Update current_wal_seq to reflect the replayed records
@@ -259,10 +274,10 @@ impl BTreeEngine {
         expire_at: u64,
         log_wal: bool,
     ) -> Result<(), Status> {
-        // Log to WAL first
+        // Log to WAL first (with TTL)
         if log_wal && let Some(wal) = &self.wal {
             let seq = wal
-                .log_insert(&key, &value)
+                .log_insert_with_ttl(&key, &value, expire_at)
                 .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
             // Track the latest WAL sequence number
             self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);

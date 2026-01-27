@@ -16,6 +16,7 @@ use super::memtable::{self, MemTable, MemValue};
 use super::sstable::{self, MappedSSTable};
 use super::wal::GroupCommitWalWriter;
 use super::{LeveledSstables, SstableHandle};
+use crate::engine::current_timestamp;
 
 /// Result of recovery process
 pub struct RecoveryResult {
@@ -154,6 +155,11 @@ fn build_sstable_handles(sst_files: &[PathBuf], manifest: &Manifest) -> LeveledS
     leveled_sstables
 }
 
+/// Check if an entry is expired
+fn is_expired(expire_at: u64, now: u64) -> bool {
+    expire_at > 0 && expire_at <= now
+}
+
 /// Recover MemTable from WAL files
 fn recover_memtable(
     wal_files: &[(u64, PathBuf)],
@@ -164,6 +170,8 @@ fn recover_memtable(
     let mut recovered_memtable: MemTable = BTreeMap::new();
     let mut recovered_size: u64 = 0;
     let mut max_wal_seq = last_flushed_wal_seq;
+    let now = current_timestamp();
+    let mut skipped_expired = 0u64;
 
     for (wal_id, wal_path) in wal_files {
         // Recover WAL files that are newer than the latest flushed WAL ID
@@ -176,6 +184,11 @@ fn recover_memtable(
                 Ok(entries) => {
                     for entry in entries {
                         max_wal_seq = max_wal_seq.max(entry.seq);
+                        // Skip expired entries during recovery
+                        if is_expired(entry.expire_at, now) {
+                            skipped_expired += 1;
+                            continue;
+                        }
                         let mem_value = MemValue::new_with_ttl(entry.value, entry.expire_at);
                         let entry_size = memtable::estimate_entry_size(&entry.key, &mem_value);
                         if let Some(old_value) = recovered_memtable.get(&entry.key) {
@@ -202,6 +215,11 @@ fn recover_memtable(
                     match GroupCommitWalWriter::read_entries(wal_path) {
                         Ok(entries) => {
                             for (key, mem_value) in entries {
+                                // Skip expired entries during recovery
+                                if is_expired(mem_value.expire_at, now) {
+                                    skipped_expired += 1;
+                                    continue;
+                                }
                                 let entry_size = memtable::estimate_entry_size(&key, &mem_value);
                                 if let Some(old_value) = recovered_memtable.get(&key) {
                                     let old_size = memtable::estimate_entry_size(&key, old_value);
@@ -228,6 +246,13 @@ fn recover_memtable(
                 }
             }
         }
+    }
+
+    if skipped_expired > 0 {
+        println!(
+            "Skipped {} expired entries during WAL recovery",
+            skipped_expired
+        );
     }
 
     (recovered_memtable, recovered_size, max_wal_seq)
