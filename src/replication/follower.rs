@@ -17,9 +17,9 @@ use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationServi
 use crate::server::kv::key_value_server::{KeyValue, KeyValueServer};
 use crate::server::kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, DeleteRequest, DeleteResponse, GetMetricsRequest, GetMetricsResponse,
-    GetRequest, GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest,
-    SetResponse,
+    BatchSetResponse, DeleteRequest, DeleteResponse, GetExpireAtRequest, GetExpireAtResponse,
+    GetMetricsRequest, GetMetricsResponse, GetRequest, GetResponse, KeyValuePair, PromoteRequest,
+    PromoteResponse, SetRequest, SetResponse,
 };
 
 /// Run as a follower, replicating from a leader
@@ -440,6 +440,19 @@ impl KeyValue for SwappableFollowerKeyValue {
             blockcache_evictions: cache_stats.evictions,
             blockcache_hit_ratio: cache_stats.hit_ratio,
         }))
+    }
+
+    async fn get_expire_at(
+        &self,
+        request: Request<GetExpireAtRequest>,
+    ) -> Result<Response<GetExpireAtResponse>, Status> {
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().unwrap();
+            Arc::clone(&*guard)
+        };
+        let (exists, expire_at) = engine.get_expire_at(req.key)?;
+        Ok(Response::new(GetExpireAtResponse { expire_at, exists }))
     }
 
     async fn promote_to_leader(

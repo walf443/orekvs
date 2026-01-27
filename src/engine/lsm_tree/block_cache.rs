@@ -31,9 +31,10 @@ impl BlockCacheKey {
     }
 }
 
-/// Parsed block entry: (key, value_option)
+/// Parsed block entry: (key, value_option, expire_at)
 /// Entries are sorted by key for binary search
-pub type ParsedBlockEntry = (String, Option<String>);
+/// expire_at: 0 = no expiration, >0 = Unix timestamp when key expires
+pub type ParsedBlockEntry = (String, Option<String>, u64);
 
 /// Cached entry types
 #[derive(Clone)]
@@ -50,7 +51,7 @@ impl CacheEntry {
             CacheEntry::Index(index) => index.iter().map(|(k, _)| k.len() + 8).sum::<usize>(),
             CacheEntry::ParsedBlock(entries) => entries
                 .iter()
-                .map(|(k, v)| k.len() + v.as_ref().map_or(0, |s| s.len()))
+                .map(|(k, v, _expire_at)| k.len() + v.as_ref().map_or(0, |s| s.len()) + 8)
                 .sum::<usize>(),
         }
     }
@@ -210,8 +211,8 @@ mod tests {
 
         let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), 0);
         let entries = Arc::new(vec![
-            ("key1".to_string(), Some("value1".to_string())),
-            ("key2".to_string(), Some("value2".to_string())),
+            ("key1".to_string(), Some("value1".to_string()), 0),
+            ("key2".to_string(), Some("value2".to_string()), 0),
         ]);
 
         // Insert
@@ -227,25 +228,25 @@ mod tests {
         // Stats
         let stats = cache.stats();
         assert_eq!(stats.entries, 1);
-        // key1(4) + value1(6) + key2(4) + value2(6) = 20
-        assert_eq!(stats.size_bytes, 20);
+        // key1(4) + value1(6) + expire_at(8) + key2(4) + value2(6) + expire_at(8) = 36
+        assert_eq!(stats.size_bytes, 36);
     }
 
     #[test]
     fn test_cache_eviction() {
-        let cache = BlockCache::new(200);
+        let cache = BlockCache::new(250);
 
         // Insert entries that exceed cache size
         for i in 0..5 {
             let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), i * 100);
-            // Create entries with predictable sizes
-            let entries = Arc::new(vec![("x".repeat(50), Some("y".repeat(50)))]);
+            // Create entries with predictable sizes: 50 + 50 + 8 = 108 bytes per entry
+            let entries = Arc::new(vec![("x".repeat(50), Some("y".repeat(50)), 0)]);
             cache.insert(key, CacheEntry::ParsedBlock(entries));
         }
 
         // Cache should have evicted older entries
         let stats = cache.stats();
-        assert!(stats.size_bytes <= 200);
+        assert!(stats.size_bytes <= 250);
     }
 
     #[test]
@@ -258,15 +259,27 @@ mod tests {
 
         cache.insert(
             BlockCacheKey::for_block(file1.clone(), 0),
-            CacheEntry::ParsedBlock(Arc::new(vec![("k1".to_string(), Some("v1".to_string()))])),
+            CacheEntry::ParsedBlock(Arc::new(vec![(
+                "k1".to_string(),
+                Some("v1".to_string()),
+                0,
+            )])),
         );
         cache.insert(
             BlockCacheKey::for_block(file1.clone(), 100),
-            CacheEntry::ParsedBlock(Arc::new(vec![("k2".to_string(), Some("v2".to_string()))])),
+            CacheEntry::ParsedBlock(Arc::new(vec![(
+                "k2".to_string(),
+                Some("v2".to_string()),
+                0,
+            )])),
         );
         cache.insert(
             BlockCacheKey::for_block(file2.clone(), 0),
-            CacheEntry::ParsedBlock(Arc::new(vec![("k3".to_string(), Some("v3".to_string()))])),
+            CacheEntry::ParsedBlock(Arc::new(vec![(
+                "k3".to_string(),
+                Some("v3".to_string()),
+                0,
+            )])),
         );
 
         assert_eq!(cache.stats().entries, 3);

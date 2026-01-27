@@ -623,6 +623,23 @@ impl Engine for BTreeEngine {
 
         Ok(count)
     }
+
+    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
+        let meta = self.meta.read().unwrap();
+
+        if meta.root_page_id == 0 {
+            return Ok((false, 0));
+        }
+
+        // Traverse to leaf
+        let leaf_page_id = self.find_leaf(meta.root_page_id, &key, meta.tree_height)?;
+        let leaf = self.get_leaf(leaf_page_id)?;
+
+        match leaf.get(&key) {
+            Some(entry) if entry.is_valid(current_timestamp()) => Ok((true, entry.expire_at)),
+            _ => Ok((false, 0)),
+        }
+    }
 }
 
 impl Drop for BTreeEngine {
@@ -697,5 +714,9 @@ impl Engine for BTreeEngineWrapper {
 
     fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
         self.0.batch_delete(keys)
+    }
+
+    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
+        self.0.get_expire_at(key)
     }
 }

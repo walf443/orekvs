@@ -1201,3 +1201,139 @@ async fn test_lsn_based_incremental_recovery() {
         engine.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_expire_at_no_ttl() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024, 4);
+
+    // Set key without TTL
+    engine
+        .set("key1".to_string(), "value1".to_string())
+        .unwrap();
+
+    // get_expire_at should return (true, 0) for key without TTL
+    let (exists, expire_at) = engine.get_expire_at("key1".to_string()).unwrap();
+    assert!(exists, "Key should exist");
+    assert_eq!(expire_at, 0, "expire_at should be 0 for key without TTL");
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_expire_at_with_ttl() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024, 4);
+
+    // Set key with TTL (10 seconds)
+    engine
+        .set_with_ttl("key1".to_string(), "value1".to_string(), 10)
+        .unwrap();
+
+    // get_expire_at should return (true, expire_at > 0)
+    let (exists, expire_at) = engine.get_expire_at("key1".to_string()).unwrap();
+    assert!(exists, "Key should exist");
+    assert!(expire_at > 0, "expire_at should be > 0 for key with TTL");
+
+    // Verify expire_at is approximately now + 10 seconds
+    let now = current_timestamp();
+    assert!(
+        expire_at >= now && expire_at <= now + 11,
+        "expire_at should be approximately now + 10 seconds"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_expire_at_expired_key() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024, 4);
+
+    // Set key with TTL of 1 second
+    engine
+        .set_with_ttl("key1".to_string(), "value1".to_string(), 1)
+        .unwrap();
+
+    // Verify key exists before expiration
+    let (exists, expire_at) = engine.get_expire_at("key1".to_string()).unwrap();
+    assert!(exists, "Key should exist before expiration");
+    assert!(expire_at > 0, "expire_at should be > 0");
+
+    // Wait for key to expire
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // get_expire_at should return (false, 0) for expired key
+    let (exists, expire_at) = engine.get_expire_at("key1".to_string()).unwrap();
+    assert!(!exists, "Key should not exist after expiration");
+    assert_eq!(expire_at, 0, "expire_at should be 0 for expired key");
+
+    // get should also return NotFound
+    let result = engine.get("key1".to_string());
+    assert!(result.is_err(), "get should return error for expired key");
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_expire_at_nonexistent_key() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024, 4);
+
+    // get_expire_at for non-existent key should return (false, 0)
+    let (exists, expire_at) = engine.get_expire_at("nonexistent".to_string()).unwrap();
+    assert!(!exists, "Non-existent key should not exist");
+    assert_eq!(expire_at, 0, "expire_at should be 0 for non-existent key");
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_expire_at_deleted_key() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024, 4);
+
+    // Set and then delete a key
+    engine
+        .set("key1".to_string(), "value1".to_string())
+        .unwrap();
+    engine.delete("key1".to_string()).unwrap();
+
+    // get_expire_at should return (false, 0) for deleted key
+    let (exists, expire_at) = engine.get_expire_at("key1".to_string()).unwrap();
+    assert!(!exists, "Deleted key should not exist");
+    assert_eq!(expire_at, 0, "expire_at should be 0 for deleted key");
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_expire_at_from_sstable() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    // Small memtable to force flush
+    let engine = LsmTreeEngine::new(data_dir, 100, 4);
+
+    // Set key with TTL
+    engine
+        .set_with_ttl("key1".to_string(), "value1".to_string(), 60)
+        .unwrap();
+
+    // Force flush by adding more data
+    for i in 0..10 {
+        engine.set(format!("pad{}", i), "x".repeat(50)).unwrap();
+    }
+    wait_for_flush(&engine, 2000).await;
+
+    // get_expire_at should still work after flush to SSTable
+    let (exists, expire_at) = engine.get_expire_at("key1".to_string()).unwrap();
+    assert!(exists, "Key should exist in SSTable");
+    assert!(expire_at > 0, "expire_at should be preserved in SSTable");
+
+    engine.shutdown().await;
+}

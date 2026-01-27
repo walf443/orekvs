@@ -11,6 +11,7 @@ mod writer;
 
 pub use reader::{
     MappedSSTable, TimestampedEntry, extract_wal_id_from_sstable, read_entries, search_key_mmap,
+    search_key_mmap_with_expire,
 };
 pub use writer::{create_from_memtable, write_timestamped_entries};
 

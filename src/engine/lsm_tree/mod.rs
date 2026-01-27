@@ -905,6 +905,53 @@ impl Engine for LsmTreeEngine {
         Err(Status::not_found("Key not found"))
     }
 
+    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
+        let now = current_timestamp();
+
+        // 1. Check memtable (active and immutable)
+        if let Some(mem_value) = self.mem_state.get(&key) {
+            if mem_value.is_tombstone() {
+                return Ok((false, 0));
+            }
+            if mem_value.is_expired(now) {
+                return Ok((false, 0));
+            }
+            return Ok((true, mem_value.expire_at));
+        }
+
+        let leveled = self.leveled_sstables.lock().unwrap();
+        let key_bytes = key.as_bytes();
+
+        // 2. Check all levels (L0 scans all, L1+ uses binary search)
+        for level in 0..leveled.level_count() {
+            for handle in leveled.candidates_for_key(level, key_bytes) {
+                if !handle.bloom.contains(&key) {
+                    continue;
+                }
+                match sstable::search_key_mmap_with_expire(&handle.mmap, &key, &self.block_cache) {
+                    Ok(Some((value_opt, expire_at))) => {
+                        // Check if it's a tombstone
+                        if value_opt.is_none() {
+                            return Ok((false, 0));
+                        }
+                        // Check if expired
+                        if expire_at > 0 && now > expire_at {
+                            return Ok((false, 0));
+                        }
+                        return Ok((true, expire_at));
+                    }
+                    Ok(None) => return Ok((false, 0)),
+                    Err(e) if e.code() == tonic::Code::NotFound => {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        Ok((false, 0))
+    }
+
     fn delete(&self, key: String) -> Result<(), Status> {
         self.metrics.record_delete();
 
@@ -1163,6 +1210,10 @@ impl Engine for LsmTreeEngineWrapper {
 
     fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
         self.0.batch_delete(keys)
+    }
+
+    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
+        self.0.get_expire_at(key)
     }
 }
 

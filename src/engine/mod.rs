@@ -80,4 +80,19 @@ pub trait Engine: Send + Sync + 'static {
         }
         Ok(count)
     }
+
+    /// Get the expiration timestamp for a key.
+    /// Returns (exists, expire_at) where:
+    /// - exists: true if key exists and is not expired
+    /// - expire_at: 0 = no expiration, >0 = Unix timestamp when key expires
+    ///
+    /// Default implementation returns (false, 0) indicating no TTL support.
+    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
+        // Default: check if key exists, but no TTL info
+        match self.get(key) {
+            Ok(_) => Ok((true, 0)),
+            Err(e) if e.code() == tonic::Code::NotFound => Ok((false, 0)),
+            Err(e) => Err(e),
+        }
+    }
 }

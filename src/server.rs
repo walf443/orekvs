@@ -9,9 +9,9 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, DeleteRequest, DeleteResponse, GetMetricsRequest, GetMetricsResponse,
-    GetRequest, GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest,
-    SetResponse,
+    BatchSetResponse, DeleteRequest, DeleteResponse, GetExpireAtRequest, GetExpireAtResponse,
+    GetMetricsRequest, GetMetricsResponse, GetRequest, GetResponse, KeyValuePair, PromoteRequest,
+    PromoteResponse, SetRequest, SetResponse,
 };
 
 use crate::engine::{
@@ -201,6 +201,15 @@ impl KeyValue for MyKeyValue {
             // Return empty metrics for non-LSM engines
             Ok(Response::new(GetMetricsResponse::default()))
         }
+    }
+
+    async fn get_expire_at(
+        &self,
+        request: Request<GetExpireAtRequest>,
+    ) -> Result<Response<GetExpireAtResponse>, Status> {
+        let req = request.into_inner();
+        let (exists, expire_at) = self.engine.get_expire_at(req.key)?;
+        Ok(Response::new(GetExpireAtResponse { expire_at, exists }))
     }
 
     async fn promote_to_leader(

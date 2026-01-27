@@ -10,6 +10,8 @@ service KeyValue {
   rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
   rpc BatchDelete (BatchDeleteRequest) returns (BatchDeleteResponse);
   rpc GetMetrics (GetMetricsRequest) returns (GetMetricsResponse);
+  // Get the expiration timestamp for a key (0 = no expiration or key not found)
+  rpc GetExpireAt (GetExpireAtRequest) returns (GetExpireAtResponse);
   // Promote follower to leader (stops replication, enables writes)
   rpc PromoteToLeader (PromoteRequest) returns (PromoteResponse);
 }
@@ -73,6 +75,17 @@ message BatchDeleteResponse {
 }
 
 message GetMetricsRequest {
+}
+
+message GetExpireAtRequest {
+  string key = 1;
+}
+
+message GetExpireAtResponse {
+  // Unix timestamp when the key expires (0 = no expiration, key has no TTL set)
+  uint64 expire_at = 1;
+  // Whether the key exists
+  bool exists = 2;
 }
 
 message PromoteRequest {

@@ -520,6 +520,29 @@ pub fn search_key_mmap(
     search_in_parsed_block(&parsed_entries, key)
 }
 
+/// Search for a key and return its expire_at timestamp
+/// Returns Ok(Some((value_opt, expire_at))) if found, Err(NotFound) if not found
+#[allow(clippy::result_large_err)]
+pub fn search_key_mmap_with_expire(
+    sst: &MappedSSTable,
+    key: &str,
+    cache: &BlockCache,
+) -> Result<Option<(Option<String>, u64)>, Status> {
+    let canonical_path = sst.canonical_path();
+
+    // Get or load index from cache
+    let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
+
+    // Binary search in index to find the block that might contain the key
+    let block_offset = find_block_offset(&index, key);
+
+    // Get or load parsed block from cache
+    let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
+
+    // Binary search within parsed block entries
+    search_in_parsed_block_with_expire(&parsed_entries, key)
+}
+
 /// Get index from cache or load from mmap
 #[allow(clippy::result_large_err)]
 fn get_or_load_index_mmap(
@@ -583,17 +606,18 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
             break;
         }
 
-        // Skip timestamp (8 bytes)
+        // Read timestamp (8 bytes) - not used but still need to read
         let mut ts_bytes = [0u8; 8];
         if cursor.read_exact(&mut ts_bytes).is_err() {
             break;
         }
 
-        // Skip expire_at (8 bytes)
+        // Read expire_at (8 bytes)
         let mut expire_at_bytes = [0u8; 8];
         cursor
             .read_exact(&mut expire_at_bytes)
             .map_err(|e| Status::internal(e.to_string()))?;
+        let expire_at = u64::from_le_bytes(expire_at_bytes);
 
         let mut klen_bytes = [0u8; 8];
         cursor
@@ -623,7 +647,7 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
             Some(String::from_utf8_lossy(&val_buf).to_string())
         };
 
-        entries.push((key, value));
+        entries.push((key, value, expire_at));
     }
 
     // Entries are already sorted by key (written in BTreeMap order)
@@ -637,10 +661,30 @@ fn search_in_parsed_block(
     entries: &[ParsedBlockEntry],
     key: &str,
 ) -> Result<Option<String>, Status> {
-    match entries.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+    match entries.binary_search_by(|(k, _, _)| k.as_str().cmp(key)) {
         Ok(idx) => {
             // Found the key
             Ok(entries[idx].1.clone())
+        }
+        Err(_) => {
+            // Key not in this block
+            Err(Status::not_found("Key not found in SSTable"))
+        }
+    }
+}
+
+/// Binary search within parsed block entries, returning value and expire_at
+/// Returns Ok(Some((value, expire_at))) if found, Ok(None) if tombstone, Err if not found
+#[allow(clippy::result_large_err)]
+fn search_in_parsed_block_with_expire(
+    entries: &[ParsedBlockEntry],
+    key: &str,
+) -> Result<Option<(Option<String>, u64)>, Status> {
+    match entries.binary_search_by(|(k, _, _)| k.as_str().cmp(key)) {
+        Ok(idx) => {
+            // Found the key - return value and expire_at
+            let (_, value, expire_at) = &entries[idx];
+            Ok(Some((value.clone(), *expire_at)))
         }
         Err(_) => {
             // Key not in this block
