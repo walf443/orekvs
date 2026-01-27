@@ -7,8 +7,8 @@ use serde::Serialize;
 use server::EngineType;
 use server::kv::key_value_client::KeyValueClient;
 use server::kv::{
-    BatchDeleteRequest, BatchGetRequest, BatchSetRequest, DeleteRequest, GetMetricsRequest,
-    GetRequest, KeyValuePair, SetRequest,
+    BatchDeleteRequest, BatchGetRequest, BatchSetRequest, DeleteRequest, GetExpireAtRequest,
+    GetMetricsRequest, GetRequest, KeyValuePair, SetRequest,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -155,9 +155,17 @@ enum TestCommands {
         key_range: u32,
     },
     /// Set a key-value pair
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        value: String,
+        /// TTL in seconds (0 = no expiration)
+        #[arg(long, default_value_t = 0)]
+        ttl: u64,
+    },
     /// Get the value of a key
     Get { key: String },
+    /// Get the expiration timestamp of a key
+    GetExpireAt { key: String },
     /// Delete a key
     Delete { key: String },
     /// Get engine metrics
@@ -280,12 +288,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 batch_size,
                 key_range,
             } => run_test_batch_delete(addr.clone(), *count, *batch_size, *key_range).await,
-            TestCommands::Set { key, value } => {
+            TestCommands::Set { key, value, ttl } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
                 let request = tonic::Request::new(SetRequest {
                     key: key.clone(),
                     value: value.clone(),
-                    ttl_seconds: 0,
+                    ttl_seconds: *ttl,
                 });
                 let response = client.set(request).await?;
                 println!("RESPONSE={:?}", response);
@@ -297,6 +305,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match client.get(request).await {
                     Ok(response) => {
                         println!("{}", response.into_inner().value);
+                    }
+                    Err(e) => {
+                        println!("Error: {}", e);
+                    }
+                }
+                Ok(())
+            }
+            TestCommands::GetExpireAt { key } => {
+                let mut client = KeyValueClient::connect(addr.clone()).await?;
+                let request = tonic::Request::new(GetExpireAtRequest { key: key.clone() });
+                match client.get_expire_at(request).await {
+                    Ok(response) => {
+                        let resp = response.into_inner();
+                        if resp.exists {
+                            if resp.expire_at == 0 {
+                                println!("Key exists, no expiration");
+                            } else {
+                                println!("Key expires at: {} (Unix timestamp)", resp.expire_at);
+                            }
+                        } else {
+                            println!("Key does not exist");
+                        }
                     }
                     Err(e) => {
                         println!("Error: {}", e);
