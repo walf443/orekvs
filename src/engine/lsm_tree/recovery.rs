@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::manifest::Manifest;
-use super::memtable::{self, MemTable};
+use super::memtable::{self, MemTable, MemValue};
 use super::sstable::{self, MappedSSTable};
 use super::wal::GroupCommitWalWriter;
 use super::{LeveledSstables, SstableHandle};
@@ -176,7 +176,8 @@ fn recover_memtable(
                 Ok(entries) => {
                     for entry in entries {
                         max_wal_seq = max_wal_seq.max(entry.seq);
-                        let entry_size = memtable::estimate_entry_size(&entry.key, &entry.value);
+                        let mem_value = MemValue::new_with_ttl(entry.value, entry.expire_at);
+                        let entry_size = memtable::estimate_entry_size(&entry.key, &mem_value);
                         if let Some(old_value) = recovered_memtable.get(&entry.key) {
                             let old_size = memtable::estimate_entry_size(&entry.key, old_value);
                             if entry_size > old_size {
@@ -187,7 +188,7 @@ fn recover_memtable(
                         } else {
                             recovered_size += entry_size;
                         }
-                        recovered_memtable.insert(entry.key, entry.value);
+                        recovered_memtable.insert(entry.key, mem_value);
                     }
                     println!(
                         "Recovered {} entries from WAL (LSN > {}): {:?}",
@@ -200,8 +201,8 @@ fn recover_memtable(
                     // Fall back to reading all entries for older WAL versions
                     match GroupCommitWalWriter::read_entries(wal_path) {
                         Ok(entries) => {
-                            for (key, value) in entries {
-                                let entry_size = memtable::estimate_entry_size(&key, &value);
+                            for (key, mem_value) in entries {
+                                let entry_size = memtable::estimate_entry_size(&key, &mem_value);
                                 if let Some(old_value) = recovered_memtable.get(&key) {
                                     let old_size = memtable::estimate_entry_size(&key, old_value);
                                     if entry_size > old_size {
@@ -212,7 +213,7 @@ fn recover_memtable(
                                 } else {
                                     recovered_size += entry_size;
                                 }
-                                recovered_memtable.insert(key, value);
+                                recovered_memtable.insert(key, mem_value);
                             }
                             println!(
                                 "Recovered {} entries from WAL (full replay): {:?}",

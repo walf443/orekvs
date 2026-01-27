@@ -285,6 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let request = tonic::Request::new(SetRequest {
                     key: key.clone(),
                     value: value.clone(),
+                    ttl_seconds: 0,
                 });
                 let response = client.set(request).await?;
                 println!("RESPONSE={:?}", response);
@@ -348,6 +349,7 @@ async fn run_test_set(
             let request = tonic::Request::new(SetRequest {
                 key: key.clone(),
                 value: value.clone(),
+                ttl_seconds: 0,
             });
 
             let req_start = Instant::now();

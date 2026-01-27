@@ -12,7 +12,7 @@ use tonic::Status;
 
 use crate::engine::lsm_tree::bloom::BloomFilter;
 use crate::engine::lsm_tree::common_prefix_compression_index as prefix_index;
-use crate::engine::lsm_tree::memtable::MemTable;
+use crate::engine::lsm_tree::memtable::{MemTable, MemValue};
 
 use super::reader::TimestampedEntry;
 use super::{BLOCK_SIZE, DATA_VERSION, FOOTER_MAGIC, HEADER_SIZE, MAGIC_BYTES, crc32};
@@ -82,12 +82,12 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
     let mut first_key_in_block = String::new();
 
     // Write entries
-    for (key, value_opt) in memtable.iter() {
+    for (key, mem_value) in memtable.iter() {
         if block_buffer.is_empty() {
             first_key_in_block = key.clone();
         }
 
-        write_entry(&mut block_buffer, key, value_opt, None)?;
+        write_entry(&mut block_buffer, key, mem_value, None)?;
 
         if block_buffer.len() >= BLOCK_SIZE {
             index.push((first_key_in_block.clone(), current_offset));
@@ -202,12 +202,13 @@ pub fn write_timestamped_entries(
     let mut first_key_in_block = String::new();
 
     // Write entries
-    for (key, (timestamp, value_opt)) in entries {
+    for (key, (timestamp, expire_at, value_opt)) in entries {
         if block_buffer.is_empty() {
             first_key_in_block = key.clone();
         }
 
-        write_entry(&mut block_buffer, key, value_opt, Some(*timestamp))?;
+        let mem_value = MemValue::new_with_ttl(value_opt.clone(), *expire_at);
+        write_entry(&mut block_buffer, key, &mem_value, Some(*timestamp))?;
 
         if block_buffer.len() >= BLOCK_SIZE {
             index.push((first_key_in_block.clone(), current_offset));
@@ -288,16 +289,17 @@ pub fn write_timestamped_entries(
 }
 
 /// Write a single entry to a writer
+/// Format: [timestamp: u64][expire_at: u64][key_len: u64][val_len: u64][key][value]
 #[allow(clippy::result_large_err)]
 fn write_entry(
     writer: &mut impl Write,
     key: &str,
-    value_opt: &Option<String>,
+    mem_value: &MemValue,
     timestamp: Option<u64>,
 ) -> Result<u64, Status> {
     let key_bytes = key.as_bytes();
     let key_len = key_bytes.len() as u64;
-    let (val_len, val_bytes) = match value_opt {
+    let (val_len, val_bytes) = match &mem_value.value {
         Some(v) => (v.len() as u64, v.as_bytes()),
         None => (u64::MAX, &[] as &[u8]),
     };
@@ -311,6 +313,9 @@ fn write_entry(
 
     writer
         .write_all(&ts.to_le_bytes())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    writer
+        .write_all(&mem_value.expire_at.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     writer
         .write_all(&key_len.to_le_bytes())
@@ -327,7 +332,8 @@ fn write_entry(
             .map_err(|e| Status::internal(e.to_string()))?;
     }
 
-    let written = 8 + 8 + 8 + key_len + if val_len == u64::MAX { 0 } else { val_len };
+    // 8 (ts) + 8 (expire_at) + 8 (key_len) + 8 (val_len) + key + value
+    let written = 8 + 8 + 8 + 8 + key_len + if val_len == u64::MAX { 0 } else { val_len };
     Ok(written)
 }
 
@@ -343,13 +349,17 @@ mod tests {
         let sst_path = dir.path().join("sst_ts.data");
 
         let mut entries = BTreeMap::new();
-        entries.insert("k1".to_string(), (100, Some("v1".to_string())));
-        entries.insert("k2".to_string(), (200, None)); // Tombstone with specific TS
+        // (timestamp, expire_at, value)
+        entries.insert("k1".to_string(), (100, 0, Some("v1".to_string())));
+        entries.insert("k2".to_string(), (200, 0, None)); // Tombstone with specific TS
 
         write_timestamped_entries(&sst_path, &entries).unwrap();
 
         let read_back = read_entries(&sst_path).unwrap();
-        assert_eq!(read_back.get("k1").unwrap(), &(100, Some("v1".to_string())));
-        assert_eq!(read_back.get("k2").unwrap(), &(200, None));
+        assert_eq!(
+            read_back.get("k1").unwrap(),
+            &(100, 0, Some("v1".to_string()))
+        );
+        assert_eq!(read_back.get("k2").unwrap(), &(200, 0, None));
     }
 }

@@ -914,19 +914,21 @@ async fn test_snapshot_lock_prevents_sstable_deletion_during_compaction() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_leveled_sstables_basic() {
+    use memtable::MemValue;
+
     let dir = tempdir().unwrap();
     let data_dir = dir.path();
 
     // Create some SSTable files with different key ranges
     let mut memtable1 = std::collections::BTreeMap::new();
-    memtable1.insert("a".to_string(), Some("v1".to_string()));
-    memtable1.insert("b".to_string(), Some("v2".to_string()));
+    memtable1.insert("a".to_string(), MemValue::new(Some("v1".to_string())));
+    memtable1.insert("b".to_string(), MemValue::new(Some("v2".to_string())));
     let sst1_path = data_dir.join("sst_1_0.data");
     sstable::create_from_memtable(&sst1_path, &memtable1).unwrap();
 
     let mut memtable2 = std::collections::BTreeMap::new();
-    memtable2.insert("c".to_string(), Some("v3".to_string()));
-    memtable2.insert("d".to_string(), Some("v4".to_string()));
+    memtable2.insert("c".to_string(), MemValue::new(Some("v3".to_string())));
+    memtable2.insert("d".to_string(), MemValue::new(Some("v4".to_string())));
     let sst2_path = data_dir.join("sst_2_0.data");
     sstable::create_from_memtable(&sst2_path, &memtable2).unwrap();
 
@@ -972,25 +974,27 @@ async fn test_leveled_sstables_basic() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_leveled_sstables_binary_search() {
+    use memtable::MemValue;
+
     let dir = tempdir().unwrap();
     let data_dir = dir.path();
 
     // Create SSTables with non-overlapping ranges for L1
     let mut memtable1 = std::collections::BTreeMap::new();
-    memtable1.insert("aaa".to_string(), Some("v1".to_string()));
-    memtable1.insert("bbb".to_string(), Some("v2".to_string()));
+    memtable1.insert("aaa".to_string(), MemValue::new(Some("v1".to_string())));
+    memtable1.insert("bbb".to_string(), MemValue::new(Some("v2".to_string())));
     let sst1_path = data_dir.join("sst_1_0.data");
     sstable::create_from_memtable(&sst1_path, &memtable1).unwrap();
 
     let mut memtable2 = std::collections::BTreeMap::new();
-    memtable2.insert("ccc".to_string(), Some("v3".to_string()));
-    memtable2.insert("ddd".to_string(), Some("v4".to_string()));
+    memtable2.insert("ccc".to_string(), MemValue::new(Some("v3".to_string())));
+    memtable2.insert("ddd".to_string(), MemValue::new(Some("v4".to_string())));
     let sst2_path = data_dir.join("sst_2_0.data");
     sstable::create_from_memtable(&sst2_path, &memtable2).unwrap();
 
     let mut memtable3 = std::collections::BTreeMap::new();
-    memtable3.insert("eee".to_string(), Some("v5".to_string()));
-    memtable3.insert("fff".to_string(), Some("v6".to_string()));
+    memtable3.insert("eee".to_string(), MemValue::new(Some("v5".to_string())));
+    memtable3.insert("fff".to_string(), MemValue::new(Some("v6".to_string())));
     let sst3_path = data_dir.join("sst_3_0.data");
     sstable::create_from_memtable(&sst3_path, &memtable3).unwrap();
 
@@ -1040,25 +1044,27 @@ async fn test_leveled_sstables_binary_search() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_leveled_sstables_get_overlapping() {
+    use memtable::MemValue;
+
     let dir = tempdir().unwrap();
     let data_dir = dir.path();
 
     // Create SSTables for L1
     let mut memtable1 = std::collections::BTreeMap::new();
-    memtable1.insert("a".to_string(), Some("v1".to_string()));
-    memtable1.insert("c".to_string(), Some("v2".to_string()));
+    memtable1.insert("a".to_string(), MemValue::new(Some("v1".to_string())));
+    memtable1.insert("c".to_string(), MemValue::new(Some("v2".to_string())));
     let sst1_path = data_dir.join("sst_1_0.data");
     sstable::create_from_memtable(&sst1_path, &memtable1).unwrap();
 
     let mut memtable2 = std::collections::BTreeMap::new();
-    memtable2.insert("d".to_string(), Some("v3".to_string()));
-    memtable2.insert("f".to_string(), Some("v4".to_string()));
+    memtable2.insert("d".to_string(), MemValue::new(Some("v3".to_string())));
+    memtable2.insert("f".to_string(), MemValue::new(Some("v4".to_string())));
     let sst2_path = data_dir.join("sst_2_0.data");
     sstable::create_from_memtable(&sst2_path, &memtable2).unwrap();
 
     let mut memtable3 = std::collections::BTreeMap::new();
-    memtable3.insert("g".to_string(), Some("v5".to_string()));
-    memtable3.insert("i".to_string(), Some("v6".to_string()));
+    memtable3.insert("g".to_string(), MemValue::new(Some("v5".to_string())));
+    memtable3.insert("i".to_string(), MemValue::new(Some("v6".to_string())));
     let sst3_path = data_dir.join("sst_3_0.data");
     sstable::create_from_memtable(&sst3_path, &memtable3).unwrap();
 

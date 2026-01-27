@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
 use super::buffer_pool::PooledBuffer;
-use super::memtable::MemTable;
+use super::memtable::{MemTable, MemValue};
 use crate::engine::wal::{
     GroupCommitConfig, SeqGenerator, WAL_FORMAT_VERSION, WalWriter, read_block, read_wal_header,
     write_block, write_wal_header,
@@ -21,6 +21,7 @@ pub struct WalEntry {
     pub seq: u64,
     pub key: String,
     pub value: Option<String>,
+    pub expire_at: u64,
 }
 
 /// Write request for group commit with pipelining
@@ -28,6 +29,7 @@ struct WriteRequest {
     seq: u64,
     key: String,
     value: Option<String>,
+    expire_at: u64,
     /// Notified when data is written to OS buffer
     written_tx: Option<oneshot::Sender<()>>,
     /// Notified when data is synced to disk (returns the sequence number)
@@ -36,7 +38,7 @@ struct WriteRequest {
 
 /// Batch write request - multiple entries with single notification
 struct BatchWriteRequest {
-    entries: Vec<(u64, String, Option<String>)>, // (seq, key, value)
+    entries: Vec<(u64, String, Option<String>, u64)>, // (seq, key, value, expire_at)
     /// Notified when all data is written to OS buffer
     written_tx: Option<oneshot::Sender<()>>,
     /// Notified when all data is synced to disk (returns the max sequence number)
@@ -275,15 +277,18 @@ impl GroupCommitWalWriter {
                         single.seq,
                         &single.key,
                         &single.value,
+                        single.expire_at,
                     ) {
                         Self::notify_all_error(pending, e);
                         return;
                     }
                 }
                 FlushRequest::Batch(batch) => {
-                    for (seq, key, value) in &batch.entries {
+                    for (seq, key, value, expire_at) in &batch.entries {
                         max_seq = max_seq.max(*seq);
-                        if let Err(e) = Self::serialize_entry(&mut entries_buf, *seq, key, value) {
+                        if let Err(e) =
+                            Self::serialize_entry(&mut entries_buf, *seq, key, value, *expire_at)
+                        {
                             Self::notify_all_error(pending, e);
                             return;
                         }
@@ -332,7 +337,7 @@ impl GroupCommitWalWriter {
                     let batch_max_seq = batch
                         .entries
                         .iter()
-                        .map(|(seq, _, _)| *seq)
+                        .map(|(seq, _, _, _)| *seq)
                         .max()
                         .unwrap_or(0);
                     let result = sync_result.clone().map(|()| batch_max_seq);
@@ -357,13 +362,14 @@ impl GroupCommitWalWriter {
     }
 
     /// Serialize a single entry to a buffer
-    /// v4 format: [seq: u64][timestamp: u64][key_len: u64][value_len: u64][key][value]
+    /// v4 format: [seq: u64][timestamp: u64][expire_at: u64][key_len: u64][value_len: u64][key][value]
     #[allow(clippy::result_large_err)]
     fn serialize_entry(
         buf: &mut Vec<u8>,
         seq: u64,
         key: &str,
         value: &Option<String>,
+        expire_at: u64,
     ) -> Result<(), Status> {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u64;
@@ -379,6 +385,7 @@ impl GroupCommitWalWriter {
 
         buf.extend_from_slice(&seq.to_le_bytes());
         buf.extend_from_slice(&timestamp.to_le_bytes());
+        buf.extend_from_slice(&expire_at.to_le_bytes());
         buf.extend_from_slice(&key_len.to_le_bytes());
         buf.extend_from_slice(&val_len.to_le_bytes());
         buf.extend_from_slice(key_bytes);
@@ -397,12 +404,13 @@ impl GroupCommitWalWriter {
         write_block(writer, data, true).map_err(|e| Status::internal(e.to_string()))
     }
 
-    /// Append an entry to the WAL with pipelining support.
+    /// Append an entry to the WAL with pipelining support and TTL.
     /// Returns two receivers: one for when it's written to OS buffer, one for when it's synced to disk (with seq number).
-    pub async fn append_pipelined(
+    pub async fn append_pipelined_with_ttl(
         &self,
         key: &str,
         value: &Option<String>,
+        expire_at: u64,
     ) -> Result<
         (
             oneshot::Receiver<()>,
@@ -418,6 +426,7 @@ impl GroupCommitWalWriter {
             seq,
             key: key.to_string(),
             value: value.clone(),
+            expire_at,
             written_tx: Some(written_tx),
             synced_tx,
         });
@@ -438,11 +447,11 @@ impl GroupCommitWalWriter {
         Ok((written_rx, synced_rx))
     }
 
-    /// Append multiple entries to the WAL as a batch with pipelining support.
+    /// Append multiple entries to the WAL as a batch with pipelining support and TTL.
     /// Returns two receivers: one for when all data is written to OS buffer, one for when it's synced to disk (with max seq number).
-    pub async fn append_batch_pipelined(
+    pub async fn append_batch_pipelined_with_ttl(
         &self,
-        entries: Vec<(String, Option<String>)>,
+        entries: Vec<(String, Option<String>, u64)>,
     ) -> Result<
         (
             oneshot::Receiver<()>,
@@ -454,11 +463,11 @@ impl GroupCommitWalWriter {
         let (synced_tx, synced_rx) = oneshot::channel();
 
         // Allocate sequence numbers for each entry
-        let entries_with_seq: Vec<(u64, String, Option<String>)> = entries
+        let entries_with_seq: Vec<(u64, String, Option<String>, u64)> = entries
             .into_iter()
-            .map(|(key, value)| {
+            .map(|(key, value, expire_at)| {
                 let seq = self.allocate_seq();
-                (seq, key, value)
+                (seq, key, value, expire_at)
             })
             .collect();
 
@@ -493,10 +502,10 @@ impl GroupCommitWalWriter {
         // Serialize all entries to buffer with sequence numbers
         let mut buf = Vec::new();
         let mut max_seq = 0u64;
-        for (key, value) in entries {
+        for (key, mem_value) in entries {
             let seq = self.allocate_seq();
             max_seq = max_seq.max(seq);
-            Self::serialize_entry(&mut buf, seq, key, value)?;
+            Self::serialize_entry(&mut buf, seq, key, &mem_value.value, mem_value.expire_at)?;
         }
 
         // Write as a block
@@ -564,8 +573,12 @@ impl GroupCommitWalWriter {
             )));
         }
 
-        Self::read_entries_v4(&mut file)
-            .map(|entries| entries.into_iter().map(|e| (e.key, e.value)).collect())
+        Self::read_entries_v4(&mut file).map(|entries| {
+            entries
+                .into_iter()
+                .map(|e| (e.key, MemValue::new_with_ttl(e.value, e.expire_at)))
+                .collect()
+        })
     }
 
     /// Read all entries from a WAL file with their sequence numbers (v4 only)
@@ -632,13 +645,13 @@ impl GroupCommitWalWriter {
         Ok(entries)
     }
 
-    /// Parse entries from a v4 buffer into a list of WalEntry (with sequence numbers)
+    /// Parse entries from a v4 buffer into a list of WalEntry (with sequence numbers and TTL)
     #[allow(clippy::result_large_err)]
     fn parse_entries_from_buffer_v4(buf: &[u8], entries: &mut Vec<WalEntry>) -> Result<(), Status> {
         let mut cursor = Cursor::new(buf);
 
         loop {
-            // v4 format: [seq: u64][timestamp: u64][key_len: u64][value_len: u64][key][value]
+            // v4 format: [seq: u64][timestamp: u64][expire_at: u64][key_len: u64][value_len: u64][key][value]
             let mut seq_bytes = [0u8; 8];
             if cursor.read_exact(&mut seq_bytes).is_err() {
                 break; // End of buffer
@@ -649,6 +662,13 @@ impl GroupCommitWalWriter {
             cursor
                 .read_exact(&mut ts_bytes)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            // timestamp is written but not used during recovery
+
+            let mut expire_at_bytes = [0u8; 8];
+            cursor
+                .read_exact(&mut expire_at_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let expire_at = u64::from_le_bytes(expire_at_bytes);
 
             let mut klen_bytes = [0u8; 8];
             let mut vlen_bytes = [0u8; 8];
@@ -679,7 +699,12 @@ impl GroupCommitWalWriter {
                 Some(String::from_utf8_lossy(&val_buf).to_string())
             };
 
-            entries.push(WalEntry { seq, key, value });
+            entries.push(WalEntry {
+                seq,
+                key,
+                value,
+                expire_at,
+            });
         }
 
         Ok(())
@@ -765,14 +790,23 @@ mod tests {
         }
 
         fn append(&self, key: &str, value: &Option<String>) -> Result<(), Status> {
+            self.append_with_ttl(key, value, 0)
+        }
+
+        fn append_with_ttl(
+            &self,
+            key: &str,
+            value: &Option<String>,
+            expire_at: u64,
+        ) -> Result<(), Status> {
             let mut wal = self.writer.lock().unwrap();
 
             // Allocate sequence number
             let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
-            // Serialize entry to buffer (v4 format with sequence number)
+            // Serialize entry to buffer (v4 format with sequence number and TTL)
             let mut buf = Vec::new();
-            GroupCommitWalWriter::serialize_entry(&mut buf, seq, key, value)?;
+            GroupCommitWalWriter::serialize_entry(&mut buf, seq, key, value, expire_at)?;
 
             // Write as uncompressed block (test data is small)
             write_block(&mut *wal, &buf, false).map_err(|e| Status::internal(e.to_string()))?;
@@ -836,8 +870,11 @@ mod tests {
         let entries = GroupCommitWalWriter::read_entries(&path).unwrap();
 
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries.get("k1"), Some(&None));
-        assert_eq!(entries.get("k2"), Some(&Some("v2".to_string())));
+        assert_eq!(entries.get("k1"), Some(&MemValue::new(None)));
+        assert_eq!(
+            entries.get("k2"),
+            Some(&MemValue::new(Some("v2".to_string())))
+        );
     }
 
     #[test]
@@ -860,12 +897,18 @@ mod tests {
 
         // Old WAL should still have k1
         let old_entries = GroupCommitWalWriter::read_entries(&old_path).unwrap();
-        assert_eq!(old_entries.get("k1"), Some(&Some("v1".to_string())));
+        assert_eq!(
+            old_entries.get("k1"),
+            Some(&MemValue::new(Some("v1".to_string())))
+        );
         assert!(!old_entries.contains_key("k2"));
 
         // New WAL should have k2
         let new_entries = GroupCommitWalWriter::read_entries(&new_path).unwrap();
-        assert_eq!(new_entries.get("k2"), Some(&Some("v2".to_string())));
+        assert_eq!(
+            new_entries.get("k2"),
+            Some(&MemValue::new(Some("v2".to_string())))
+        );
         assert!(!new_entries.contains_key("k1"));
     }
 

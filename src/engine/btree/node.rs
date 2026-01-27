@@ -5,7 +5,7 @@
 //! **Leaf Node:**
 //! ```text
 //! [entry_count: u16][next_leaf: u32][prev_leaf: u32]
-//! [key_len: u16][value_len: u16][key_bytes...][value_bytes...]
+//! [key_len: u16][value_len: u16][expire_at: u64][key_bytes...][value_bytes...]
 //! ...
 //! ```
 //!
@@ -28,8 +28,8 @@ const LEAF_HEADER_SIZE: usize = 10;
 /// Internal node header size: entry_count(2) + first_child(4)
 const INTERNAL_HEADER_SIZE: usize = 6;
 
-/// Entry overhead in leaf: key_len(2) + value_len(2)
-const LEAF_ENTRY_OVERHEAD: usize = 4;
+/// Entry overhead in leaf: key_len(2) + value_len(2) + expire_at(8)
+const LEAF_ENTRY_OVERHEAD: usize = 12;
 
 /// Entry overhead in internal: key_len(2) + child_page(4)
 const INTERNAL_ENTRY_OVERHEAD: usize = 6;
@@ -40,6 +40,8 @@ pub struct LeafEntry {
     pub key: String,
     /// None means tombstone (deleted)
     pub value: Option<String>,
+    /// Expiration timestamp (Unix seconds), 0 = no expiration
+    pub expire_at: u64,
 }
 
 impl LeafEntry {
@@ -47,15 +49,38 @@ impl LeafEntry {
         Self {
             key,
             value: Some(value),
+            expire_at: 0,
+        }
+    }
+
+    pub fn new_with_ttl(key: String, value: String, expire_at: u64) -> Self {
+        Self {
+            key,
+            value: Some(value),
+            expire_at,
         }
     }
 
     pub fn tombstone(key: String) -> Self {
-        Self { key, value: None }
+        Self {
+            key,
+            value: None,
+            expire_at: 0,
+        }
     }
 
     pub fn is_tombstone(&self) -> bool {
         self.value.is_none()
+    }
+
+    /// Check if entry is expired at the given timestamp
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expire_at > 0 && now > self.expire_at
+    }
+
+    /// Check if entry is valid (not tombstone and not expired)
+    pub fn is_valid(&self, now: u64) -> bool {
+        !self.is_tombstone() && !self.is_expired(now)
     }
 
     /// Size in bytes when serialized
@@ -122,6 +147,7 @@ impl LeafNode {
 
         let mut buf2 = [0u8; 2];
         let mut buf4 = [0u8; 4];
+        let mut buf8 = [0u8; 8];
 
         cursor.read_exact(&mut buf2)?;
         let entry_count = u16::from_le_bytes(buf2) as usize;
@@ -139,6 +165,9 @@ impl LeafNode {
 
             cursor.read_exact(&mut buf2)?;
             let value_len = u16::from_le_bytes(buf2);
+
+            cursor.read_exact(&mut buf8)?;
+            let expire_at = u64::from_le_bytes(buf8);
 
             let mut key_buf = vec![0u8; key_len];
             cursor.read_exact(&mut key_buf)?;
@@ -163,7 +192,11 @@ impl LeafNode {
                 })?)
             };
 
-            entries.push(LeafEntry { key, value });
+            entries.push(LeafEntry {
+                key,
+                value,
+                expire_at,
+            });
         }
 
         Ok(Self {
@@ -189,11 +222,13 @@ impl LeafNode {
 
             if let Some(value) = &entry.value {
                 cursor.write_all(&(value.len() as u16).to_le_bytes())?;
+                cursor.write_all(&entry.expire_at.to_le_bytes())?;
                 cursor.write_all(entry.key.as_bytes())?;
                 cursor.write_all(value.as_bytes())?;
             } else {
                 // Tombstone marker
                 cursor.write_all(&u16::MAX.to_le_bytes())?;
+                cursor.write_all(&entry.expire_at.to_le_bytes())?;
                 cursor.write_all(entry.key.as_bytes())?;
             }
         }
@@ -269,6 +304,29 @@ impl LeafNode {
             || (self.serialized_size() as f32) < (MAX_DATA_SIZE as f32 * MIN_FILL_FACTOR)
     }
 
+    /// Clean up expired and tombstone entries, returns number of entries removed
+    pub fn cleanup_expired(&mut self, now: u64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.is_valid(now));
+        before - self.entries.len()
+    }
+
+    /// Check if split is still needed after cleanup
+    pub fn needs_split_after_cleanup(&mut self, now: u64) -> bool {
+        if !self.needs_split() {
+            return false;
+        }
+
+        // Try cleanup first
+        let removed = self.cleanup_expired(now);
+        if removed > 0 {
+            // Re-check after cleanup
+            return self.needs_split();
+        }
+
+        true
+    }
+
     /// Split node, returns (left, right, split_key)
     pub fn split(&mut self) -> (LeafNode, String) {
         let mid = self.entries.len() / 2;
@@ -284,6 +342,15 @@ impl LeafNode {
         self.next_leaf = 0; // Will be set by caller
 
         (right, split_key)
+    }
+
+    /// Split with cleanup: first cleanup expired entries, then split if still needed
+    /// Returns None if cleanup avoided the split, Some((right, split_key)) if split occurred
+    pub fn split_with_cleanup(&mut self, now: u64) -> Option<(LeafNode, String)> {
+        if !self.needs_split_after_cleanup(now) {
+            return None;
+        }
+        Some(self.split())
     }
 
     /// Merge with sibling (self becomes merged node)

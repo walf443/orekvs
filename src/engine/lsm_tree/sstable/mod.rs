@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub use reader::{read_bloom_filter, read_keys, search_key};
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 8;
+pub const DATA_VERSION: u32 = 9; // v9: added expire_at field for TTL support
 
 /// Compute CRC32C checksum
 pub(crate) fn crc32(data: &[u8]) -> u32 {
@@ -73,6 +73,7 @@ pub fn generate_path(data_dir: &Path, sst_id: u64, wal_id: u64) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::lsm_tree::memtable::MemValue;
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
@@ -92,9 +93,15 @@ mod tests {
         let sst_path = dir.path().join("sst_00001_00001.data");
 
         let mut memtable = BTreeMap::new();
-        memtable.insert("key1".to_string(), Some("value1".to_string()));
-        memtable.insert("key2".to_string(), Some("value2".to_string()));
-        memtable.insert("key3".to_string(), None); // Tombstone
+        memtable.insert(
+            "key1".to_string(),
+            MemValue::new(Some("value1".to_string())),
+        );
+        memtable.insert(
+            "key2".to_string(),
+            MemValue::new(Some("value2".to_string())),
+        );
+        memtable.insert("key3".to_string(), MemValue::new(None)); // Tombstone
 
         create_from_memtable(&sst_path, &memtable).unwrap();
 
@@ -122,7 +129,7 @@ mod tests {
         for i in 0..entry_count {
             let key = format!("key{:05}", i);
             let value = format!("value{:05}", i);
-            memtable.insert(key, Some(value));
+            memtable.insert(key, MemValue::new(Some(value)));
         }
 
         create_from_memtable(&sst_path, &memtable).unwrap();
@@ -137,7 +144,7 @@ mod tests {
         // Read all entries and verify
         let read_back = read_entries(&sst_path).unwrap();
         assert_eq!(read_back.len(), entry_count);
-        for (key, (_, value)) in read_back {
+        for (key, (_, _, value)) in read_back {
             let i_str = &key[3..];
             let expected_value = format!("value{}", i_str);
             assert_eq!(value, Some(expected_value));
@@ -165,8 +172,11 @@ mod tests {
         let mut memtable = BTreeMap::new();
         let large_key = "k".repeat(1024); // 1KB key
         let large_value = "v".repeat(1024 * 1024); // 1MB value
-        memtable.insert(large_key.clone(), Some(large_value.clone()));
-        memtable.insert("short".to_string(), Some("value".to_string()));
+        memtable.insert(large_key.clone(), MemValue::new(Some(large_value.clone())));
+        memtable.insert(
+            "short".to_string(),
+            MemValue::new(Some("value".to_string())),
+        );
 
         create_from_memtable(&sst_path, &memtable).unwrap();
 

@@ -59,6 +59,7 @@ async fn set_key(addr: &str, key: &str, value: &str) -> Result<(), Box<dyn std::
         .set(SetRequest {
             key: key.to_string(),
             value: value.to_string(),
+            ttl_seconds: 0,
         })
         .await?;
     Ok(())

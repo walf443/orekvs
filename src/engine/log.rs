@@ -1,4 +1,4 @@
-use super::Engine;
+use super::{Engine, current_timestamp};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -9,13 +9,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
 const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-const DATA_VERSION: u32 = 1;
+const DATA_VERSION: u32 = 2; // v2: added expire_at support
 const HEADER_SIZE: u64 = 10; // 6 (magic) + 4 (version)
+
+/// Index entry: (FileOffset, ValueLength, ExpireAt)
+/// ExpireAt: 0 = no expiration, >0 = Unix timestamp when key expires
+type IndexEntry = (u64, usize, u64);
 
 #[derive(Debug, Clone)]
 pub struct LogEngine {
-    // Stores Key -> (FileOffset, ValueLength)
-    index: Arc<Mutex<HashMap<String, (u64, usize)>>>,
+    index: Arc<Mutex<HashMap<String, IndexEntry>>>,
     // File writer for appending new entries
     writer: Arc<Mutex<File>>,
     // Path to the data file
@@ -96,13 +99,21 @@ impl LogEngine {
             }
 
             let version = u32::from_le_bytes(version_bytes);
-            if version != DATA_VERSION {
+            if version != DATA_VERSION && version != 1 {
                 panic!(
-                    "Incompatible data version: expected {}, found {}",
+                    "Incompatible data version: expected {} or 1, found {}",
                     DATA_VERSION, version
                 );
             }
         }
+
+        // Read version again for format detection
+        file.seek(SeekFrom::Start(6))
+            .expect("Failed to seek to version");
+        let mut ver_bytes = [0u8; 4];
+        file.read_exact(&mut ver_bytes)
+            .expect("Failed to read version");
+        let file_version = u32::from_le_bytes(ver_bytes);
 
         // Rebuild index from file
         let mut index_map = HashMap::new();
@@ -118,6 +129,16 @@ impl LogEngine {
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(e) => panic!("Error reading timestamp: {}", e),
                 }
+
+                // Read expire_at (v2+) or default to 0 (v1)
+                let expire_at = if file_version >= 2 {
+                    let mut expire_bytes = [0u8; 8];
+                    file.read_exact(&mut expire_bytes)
+                        .expect("Failed to read expire_at");
+                    u64::from_le_bytes(expire_bytes)
+                } else {
+                    0
+                };
 
                 let mut klen_bytes = [0u8; 8];
                 file.read_exact(&mut klen_bytes)
@@ -145,7 +166,7 @@ impl LogEngine {
                     // Skip value
                     file.seek(SeekFrom::Current(val_len as i64))
                         .expect("Failed to skip value");
-                    index_map.insert(key, (value_offset, val_len as usize));
+                    index_map.insert(key, (value_offset, val_len as usize, expire_at));
                 }
             }
         }
@@ -237,8 +258,14 @@ impl LogEngine {
         }
 
         let mut new_index = HashMap::new();
+        let now = current_timestamp();
 
-        for (key, &(offset, length)) in index.iter() {
+        for (key, &(offset, length, expire_at)) in index.iter() {
+            // Skip expired entries during compaction
+            if expire_at > 0 && now > expire_at {
+                continue;
+            }
+
             if let Err(e) = writer.seek(SeekFrom::Start(offset)) {
                 self.is_compacting.store(false, Ordering::SeqCst);
                 return Err(Status::internal(e.to_string()));
@@ -258,6 +285,11 @@ impl LogEngine {
                 .as_secs();
 
             if let Err(e) = new_file.write_all(&timestamp.to_le_bytes()) {
+                self.is_compacting.store(false, Ordering::SeqCst);
+                return Err(Status::internal(e.to_string()));
+            }
+            // Write expire_at (v2 format)
+            if let Err(e) = new_file.write_all(&expire_at.to_le_bytes()) {
                 self.is_compacting.store(false, Ordering::SeqCst);
                 return Err(Status::internal(e.to_string()));
             }
@@ -286,7 +318,7 @@ impl LogEngine {
                 }
             };
             let value_offset = current_pos - val_len;
-            new_index.insert(key.clone(), (value_offset, length));
+            new_index.insert(key.clone(), (value_offset, length, expire_at));
         }
 
         if let Err(e) = new_file.sync_data() {
@@ -308,16 +340,17 @@ impl LogEngine {
     }
 }
 
-impl Engine for LogEngine {
-    fn set(&self, key: String, value: String) -> Result<(), Status> {
+impl LogEngine {
+    #[allow(clippy::result_large_err)]
+    fn set_internal(&self, key: String, value: String, expire_at: u64) -> Result<(), Status> {
         let key_bytes = key.as_bytes();
         let val_bytes = value.as_bytes();
 
         let key_len = key_bytes.len() as u64;
         let val_len = val_bytes.len() as u64;
 
-        // Entry size = timestamp(8) + key_len_size(8) + val_len_size(8) + key + value
-        let entry_size = 8 + 8 + 8 + key_len + val_len;
+        // Entry size = timestamp(8) + expire_at(8) + key_len_size(8) + val_len_size(8) + key + value
+        let entry_size = 8 + 8 + 8 + 8 + key_len + val_len;
         if entry_size > self.log_capacity_bytes {
             return Err(Status::invalid_argument(format!(
                 "Data size ({} bytes) exceeds the log capacity ({} bytes)",
@@ -339,9 +372,12 @@ impl Engine for LogEngine {
                 .seek(SeekFrom::End(0))
                 .map_err(|e| Status::internal(e.to_string()))?;
 
-            // Write Format: [timestamp(8)][key_len(8)][val_len(8)][key][value]
+            // Write Format: [timestamp(8)][expire_at(8)][key_len(8)][val_len(8)][key][value]
             writer
                 .write_all(&timestamp.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            writer
+                .write_all(&expire_at.to_le_bytes())
                 .map_err(|e| Status::internal(e.to_string()))?;
             writer
                 .write_all(&key_len.to_le_bytes())
@@ -360,11 +396,12 @@ impl Engine for LogEngine {
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             // Calculate where the value starts:
-            let value_offset = start_offset + 8 + 8 + 8 + key_len;
+            // timestamp(8) + expire_at(8) + key_len(8) + val_len(8) + key
+            let value_offset = start_offset + 8 + 8 + 8 + 8 + key_len;
 
             // Update in-memory index
             let mut index = self.index.lock().unwrap();
-            index.insert(key, (value_offset, val_len as usize));
+            index.insert(key, (value_offset, val_len as usize, expire_at));
 
             writer
                 .metadata()
@@ -392,15 +429,31 @@ impl Engine for LogEngine {
 
         Ok(())
     }
+}
+
+impl Engine for LogEngine {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.set_internal(key, value, 0)
+    }
+
+    fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
+        let expire_at = current_timestamp() + ttl_secs;
+        self.set_internal(key, value, expire_at)
+    }
 
     fn get(&self, key: String) -> Result<String, Status> {
-        let (offset, length) = {
+        let (offset, length, expire_at) = {
             let index = self.index.lock().unwrap();
             match index.get(&key) {
                 Some(&info) => info,
                 None => return Err(Status::not_found("Key not found")),
             }
         };
+
+        // Check if expired
+        if expire_at > 0 && current_timestamp() > expire_at {
+            return Err(Status::not_found("Key not found"));
+        }
 
         let mut file = File::open(&self.file_path).map_err(|e| Status::internal(e.to_string()))?;
 
@@ -420,8 +473,10 @@ impl Engine for LogEngine {
         let key_bytes = key.as_bytes();
         let key_len = key_bytes.len() as u64;
         let val_len = u64::MAX; // Tombstone marker
+        let expire_at = 0u64; // No expiration for tombstones
 
-        let entry_size = 8 + 8 + 8 + key_len;
+        // Entry size = timestamp(8) + expire_at(8) + key_len_size(8) + val_len_size(8) + key
+        let entry_size = 8 + 8 + 8 + 8 + key_len;
         if entry_size > self.log_capacity_bytes {
             return Err(Status::invalid_argument(format!(
                 "Data size ({} bytes) exceeds the log capacity ({} bytes)",
@@ -442,6 +497,9 @@ impl Engine for LogEngine {
 
             writer
                 .write_all(&timestamp.to_le_bytes())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            writer
+                .write_all(&expire_at.to_le_bytes())
                 .map_err(|e| Status::internal(e.to_string()))?;
             writer
                 .write_all(&key_len.to_le_bytes())
@@ -618,13 +676,16 @@ mod tests {
         let data_dir = dir.path().to_str().unwrap().to_string();
         let file_path = dir.path().join("log_engine.data");
 
-        let engine = LogEngine::new(data_dir, 80);
+        // Size increased due to expire_at field (8 bytes per entry)
+        // Entry format: timestamp(8) + expire_at(8) + key_len(8) + val_len(8) + key + value
+        // = 32 bytes + key + value per entry
+        let engine = LogEngine::new(data_dir, 100);
 
         engine.set("key1".to_string(), "val1".to_string()).unwrap();
         engine.set("key2".to_string(), "val2".to_string()).unwrap();
 
         let size_before = std::fs::metadata(&file_path).unwrap().len();
-        assert!(size_before < 80);
+        assert!(size_before < 100);
 
         engine
             .set("key1".to_string(), "new_val1".to_string())
@@ -633,7 +694,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         let size_after = std::fs::metadata(&file_path).unwrap().len();
-        assert!(size_after < 110);
+        assert!(size_after < 140);
 
         assert_eq!(engine.get("key1".to_string()).unwrap(), "new_val1");
         assert_eq!(engine.get("key2".to_string()).unwrap(), "val2");

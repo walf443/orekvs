@@ -208,10 +208,13 @@ mod tests {
     ) -> Arc<SstableHandle> {
         let path = dir.join(format!("test_{}.sst", id));
 
-        // Build a BTreeMap with timestamped entries
-        let mut btree: BTreeMap<String, (u64, Option<String>)> = BTreeMap::new();
+        // Build a BTreeMap with timestamped entries (timestamp, expire_at, value)
+        let mut btree: BTreeMap<String, (u64, u64, Option<String>)> = BTreeMap::new();
         for (key, value) in &entries {
-            btree.insert(key.to_string(), (1000 + id, value.map(|v| v.to_string())));
+            btree.insert(
+                key.to_string(),
+                (1000 + id, 0, value.map(|v| v.to_string())),
+            );
         }
 
         // Write using public API

@@ -20,8 +20,9 @@ use crate::engine::lsm_tree::mmap::MappedFile;
 
 use super::{DATA_VERSION, FOOTER_MAGIC, FOOTER_SIZE, HEADER_SIZE, MAGIC_BYTES, crc32};
 
-// Entry with timestamp for merge-sorting during compaction
-pub type TimestampedEntry = (u64, Option<String>); // (timestamp, value)
+// Entry with timestamp and TTL for merge-sorting during compaction
+// (timestamp, expire_at, value)
+pub type TimestampedEntry = (u64, u64, Option<String>);
 
 /// Find the block offset for a key using binary search in the index.
 ///
@@ -441,10 +442,17 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
             break;
         }
 
+        // Skip timestamp (8 bytes)
         let mut ts_bytes = [0u8; 8];
         if cursor.read_exact(&mut ts_bytes).is_err() {
             break;
         }
+
+        // Skip expire_at (8 bytes)
+        let mut expire_at_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut expire_at_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut klen_bytes = [0u8; 8];
         cursor
@@ -580,6 +588,12 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
         if cursor.read_exact(&mut ts_bytes).is_err() {
             break;
         }
+
+        // Skip expire_at (8 bytes)
+        let mut expire_at_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut expire_at_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut klen_bytes = [0u8; 8];
         cursor
@@ -717,9 +731,9 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
                 break;
             }
 
-            // Skip timestamp (8) + read klen (8) + vlen (8)
+            // Skip timestamp (8) + expire_at (8) + read klen (8) + vlen (8)
             cursor
-                .seek(SeekFrom::Current(8))
+                .seek(SeekFrom::Current(16))
                 .map_err(|e| Status::internal(e.to_string()))?;
 
             let mut lengths = [0u8; 16];
@@ -847,6 +861,12 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
             }
             let timestamp = u64::from_le_bytes(ts_bytes);
 
+            let mut expire_at_bytes = [0u8; 8];
+            cursor
+                .read_exact(&mut expire_at_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let expire_at = u64::from_le_bytes(expire_at_bytes);
+
             let mut klen_bytes = [0u8; 8];
             cursor
                 .read_exact(&mut klen_bytes)
@@ -875,7 +895,7 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
                 Some(String::from_utf8_lossy(&val_buf).to_string())
             };
 
-            entries.insert(key, (timestamp, value));
+            entries.insert(key, (timestamp, expire_at, value));
         }
     }
 
@@ -976,13 +996,18 @@ mod tests {
 
     #[test]
     fn test_read_bloom_filter() {
+        use crate::engine::lsm_tree::memtable::MemValue;
+
         let dir = tempdir().unwrap();
         let sst_path = dir.path().join("sst_bloom.data");
 
         let mut memtable = BTreeMap::new();
-        memtable.insert("apple".to_string(), Some("red".to_string()));
-        memtable.insert("banana".to_string(), Some("yellow".to_string()));
-        memtable.insert("cherry".to_string(), Some("red".to_string()));
+        memtable.insert("apple".to_string(), MemValue::new(Some("red".to_string())));
+        memtable.insert(
+            "banana".to_string(),
+            MemValue::new(Some("yellow".to_string())),
+        );
+        memtable.insert("cherry".to_string(), MemValue::new(Some("red".to_string())));
 
         create_from_memtable(&sst_path, &memtable).unwrap();
 
@@ -1021,11 +1046,16 @@ mod tests {
 
     #[test]
     fn test_corrupt_block_data() {
+        use crate::engine::lsm_tree::memtable::MemValue;
+
         let dir = tempdir().unwrap();
         let sst_path = dir.path().join("corrupt_block.data");
 
         let mut memtable = BTreeMap::new();
-        memtable.insert("key1".to_string(), Some("value1".to_string()));
+        memtable.insert(
+            "key1".to_string(),
+            MemValue::new(Some("value1".to_string())),
+        );
         create_from_memtable(&sst_path, &memtable).unwrap();
 
         // Corrupt the block data (between header and index)
@@ -1050,11 +1080,16 @@ mod tests {
 
     #[test]
     fn test_corrupt_index_data() {
+        use crate::engine::lsm_tree::memtable::MemValue;
+
         let dir = tempdir().unwrap();
         let sst_path = dir.path().join("corrupt_index.data");
 
         let mut memtable = BTreeMap::new();
-        memtable.insert("key1".to_string(), Some("value1".to_string()));
+        memtable.insert(
+            "key1".to_string(),
+            MemValue::new(Some("value1".to_string())),
+        );
         create_from_memtable(&sst_path, &memtable).unwrap();
 
         // Corrupt the index offset in the footer (V7 format)
@@ -1074,14 +1109,19 @@ mod tests {
 
     #[test]
     fn test_v7_min_max_key() {
+        use crate::engine::lsm_tree::memtable::MemValue;
+
         let dir = tempdir().unwrap();
         let sst_path = dir.path().join("sst_v7_minmax.data");
 
         let mut memtable = BTreeMap::new();
-        memtable.insert("apple".to_string(), Some("red".to_string()));
-        memtable.insert("banana".to_string(), Some("yellow".to_string()));
-        memtable.insert("cherry".to_string(), Some("red".to_string()));
-        memtable.insert("date".to_string(), Some("brown".to_string()));
+        memtable.insert("apple".to_string(), MemValue::new(Some("red".to_string())));
+        memtable.insert(
+            "banana".to_string(),
+            MemValue::new(Some("yellow".to_string())),
+        );
+        memtable.insert("cherry".to_string(), MemValue::new(Some("red".to_string())));
+        memtable.insert("date".to_string(), MemValue::new(Some("brown".to_string())));
 
         create_from_memtable(&sst_path, &memtable).unwrap();
 
@@ -1102,10 +1142,12 @@ mod tests {
 
     #[test]
     fn test_v7_empty_memtable_min_max_key() {
+        use crate::engine::lsm_tree::memtable::MemValue;
+
         let dir = tempdir().unwrap();
         let sst_path = dir.path().join("sst_v7_empty.data");
 
-        let memtable: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let memtable: BTreeMap<String, MemValue> = BTreeMap::new();
         create_from_memtable(&sst_path, &memtable).unwrap();
 
         // Open with MappedSSTable - empty memtable should have empty min/max keys

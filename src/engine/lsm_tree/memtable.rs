@@ -4,20 +4,55 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
+/// MemTable entry value with optional expiration
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemValue {
+    /// The actual value, None means tombstone
+    pub value: Option<String>,
+    /// Unix timestamp when this entry expires, 0 = no expiration
+    pub expire_at: u64,
+}
+
+impl MemValue {
+    pub fn new(value: Option<String>) -> Self {
+        Self {
+            value,
+            expire_at: 0,
+        }
+    }
+
+    pub fn new_with_ttl(value: Option<String>, expire_at: u64) -> Self {
+        Self { value, expire_at }
+    }
+
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expire_at > 0 && now > self.expire_at
+    }
+
+    pub fn is_valid(&self, now: u64) -> bool {
+        !self.is_tombstone() && !self.is_expired(now)
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.value.is_none()
+    }
+}
+
 /// Lock-free SkipList-based MemTable
 /// Allows concurrent reads and writes without mutex
-pub type SkipMemTable = SkipMap<String, Option<String>>;
+pub type SkipMemTable = SkipMap<String, MemValue>;
 
 /// Legacy BTreeMap-based MemTable (used for WAL recovery and SSTable creation)
-pub type MemTable = BTreeMap<String, Option<String>>;
+pub type MemTable = BTreeMap<String, MemValue>;
 
 /// Default maximum number of immutable memtables before write stall
 pub const DEFAULT_MAX_IMMUTABLE_MEMTABLES: usize = 4;
 
 /// Estimate the size of a MemTable entry in bytes
-pub fn estimate_entry_size(key: &str, value: &Option<String>) -> u64 {
-    let vlen = value.as_ref().map_or(0, |v| v.len() as u64);
-    8 + 8 + 8 + key.len() as u64 + vlen
+pub fn estimate_entry_size(key: &str, mem_value: &MemValue) -> u64 {
+    let vlen = mem_value.value.as_ref().map_or(0, |v| v.len() as u64);
+    // timestamp(8) + expire_at(8) + key_len(8) + val_len(8) + key + value
+    8 + 8 + 8 + 8 + key.len() as u64 + vlen
 }
 
 /// Convert SkipMemTable to BTreeMap for SSTable creation
@@ -184,11 +219,11 @@ impl MemTableState {
 
     /// Insert a key-value pair into the active MemTable
     /// Takes a read lock to prevent data loss during flush (multiple inserts can run concurrently)
-    pub fn insert(&self, key: String, value: Option<String>) {
+    pub fn insert(&self, key: String, mem_value: MemValue) {
         // Take read lock - allows concurrent inserts but blocks during flush
         let _guard = self.flush_lock.read().unwrap();
 
-        let entry_size = estimate_entry_size(&key, &value);
+        let entry_size = estimate_entry_size(&key, &mem_value);
 
         // Load current active memtable
         let active = self.active_memtable.load();
@@ -207,7 +242,7 @@ impl MemTableState {
             self.current_size.fetch_add(entry_size, Ordering::SeqCst);
         }
 
-        active.insert(key, value);
+        active.insert(key, mem_value);
     }
 
     /// Check if flush is needed and return immutable memtable if so.
@@ -257,7 +292,7 @@ impl MemTableState {
     }
 
     /// Get a value from MemTable (lock-free for active memtable)
-    pub fn get(&self, key: &str) -> Option<Option<String>> {
+    pub fn get(&self, key: &str) -> Option<MemValue> {
         // Check active memtable (lock-free)
         let active = self.active_memtable.load();
         if let Some(entry) = active.get(key) {
@@ -268,8 +303,8 @@ impl MemTableState {
         {
             let immutables = self.immutable_memtables.lock().unwrap();
             for mem in immutables.iter().rev() {
-                if let Some(val_opt) = mem.get(key) {
-                    return Some(val_opt.clone());
+                if let Some(mem_value) = mem.get(key) {
+                    return Some(mem_value.clone());
                 }
             }
         }
@@ -285,31 +320,37 @@ mod tests {
     #[test]
     fn test_estimate_entry_size() {
         let key = "key1";
-        let value = Some("value1".to_string());
+        let value = MemValue::new(Some("value1".to_string()));
         let size = estimate_entry_size(key, &value);
-        // 8 (size_of overhead) + 8 (key len) + 8 (val len) + 4 (key) + 6 (val) = 34
-        assert_eq!(size, 8 + 8 + 8 + 4 + 6);
+        // 8 (timestamp) + 8 (expire_at) + 8 (key len) + 8 (val len) + 4 (key) + 6 (val) = 42
+        assert_eq!(size, 8 + 8 + 8 + 8 + 4 + 6);
 
-        let value_none = None;
+        let value_none = MemValue::new(None);
         let size_none = estimate_entry_size(key, &value_none);
-        // 8 + 8 + 8 + 4 + 0 = 28
-        assert_eq!(size_none, 8 + 8 + 8 + 4 + 0);
+        // 8 + 8 + 8 + 8 + 4 + 0 = 36
+        assert_eq!(size_none, 8 + 8 + 8 + 8 + 4 + 0);
     }
 
     #[test]
     fn test_memtable_basic_ops() {
         let state = MemTableState::new(1000, BTreeMap::new(), 0);
 
-        state.insert("k1".to_string(), Some("v1".to_string()));
-        state.insert("k2".to_string(), Some("v2".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v1".to_string())));
+        state.insert("k2".to_string(), MemValue::new(Some("v2".to_string())));
 
-        assert_eq!(state.get("k1"), Some(Some("v1".to_string())));
-        assert_eq!(state.get("k2"), Some(Some("v2".to_string())));
+        assert_eq!(
+            state.get("k1").map(|m| m.value),
+            Some(Some("v1".to_string()))
+        );
+        assert_eq!(
+            state.get("k2").map(|m| m.value),
+            Some(Some("v2".to_string()))
+        );
         assert_eq!(state.get("k3"), None);
 
         // Delete
-        state.insert("k1".to_string(), None);
-        assert_eq!(state.get("k1"), Some(None));
+        state.insert("k1".to_string(), MemValue::new(None));
+        assert_eq!(state.get("k1").map(|m| m.value), Some(None));
     }
 
     #[test]
@@ -317,44 +358,45 @@ mod tests {
         let state = MemTableState::new(1000, BTreeMap::new(), 0);
 
         let k1 = "k1".to_string();
-        let v1 = "v1".to_string();
-        let size1 = estimate_entry_size(&k1, &Some(v1.clone()));
+        let v1 = MemValue::new(Some("v1".to_string()));
+        let size1 = estimate_entry_size(&k1, &v1);
 
-        state.insert(k1.clone(), Some(v1.clone()));
+        state.insert(k1.clone(), v1);
         assert_eq!(state.current_size.load(Ordering::SeqCst), size1);
 
         // Update with larger value
-        let v1_large = "v1_large".to_string();
-        let size1_large = estimate_entry_size(&k1, &Some(v1_large.clone()));
-        state.insert(k1.clone(), Some(v1_large));
+        let v1_large = MemValue::new(Some("v1_large".to_string()));
+        let size1_large = estimate_entry_size(&k1, &v1_large);
+        state.insert(k1.clone(), v1_large);
         assert_eq!(state.current_size.load(Ordering::SeqCst), size1_large);
 
         // Update with smaller value
-        let v1_small = "s".to_string();
-        let size1_small = estimate_entry_size(&k1, &Some(v1_small.clone()));
-        state.insert(k1, Some(v1_small));
+        let v1_small = MemValue::new(Some("s".to_string()));
+        let size1_small = estimate_entry_size(&k1, &v1_small);
+        state.insert(k1, v1_small);
         assert_eq!(state.current_size.load(Ordering::SeqCst), size1_small);
 
         // Delete
         let k1 = "k1".to_string();
-        let size_delete = estimate_entry_size(&k1, &None);
-        state.insert(k1, None);
+        let v_delete = MemValue::new(None);
+        let size_delete = estimate_entry_size(&k1, &v_delete);
+        state.insert(k1, v_delete);
         assert_eq!(state.current_size.load(Ordering::SeqCst), size_delete);
     }
 
     #[test]
     fn test_memtable_flush_trigger() {
-        let capacity = 50;
+        let capacity = 60; // Increased for new format with expire_at
         let state = MemTableState::new(capacity, BTreeMap::new(), 0);
 
         // This should not trigger flush
-        state.insert("k1".to_string(), Some("v1".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v1".to_string())));
         assert!(state.needs_flush().is_none());
 
         // This should trigger flush
         state.insert(
             "k2".to_string(),
-            Some("very_long_value_to_trigger_flush".to_string()),
+            MemValue::new(Some("very_long_value_to_trigger_flush".to_string())),
         );
         let immutable = state.needs_flush();
         assert!(immutable.is_some());
@@ -367,7 +409,10 @@ mod tests {
         assert_eq!(state.immutable_memtables.lock().unwrap().len(), 1);
 
         // Retrieval should still work from immutable
-        assert_eq!(state.get("k1"), Some(Some("v1".to_string())));
+        assert_eq!(
+            state.get("k1").map(|m| m.value),
+            Some(Some("v1".to_string()))
+        );
     }
 
     #[test]
@@ -375,7 +420,7 @@ mod tests {
         let state = MemTableState::new(1000, BTreeMap::new(), 0);
 
         // 1. Insert k1=v1
-        state.insert("k1".to_string(), Some("v1".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v1".to_string())));
 
         // 2. Force flush to immutable using atomic swap
         let old = state.active_memtable.swap(Arc::new(SkipMap::new()));
@@ -385,10 +430,13 @@ mod tests {
         state.immutable_memtables.lock().unwrap().push(immutable1);
 
         // 3. Insert k1=v2 in active
-        state.insert("k1".to_string(), Some("v2".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v2".to_string())));
 
         // Should get v2 from active
-        assert_eq!(state.get("k1"), Some(Some("v2".to_string())));
+        assert_eq!(
+            state.get("k1").map(|m| m.value),
+            Some(Some("v2".to_string()))
+        );
 
         // 4. Force another flush
         let old = state.active_memtable.swap(Arc::new(SkipMap::new()));
@@ -398,20 +446,26 @@ mod tests {
         state.immutable_memtables.lock().unwrap().push(immutable2);
 
         // 5. Insert k1=v3 in active
-        state.insert("k1".to_string(), Some("v3".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v3".to_string())));
 
         // Should get v3 from active
-        assert_eq!(state.get("k1"), Some(Some("v3".to_string())));
+        assert_eq!(
+            state.get("k1").map(|m| m.value),
+            Some(Some("v3".to_string()))
+        );
 
         // 6. Clear active, should get v2 from newest immutable (immutable2)
         state.active_memtable.swap(Arc::new(SkipMap::new()));
-        assert_eq!(state.get("k1"), Some(Some("v2".to_string())));
+        assert_eq!(
+            state.get("k1").map(|m| m.value),
+            Some(Some("v2".to_string()))
+        );
     }
 
     #[test]
     fn test_remove_immutable() {
         let state = MemTableState::new(1000, BTreeMap::new(), 0);
-        state.insert("k1".to_string(), Some("v1".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v1".to_string())));
 
         let imm = state.needs_flush_manual();
         assert_eq!(state.immutable_memtables.lock().unwrap().len(), 1);
@@ -423,15 +477,21 @@ mod tests {
     #[test]
     fn test_skip_to_btree() {
         let skip = SkipMap::new();
-        skip.insert("b".to_string(), Some("2".to_string()));
-        skip.insert("a".to_string(), Some("1".to_string()));
-        skip.insert("c".to_string(), None);
+        skip.insert("b".to_string(), MemValue::new(Some("2".to_string())));
+        skip.insert("a".to_string(), MemValue::new(Some("1".to_string())));
+        skip.insert("c".to_string(), MemValue::new(None));
 
         let btree = skip_to_btree(&skip);
         assert_eq!(btree.len(), 3);
-        assert_eq!(btree.get("a"), Some(&Some("1".to_string())));
-        assert_eq!(btree.get("b"), Some(&Some("2".to_string())));
-        assert_eq!(btree.get("c"), Some(&None));
+        assert_eq!(
+            btree.get("a").map(|m| m.value.clone()),
+            Some(Some("1".to_string()))
+        );
+        assert_eq!(
+            btree.get("b").map(|m| m.value.clone()),
+            Some(Some("2".to_string()))
+        );
+        assert_eq!(btree.get("c").map(|m| m.value.clone()), Some(None));
 
         // Verify order
         let keys: Vec<_> = btree.keys().collect();
@@ -453,7 +513,7 @@ mod tests {
                 for i in 0..1000 {
                     let key = format!("key_{}_{}", t, i);
                     let value = format!("value_{}_{}", t, i);
-                    state_clone.insert(key, Some(value));
+                    state_clone.insert(key, MemValue::new(Some(value)));
                 }
             }));
         }
@@ -491,7 +551,7 @@ mod tests {
             for i in 0..10000 {
                 let key = format!("key_{}", i);
                 let value = format!("value_{}", i);
-                state_writer.insert(key, Some(value));
+                state_writer.insert(key, MemValue::new(Some(value)));
             }
         });
 
@@ -547,9 +607,9 @@ mod tests {
         ));
 
         // Create 2 immutable memtables (at the limit)
-        state.insert("k1".to_string(), Some("v1".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v1".to_string())));
         let imm1 = state.needs_flush_manual();
-        state.insert("k2".to_string(), Some("v2".to_string()));
+        state.insert("k2".to_string(), MemValue::new(Some("v2".to_string())));
         let imm2 = state.needs_flush_manual();
 
         assert_eq!(state.immutable_count(), 2);
@@ -598,11 +658,11 @@ mod tests {
         );
 
         // Create 3 immutable memtables (under the limit)
-        state.insert("k1".to_string(), Some("v1".to_string()));
+        state.insert("k1".to_string(), MemValue::new(Some("v1".to_string())));
         let _imm1 = state.needs_flush_manual();
-        state.insert("k2".to_string(), Some("v2".to_string()));
+        state.insert("k2".to_string(), MemValue::new(Some("v2".to_string())));
         let _imm2 = state.needs_flush_manual();
-        state.insert("k3".to_string(), Some("v3".to_string()));
+        state.insert("k3".to_string(), MemValue::new(Some("v3".to_string())));
         let _imm3 = state.needs_flush_manual();
 
         assert_eq!(state.immutable_count(), 3);
@@ -611,6 +671,32 @@ mod tests {
         let stalled = state.wait_if_stalled();
         assert!(!stalled, "Should not stall when under limit");
         assert_eq!(state.stall_count(), 0);
+    }
+
+    /// Test TTL functionality
+    #[test]
+    fn test_memvalue_ttl() {
+        let now = crate::engine::current_timestamp();
+
+        // Entry with no expiration
+        let entry = MemValue::new(Some("value".to_string()));
+        assert!(!entry.is_expired(now));
+        assert!(entry.is_valid(now));
+
+        // Entry that expires in the future
+        let entry_future = MemValue::new_with_ttl(Some("value".to_string()), now + 3600);
+        assert!(!entry_future.is_expired(now));
+        assert!(entry_future.is_valid(now));
+
+        // Entry that has already expired
+        let entry_past = MemValue::new_with_ttl(Some("value".to_string()), now - 1);
+        assert!(entry_past.is_expired(now));
+        assert!(!entry_past.is_valid(now));
+
+        // Tombstone entry
+        let tombstone = MemValue::new(None);
+        assert!(tombstone.is_tombstone());
+        assert!(!tombstone.is_valid(now));
     }
 }
 
@@ -640,7 +726,7 @@ impl MemTableState {
         use std::time::Instant;
 
         fn bench_btree_mutex(num_threads: usize, ops_per_thread: usize) -> std::time::Duration {
-            let map: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
+            let map: Arc<Mutex<BTreeMap<String, MemValue>>> = Arc::new(Mutex::new(BTreeMap::new()));
             let mut handles = vec![];
 
             let start = Instant::now();
@@ -651,7 +737,10 @@ impl MemTableState {
                     for i in 0..ops_per_thread {
                         let key = format!("key_{}_{}", t, i);
                         let value = format!("value_{}_{}", t, i);
-                        map_clone.lock().unwrap().insert(key, value);
+                        map_clone
+                            .lock()
+                            .unwrap()
+                            .insert(key, MemValue::new(Some(value)));
                     }
                 }));
             }
@@ -673,7 +762,7 @@ impl MemTableState {
         }
 
         fn bench_skiplist(num_threads: usize, ops_per_thread: usize) -> std::time::Duration {
-            let map: Arc<SkipMap<String, String>> = Arc::new(SkipMap::new());
+            let map: Arc<SkipMap<String, MemValue>> = Arc::new(SkipMap::new());
             let mut handles = vec![];
 
             let start = Instant::now();
@@ -684,7 +773,7 @@ impl MemTableState {
                     for i in 0..ops_per_thread {
                         let key = format!("key_{}_{}", t, i);
                         let value = format!("value_{}_{}", t, i);
-                        map_clone.insert(key, value);
+                        map_clone.insert(key, MemValue::new(Some(value)));
                     }
                 }));
             }

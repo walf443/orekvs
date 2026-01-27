@@ -11,13 +11,13 @@ mod recovery;
 mod sstable;
 mod wal;
 
-use super::Engine;
+use super::{Engine, current_timestamp};
 use crate::engine::wal::GroupCommitConfig;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use bloom::BloomFilter;
 use compaction::{CompactionConfig, LeveledCompaction};
 use manifest::{Manifest, ManifestEntry};
-use memtable::{MemTable, MemTableState};
+use memtable::{MemTable, MemTableState, MemValue};
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
 use sstable::MappedSSTable;
@@ -814,21 +814,23 @@ impl LsmTreeEngine {
     }
 }
 
-impl Engine for LsmTreeEngine {
-    fn set(&self, key: String, value: String) -> Result<(), Status> {
+impl LsmTreeEngine {
+    #[allow(clippy::result_large_err)]
+    fn set_internal(&self, key: String, value: String, expire_at: u64) -> Result<(), Status> {
         self.metrics.record_set();
 
         // 0. Wait if too many immutable memtables are pending (write stall prevention)
         self.mem_state.wait_if_stalled();
 
-        let new_val_opt = Some(value);
+        let value_opt = Some(value);
 
         // 1. Start writing to WAL
         let wal = self.wal.clone();
         let key_clone = key.clone();
-        let val_clone = new_val_opt.clone();
+        let val_clone = value_opt.clone();
         let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wal.append_pipelined(&key_clone, &val_clone))
+            tokio::runtime::Handle::current()
+                .block_on(wal.append_pipelined_with_ttl(&key_clone, &val_clone, expire_at))
         })?;
 
         // 2. Wait for WAL to be written to OS buffer
@@ -836,7 +838,8 @@ impl Engine for LsmTreeEngine {
             tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
 
         // 3. Update MemTable immediately (it becomes visible to Get)
-        self.mem_state.insert(key, new_val_opt);
+        self.mem_state
+            .insert(key, MemValue::new_with_ttl(value_opt, expire_at));
         self.trigger_flush_if_needed();
 
         // 4. Finally wait for disk sync for durability
@@ -847,15 +850,32 @@ impl Engine for LsmTreeEngine {
                 .map(|_seq| ()) // Discard the sequence number
         })
     }
+}
+
+impl Engine for LsmTreeEngine {
+    fn set(&self, key: String, value: String) -> Result<(), Status> {
+        self.set_internal(key, value, 0)
+    }
+
+    fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
+        let expire_at = current_timestamp() + ttl_secs;
+        self.set_internal(key, value, expire_at)
+    }
 
     fn get(&self, key: String) -> Result<String, Status> {
         self.metrics.record_get();
+        let now = current_timestamp();
 
         // 1. Check memtable (active and immutable)
-        if let Some(val_opt) = self.mem_state.get(&key) {
-            return val_opt
-                .as_ref()
-                .cloned()
+        if let Some(mem_value) = self.mem_state.get(&key) {
+            if mem_value.is_tombstone() {
+                return Err(Status::not_found("Key deleted"));
+            }
+            if mem_value.is_expired(now) {
+                return Err(Status::not_found("Key expired"));
+            }
+            return mem_value
+                .value
                 .ok_or_else(|| Status::not_found("Key deleted"));
         }
 
@@ -895,15 +915,16 @@ impl Engine for LsmTreeEngine {
         let wal = self.wal.clone();
         let key_clone = key.clone();
         let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wal.append_pipelined(&key_clone, &None))
+            tokio::runtime::Handle::current()
+                .block_on(wal.append_pipelined_with_ttl(&key_clone, &None, 0))
         })?;
 
         // 2. Wait for WAL to be written to OS buffer
         let _ =
             tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
 
-        // 3. Update MemTable
-        self.mem_state.insert(key, None);
+        // 3. Update MemTable with tombstone
+        self.mem_state.insert(key, MemValue::new(None));
         self.trigger_flush_if_needed();
 
         // 4. Wait for disk sync
@@ -926,16 +947,16 @@ impl Engine for LsmTreeEngine {
         let count = items.len();
         self.metrics.record_batch_set(count as u64);
 
-        // Convert to WAL format (key, Some(value))
-        let entries: Vec<(String, Option<String>)> = items
+        // Convert to WAL format (key, Some(value), expire_at=0)
+        let entries: Vec<(String, Option<String>, u64)> = items
             .iter()
-            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .map(|(k, v)| (k.clone(), Some(v.clone()), 0u64))
             .collect();
 
         // 1. Start writing batch to WAL
         let wal = self.wal.clone();
         let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined(entries))
+            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined_with_ttl(entries))
         })?;
 
         // 2. Wait for WAL to be written to OS buffer
@@ -944,7 +965,7 @@ impl Engine for LsmTreeEngine {
 
         // 3. Update MemTable with all entries (they become visible to Get)
         for (key, value) in items {
-            self.mem_state.insert(key, Some(value));
+            self.mem_state.insert(key, MemValue::new(Some(value)));
         }
         self.trigger_flush_if_needed();
 
@@ -972,17 +993,20 @@ impl Engine for LsmTreeEngine {
         self.metrics.record_batch_get(keys.len() as u64);
 
         let mut results = Vec::with_capacity(keys.len());
+        let now = current_timestamp();
 
         // First pass: check MemTable for all keys (fast, in-memory)
         // MemTable uses SkipMap which is already thread-safe, but sequential access
         // is efficient enough and maintains sorted order benefits
         let mut remaining_keys = Vec::new();
         for key in keys {
-            if let Some(val_opt) = self.mem_state.get(&key) {
-                if let Some(value) = val_opt {
+            if let Some(mem_value) = self.mem_state.get(&key) {
+                if mem_value.is_valid(now)
+                    && let Some(value) = mem_value.value
+                {
                     results.push((key, value));
                 }
-                // If val_opt is None, it's a tombstone - skip
+                // If tombstone or expired, skip
             } else {
                 remaining_keys.push(key);
             }
@@ -1046,14 +1070,14 @@ impl Engine for LsmTreeEngine {
         let count = keys.len();
         self.metrics.record_batch_delete(count as u64);
 
-        // Convert to WAL format (key, None for tombstone)
-        let entries: Vec<(String, Option<String>)> =
-            keys.iter().map(|k| (k.clone(), None)).collect();
+        // Convert to WAL format (key, None for tombstone, expire_at=0)
+        let entries: Vec<(String, Option<String>, u64)> =
+            keys.iter().map(|k| (k.clone(), None, 0u64)).collect();
 
         // 1. Start writing batch of tombstones to WAL
         let wal = self.wal.clone();
         let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined(entries))
+            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined_with_ttl(entries))
         })?;
 
         // 2. Wait for WAL to be written to OS buffer
@@ -1062,7 +1086,7 @@ impl Engine for LsmTreeEngine {
 
         // 3. Update MemTable with tombstones
         for key in keys {
-            self.mem_state.insert(key, None);
+            self.mem_state.insert(key, MemValue::new(None));
         }
         self.trigger_flush_if_needed();
 
@@ -1115,6 +1139,10 @@ pub struct LsmTreeEngineWrapper(pub Arc<LsmTreeEngine>);
 impl Engine for LsmTreeEngineWrapper {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
         self.0.set(key, value)
+    }
+
+    fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
+        self.0.set_with_ttl(key, value, ttl_secs)
     }
 
     fn get(&self, key: String) -> Result<String, Status> {

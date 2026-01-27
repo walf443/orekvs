@@ -24,8 +24,8 @@ use self::node::{InternalNode, LeafEntry, LeafNode};
 use self::page::MetaPage;
 use self::page_manager::PageManager;
 use self::wal::{GroupCommitWalWriter, RecordType};
-use crate::engine::Engine;
 use crate::engine::wal::GroupCommitConfig;
+use crate::engine::{Engine, current_timestamp};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -221,7 +221,7 @@ impl BTreeEngine {
             match record.record_type {
                 RecordType::Insert => {
                     if let Some(value) = record.value {
-                        self.set_internal(record.key, value, false)?;
+                        self.set_internal_with_ttl(record.key, value, 0, false)?;
                     }
                 }
                 RecordType::Delete => {
@@ -251,8 +251,14 @@ impl BTreeEngine {
         Ok(())
     }
 
-    /// Internal set implementation
-    fn set_internal(&self, key: String, value: String, log_wal: bool) -> Result<(), Status> {
+    /// Internal set implementation with optional TTL
+    fn set_internal_with_ttl(
+        &self,
+        key: String,
+        value: String,
+        expire_at: u64,
+        log_wal: bool,
+    ) -> Result<(), Status> {
         // Log to WAL first
         if log_wal && let Some(wal) = &self.wal {
             let seq = wal
@@ -262,7 +268,11 @@ impl BTreeEngine {
             self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
         }
 
-        let entry = LeafEntry::new(key, value);
+        let entry = if expire_at > 0 {
+            LeafEntry::new_with_ttl(key, value, expire_at)
+        } else {
+            LeafEntry::new(key, value)
+        };
 
         let mut meta = self.meta.write().unwrap();
 
@@ -314,9 +324,9 @@ impl BTreeEngine {
             let mut leaf = self.get_leaf(page_id)?;
             let _is_new = leaf.insert(entry.clone());
 
-            if leaf.needs_split() {
-                // Split leaf
-                let (right, split_key) = leaf.split();
+            // Try cleanup before split - this may avoid the split entirely
+            if let Some((right, split_key)) = leaf.split_with_cleanup(current_timestamp()) {
+                // Split still needed after cleanup
                 let right_page_id = self.allocate_page()?;
 
                 // Update next/prev pointers
@@ -530,7 +540,12 @@ impl BTreeEngine {
 
 impl Engine for BTreeEngine {
     fn set(&self, key: String, value: String) -> Result<(), Status> {
-        self.set_internal(key, value, true)
+        self.set_internal_with_ttl(key, value, 0, true)
+    }
+
+    fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
+        let expire_at = current_timestamp() + ttl_secs;
+        self.set_internal_with_ttl(key, value, expire_at, true)
     }
 
     fn get(&self, key: String) -> Result<String, Status> {
@@ -545,7 +560,7 @@ impl Engine for BTreeEngine {
         let leaf = self.get_leaf(leaf_page_id)?;
 
         match leaf.get(&key) {
-            Some(entry) if !entry.is_tombstone() => Ok(entry.value.clone().unwrap()),
+            Some(entry) if entry.is_valid(current_timestamp()) => Ok(entry.value.clone().unwrap()),
             _ => Err(Status::not_found("Key not found")),
         }
     }
@@ -567,7 +582,7 @@ impl Engine for BTreeEngine {
 
         let mut count = 0;
         for (key, value) in items {
-            self.set_internal(key, value, true)?;
+            self.set_internal_with_ttl(key, value, 0, true)?;
             count += 1;
         }
 

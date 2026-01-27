@@ -1,3 +1,4 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
 pub mod btree;
@@ -6,11 +7,27 @@ pub mod lsm_tree;
 pub mod memory;
 pub mod wal;
 
+/// Get current Unix timestamp in seconds
+pub fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 #[allow(clippy::result_large_err)]
 pub trait Engine: Send + Sync + 'static {
     fn set(&self, key: String, value: String) -> Result<(), Status>;
     fn get(&self, key: String) -> Result<String, Status>;
     fn delete(&self, key: String) -> Result<(), Status>;
+
+    /// Set a key-value pair with TTL (time-to-live) in seconds.
+    /// The key will expire after `ttl_secs` seconds from now.
+    /// Default implementation calls set() (no TTL support).
+    fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
+        let _ = ttl_secs; // Default: ignore TTL
+        self.set(key, value)
+    }
 
     /// Batch set multiple key-value pairs.
     /// Default implementation calls set() for each item.

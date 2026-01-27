@@ -243,22 +243,27 @@ impl LeveledCompaction {
     ) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
         let mut merged: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
 
+        let now = crate::engine::current_timestamp();
         for path in files {
             let entries = sstable::read_entries(path)?;
-            for (key, (timestamp, value)) in entries {
+            for (key, (timestamp, expire_at, value)) in entries {
+                // Skip expired entries during compaction
+                if expire_at > 0 && now > expire_at {
+                    continue;
+                }
                 match merged.get(&key) {
-                    Some((existing_ts, _)) if *existing_ts >= timestamp => {
+                    Some((existing_ts, _, _)) if *existing_ts >= timestamp => {
                         // Keep existing entry (newer timestamp)
                     }
                     _ => {
-                        merged.insert(key, (timestamp, value));
+                        merged.insert(key, (timestamp, expire_at, value));
                     }
                 }
             }
         }
 
         // Remove tombstones during compaction
-        merged.retain(|_, (_, value)| value.is_some());
+        merged.retain(|_, (_, _, value)| value.is_some());
 
         Ok(merged)
     }
@@ -417,7 +422,8 @@ mod tests {
         });
         let mut timestamped: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
         for (k, v) in entries {
-            timestamped.insert(k.to_string(), (ts, Some(v.to_string())));
+            // (timestamp, expire_at, value) - expire_at=0 means no expiration
+            timestamped.insert(k.to_string(), (ts, 0, Some(v.to_string())));
         }
         sstable::write_timestamped_entries(&path, &timestamped).unwrap();
         path
@@ -543,10 +549,10 @@ mod tests {
         let entries = sstable::read_entries(&new_file.path).unwrap();
         assert_eq!(entries.len(), 5); // a, b, c, d, e
 
-        // Newer values should win
-        assert_eq!(entries.get("b").unwrap().1, Some("new_b".to_string()));
-        assert_eq!(entries.get("c").unwrap().1, Some("new_c".to_string()));
-        assert_eq!(entries.get("e").unwrap().1, Some("old_e".to_string()));
+        // Newer values should win (index 2 is value in the tuple)
+        assert_eq!(entries.get("b").unwrap().2, Some("new_b".to_string()));
+        assert_eq!(entries.get("c").unwrap().2, Some("new_c".to_string()));
+        assert_eq!(entries.get("e").unwrap().2, Some("old_e".to_string()));
     }
 
     #[test]
@@ -564,7 +570,8 @@ mod tests {
         // Create SSTable with a tombstone for "b"
         let sst2_path = data_dir.join("sst_2_0.data");
         let mut entries: BTreeMap<String, TimestampedEntry> = BTreeMap::new();
-        entries.insert("b".to_string(), (u64::MAX, None)); // Tombstone with high timestamp
+        // (timestamp, expire_at, value) - high timestamp ensures it wins, expire_at=0, None=tombstone
+        entries.insert("b".to_string(), (u64::MAX, 0, None));
         sstable::write_timestamped_entries(&sst2_path, &entries).unwrap();
 
         let compaction =
@@ -738,12 +745,12 @@ mod tests {
         let new_file = &result.new_files[0];
         assert_eq!(new_file.level, 2);
 
-        // Verify newer values win
+        // Verify newer values win (index 2 is value in the tuple)
         let entries = sstable::read_entries(&new_file.path).unwrap();
         assert_eq!(entries.len(), 4); // a, b, c, d
-        assert_eq!(entries.get("b").unwrap().1, Some("new_b".to_string())); // new wins
-        assert_eq!(entries.get("c").unwrap().1, Some("new_c".to_string())); // new
-        assert_eq!(entries.get("a").unwrap().1, Some("old_a".to_string())); // old (no conflict)
-        assert_eq!(entries.get("d").unwrap().1, Some("old_d".to_string())); // old (no conflict)
+        assert_eq!(entries.get("b").unwrap().2, Some("new_b".to_string())); // new wins
+        assert_eq!(entries.get("c").unwrap().2, Some("new_c".to_string())); // new
+        assert_eq!(entries.get("a").unwrap().2, Some("old_a".to_string())); // old (no conflict)
+        assert_eq!(entries.get("d").unwrap().2, Some("old_d".to_string())); // old (no conflict)
     }
 }

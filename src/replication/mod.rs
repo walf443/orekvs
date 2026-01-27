@@ -303,7 +303,7 @@ impl ReplicationService {
             current_offset += block_size as u64;
             bytes_read += block_size;
 
-            // Parse entries from buffer (v4 format: seq + timestamp + key_len + value_len + key + value)
+            // Parse entries from buffer (v4 format: seq + timestamp + expire_at + key_len + value_len + key + value)
             let mut cursor = Cursor::new(&entries_data);
             loop {
                 // v4 format starts with sequence number
@@ -326,6 +326,13 @@ impl ReplicationService {
                         timestamp
                     )));
                 }
+
+                // Read expire_at (added for TTL support)
+                let mut expire_at_bytes = [0u8; 8];
+                if cursor.read_exact(&mut expire_at_bytes).is_err() {
+                    break;
+                }
+                let _expire_at = u64::from_le_bytes(expire_at_bytes);
 
                 let mut klen_bytes = [0u8; 8];
                 let mut vlen_bytes = [0u8; 8];
@@ -442,7 +449,7 @@ impl ReplicationService {
             current_offset += block_size as u64;
             bytes_read += block_size;
 
-            // Parse entries from buffer
+            // Parse entries from buffer (now includes expire_at for TTL support)
             let mut cursor = Cursor::new(&entries_data);
             loop {
                 let mut ts_bytes = [0u8; 8];
@@ -458,6 +465,13 @@ impl ReplicationService {
                         timestamp
                     )));
                 }
+
+                // Read expire_at (added for TTL support)
+                let mut expire_at_bytes = [0u8; 8];
+                if cursor.read_exact(&mut expire_at_bytes).is_err() {
+                    break;
+                }
+                let _expire_at = u64::from_le_bytes(expire_at_bytes);
 
                 let mut klen_bytes = [0u8; 8];
                 let mut vlen_bytes = [0u8; 8];

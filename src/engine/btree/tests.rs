@@ -390,3 +390,72 @@ fn test_btree_sequential_vs_random_insert() {
         assert!(engine.get(format!("{:05}", i)).is_ok());
     }
 }
+
+#[test]
+fn test_btree_ttl() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Set with TTL of 1 second
+    engine
+        .set_with_ttl("ttl_key".to_string(), "ttl_value".to_string(), 1)
+        .unwrap();
+
+    // Should be accessible immediately
+    assert_eq!(engine.get("ttl_key".to_string()).unwrap(), "ttl_value");
+
+    // Wait for expiration
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Should be expired now
+    assert!(engine.get("ttl_key".to_string()).is_err());
+}
+
+#[test]
+fn test_btree_ttl_no_expiry() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Set without TTL (ttl_secs = 0)
+    engine
+        .set("no_ttl_key".to_string(), "no_ttl_value".to_string())
+        .unwrap();
+
+    // Should always be accessible
+    assert_eq!(
+        engine.get("no_ttl_key".to_string()).unwrap(),
+        "no_ttl_value"
+    );
+}
+
+#[test]
+fn test_leaf_entry_ttl() {
+    use crate::engine::btree::node::LeafEntry;
+    use crate::engine::current_timestamp;
+
+    let now = current_timestamp();
+
+    // Entry with no expiration
+    let entry = LeafEntry::new("key".to_string(), "value".to_string());
+    assert!(!entry.is_expired(now));
+    assert!(entry.is_valid(now));
+
+    // Entry that expires in the future
+    let entry_future = LeafEntry::new_with_ttl("key".to_string(), "value".to_string(), now + 3600);
+    assert!(!entry_future.is_expired(now));
+    assert!(entry_future.is_valid(now));
+
+    // Entry that has already expired
+    let entry_past = LeafEntry::new_with_ttl("key".to_string(), "value".to_string(), now - 1);
+    assert!(entry_past.is_expired(now));
+    assert!(!entry_past.is_valid(now));
+
+    // Tombstone entry
+    let tombstone = LeafEntry::tombstone("key".to_string());
+    assert!(tombstone.is_tombstone());
+    assert!(!tombstone.is_valid(now));
+}

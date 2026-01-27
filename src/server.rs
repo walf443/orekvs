@@ -86,7 +86,12 @@ impl MyKeyValue {
 impl KeyValue for MyKeyValue {
     async fn set(&self, request: Request<SetRequest>) -> Result<Response<SetResponse>, Status> {
         let req = request.into_inner();
-        self.engine.set(req.key, req.value)?;
+        if req.ttl_seconds > 0 {
+            self.engine
+                .set_with_ttl(req.key, req.value, req.ttl_seconds)?;
+        } else {
+            self.engine.set(req.key, req.value)?;
+        }
         Ok(Response::new(SetResponse { success: true }))
     }
 

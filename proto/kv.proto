@@ -17,6 +17,8 @@ service KeyValue {
 message SetRequest {
   string key = 1;
   string value = 2;
+  // TTL in seconds (0 = no expiration)
+  uint64 ttl_seconds = 3;
 }
 
 message SetResponse {
