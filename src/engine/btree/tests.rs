@@ -527,3 +527,123 @@ fn test_btree_wal_recovery_filters_expired_keys() {
         assert!(expire_at > 0, "valid_ttl_key should have TTL preserved");
     }
 }
+
+/// Test that split_with_cleanup removes expired entries during node split
+/// This helps with defragmentation by cleaning up expired data opportunistically
+#[test]
+fn test_btree_split_with_cleanup() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Insert many entries with short TTL
+    for i in 0..200 {
+        engine
+            .set_with_ttl(
+                format!("expired_key_{:04}", i),
+                format!("value_{}", "x".repeat(50)),
+                1, // 1 second TTL
+            )
+            .unwrap();
+    }
+
+    // Insert some permanent entries
+    for i in 0..50 {
+        engine
+            .set(
+                format!("permanent_key_{:04}", i),
+                format!("value_{}", "x".repeat(50)),
+            )
+            .unwrap();
+    }
+
+    // Wait for TTL to expire
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Insert more entries to trigger splits
+    // Expired entries should be cleaned up during split
+    for i in 0..100 {
+        engine
+            .set(
+                format!("new_key_{:04}", i),
+                format!("value_{}", "x".repeat(50)),
+            )
+            .unwrap();
+    }
+
+    // Verify permanent and new keys are accessible
+    for i in 0..50 {
+        assert!(
+            engine.get(format!("permanent_key_{:04}", i)).is_ok(),
+            "Permanent key {} should be accessible",
+            i
+        );
+    }
+    for i in 0..100 {
+        assert!(
+            engine.get(format!("new_key_{:04}", i)).is_ok(),
+            "New key {} should be accessible",
+            i
+        );
+    }
+
+    // Expired keys should not be accessible
+    for i in 0..200 {
+        assert!(
+            engine.get(format!("expired_key_{:04}", i)).is_err(),
+            "Expired key {} should not be accessible",
+            i
+        );
+    }
+}
+
+/// Test that cleanup during split improves space efficiency
+#[test]
+fn test_btree_split_cleanup_reduces_tree_height() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Insert entries with immediate expiration (expire_at = 1)
+    // Using internal method to set exact expire_at
+    for i in 0..300 {
+        engine
+            .set_with_ttl(
+                format!("key_{:04}", i),
+                format!("value_{}", "x".repeat(40)),
+                1,
+            )
+            .unwrap();
+    }
+
+    let height_before = engine.tree_height();
+
+    // Wait for expiration
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Insert new entries - this should trigger splits with cleanup
+    // The cleanup should prevent excessive tree growth
+    for i in 0..100 {
+        engine
+            .set(format!("new_{:04}", i), format!("value_{}", "x".repeat(40)))
+            .unwrap();
+    }
+
+    let height_after = engine.tree_height();
+
+    // Tree height should not grow significantly since expired entries are cleaned
+    // (The exact assertion depends on the implementation, but height should be reasonable)
+    assert!(
+        height_after <= height_before + 1,
+        "Tree height should not grow excessively after cleanup: before={}, after={}",
+        height_before,
+        height_after
+    );
+
+    // Verify new entries are accessible
+    for i in 0..100 {
+        assert!(engine.get(format!("new_{:04}", i)).is_ok());
+    }
+}

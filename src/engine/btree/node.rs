@@ -686,4 +686,134 @@ mod tests {
         assert_eq!(right.entries.len(), 4);
         assert_eq!(promoted, "key05");
     }
+
+    #[test]
+    fn test_cleanup_expired_removes_expired_entries() {
+        let now = 1000u64;
+        let mut node = LeafNode::new();
+
+        // Valid entry (no TTL)
+        node.insert(LeafEntry::new("key1".to_string(), "value1".to_string()));
+        // Valid entry (future TTL)
+        node.insert(LeafEntry::new_with_ttl(
+            "key2".to_string(),
+            "value2".to_string(),
+            now + 100,
+        ));
+        // Expired entry
+        node.insert(LeafEntry::new_with_ttl(
+            "key3".to_string(),
+            "value3".to_string(),
+            now - 1,
+        ));
+        // Tombstone
+        node.insert(LeafEntry::tombstone("key4".to_string()));
+
+        assert_eq!(node.entries.len(), 4);
+
+        let removed = node.cleanup_expired(now);
+
+        assert_eq!(removed, 2); // expired + tombstone
+        assert_eq!(node.entries.len(), 2);
+        assert_eq!(node.entries[0].key, "key1");
+        assert_eq!(node.entries[1].key, "key2");
+    }
+
+    #[test]
+    fn test_cleanup_expired_no_expired_entries() {
+        let now = 1000u64;
+        let mut node = LeafNode::new();
+
+        node.insert(LeafEntry::new("key1".to_string(), "value1".to_string()));
+        node.insert(LeafEntry::new_with_ttl(
+            "key2".to_string(),
+            "value2".to_string(),
+            now + 100,
+        ));
+
+        let removed = node.cleanup_expired(now);
+
+        assert_eq!(removed, 0);
+        assert_eq!(node.entries.len(), 2);
+    }
+
+    #[test]
+    fn test_split_with_cleanup_avoids_split() {
+        let now = 1000u64;
+        let mut node = LeafNode::new();
+
+        // Add entries that would cause a split, but half are expired
+        // MAX_DATA_SIZE is 4076 bytes, LEAF_HEADER_SIZE is 10
+        // Each entry: 12 bytes overhead + key + value
+        for i in 0..100 {
+            let entry = if i % 2 == 0 {
+                // Expired entry
+                LeafEntry::new_with_ttl(
+                    format!("key{:03}", i),
+                    "x".repeat(30),
+                    now - 1, // expired
+                )
+            } else {
+                // Valid entry
+                LeafEntry::new(format!("key{:03}", i), "x".repeat(30))
+            };
+            node.entries.push(entry);
+        }
+        node.entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+        // Node should need split before cleanup
+        assert!(node.needs_split());
+
+        // After cleanup, split should be avoided
+        let result = node.split_with_cleanup(now);
+        assert!(result.is_none(), "Split should be avoided after cleanup");
+        assert_eq!(node.entries.len(), 50); // Only valid entries remain
+    }
+
+    #[test]
+    fn test_split_with_cleanup_still_needs_split() {
+        let now = 1000u64;
+        let mut node = LeafNode::new();
+
+        // Add many valid entries that will still need split after cleanup
+        for i in 0..100 {
+            let entry = LeafEntry::new(format!("key{:03}", i), "x".repeat(30));
+            node.entries.push(entry);
+        }
+        node.entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+        assert!(node.needs_split());
+
+        let result = node.split_with_cleanup(now);
+        assert!(result.is_some(), "Split should still occur");
+
+        let (right, split_key) = result.unwrap();
+        assert!(!node.entries.is_empty());
+        assert!(!right.entries.is_empty());
+        assert!(node.entries.last().unwrap().key < split_key);
+        assert!(right.entries.first().unwrap().key >= split_key);
+    }
+
+    #[test]
+    fn test_needs_split_after_cleanup() {
+        let now = 1000u64;
+        let mut node = LeafNode::new();
+
+        // Add entries where most are expired
+        for i in 0..100 {
+            let entry = if i < 90 {
+                // 90% expired
+                LeafEntry::new_with_ttl(format!("key{:03}", i), "x".repeat(30), now - 1)
+            } else {
+                LeafEntry::new(format!("key{:03}", i), "x".repeat(30))
+            };
+            node.entries.push(entry);
+        }
+        node.entries.sort_by(|a, b| a.key.cmp(&b.key));
+
+        assert!(node.needs_split());
+        assert!(!node.needs_split_after_cleanup(now));
+        // After cleanup call, node should have only 10 entries
+        assert_eq!(node.entries.len(), 10);
+    }
 }
