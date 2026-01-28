@@ -646,59 +646,54 @@ impl LsmTreeEngine {
 
         let engine_clone = self.clone();
         tokio::spawn(async move {
-            engine_clone.compact_all_levels().await;
+            engine_clone.compact_stale_l0().await;
         });
     }
 
-    /// Compact all levels sequentially, starting from L0.
-    /// This is used to clean up stale SSTables after recovery.
-    async fn compact_all_levels(&self) {
+    /// Compact L0 level to clean up stale SSTables after recovery.
+    /// L0 compaction merges all L0 files with overlapping L1 files,
+    /// which effectively cleans up old SSTables by merging them into newer ones.
+    async fn compact_stale_l0(&self) {
         // Wait a bit before starting to allow the engine to fully initialize
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let level_count = {
-            let leveled = self.leveled_sstables.lock().unwrap();
-            leveled.level_count()
-        };
-
-        for level in 0..level_count {
-            // Check if compaction is already in progress
+        // Wait for any ongoing compaction to finish first
+        loop {
             let is_in_progress = {
                 let in_progress = self.compaction_in_progress.lock().unwrap();
                 *in_progress
             };
-
-            if is_in_progress {
-                // Wait for ongoing compaction to finish
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                continue;
+            if !is_in_progress {
+                break;
             }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
 
-            // Check if this level has files to compact
-            let has_files = {
-                let leveled = self.leveled_sstables.lock().unwrap();
-                !leveled.get_level(level).is_empty()
-            };
+        // Compact L0 (this is where stale files accumulate)
+        // L0 compaction merges all L0 files with overlapping L1 files
+        let has_l0_files = {
+            let leveled = self.leveled_sstables.lock().unwrap();
+            !leveled.get_level(0).is_empty()
+        };
 
-            if has_files {
-                let should_run = {
-                    let mut in_progress = self.compaction_in_progress.lock().unwrap();
-                    if !*in_progress {
-                        *in_progress = true;
-                        true
-                    } else {
-                        false
-                    }
-                };
+        if !has_l0_files {
+            println!("Stale compaction: no L0 files to compact");
+            return;
+        }
 
-                if should_run {
-                    if let Err(e) = self.run_compaction_for_level(level).await {
-                        eprintln!("Stale compaction failed for level {}: {}", level, e);
-                    }
+        {
+            let mut in_progress = self.compaction_in_progress.lock().unwrap();
+            *in_progress = true;
+        }
 
-                    *self.compaction_in_progress.lock().unwrap() = false;
-                }
-            }
+        println!("Stale compaction: running L0 compaction");
+        if let Err(e) = self.run_compaction_for_level(0).await {
+            eprintln!("Stale compaction failed for L0: {}", e);
+        }
+
+        {
+            let mut in_progress = self.compaction_in_progress.lock().unwrap();
+            *in_progress = false;
         }
 
         println!("Background stale SSTable compaction finished");
