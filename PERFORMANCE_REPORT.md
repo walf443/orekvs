@@ -1,7 +1,9 @@
 # Orelsm 性能レポート
 
 ## 実行環境
-- **OS**: Darwin (Mac)
+- **CPU**: Apple M2 Pro (10コア)
+- **メモリ**: 32 GB
+- **OS**: Darwin (macOS)
 - **ビルド**: Release (`cargo build --release`)
 - **日付**: 2026-01-28 (CAS + リファクタリング後)
 
@@ -14,40 +16,26 @@
 
 ### 1. スループット (Requests per Second)
 
-| エンジン | Set (req/sec) | Get (req/sec) | 備考 |
-| :--- | :---: | :---: | :--- |
-| **Memory** | 25,156 | 26,966 | ベースライン (メモリ上のHashMap) |
-| **Log** | 198* | 25,724 | *永続性のために `sync_all()` を使用 |
-| **LSM-tree** | 1,215** | 25,800*** | **Leveled Compaction + Index Cache |
-| **BTree** | 1,074** | 24,607 | **グループコミット + `sync_data()` |
+| エンジン | Get | Set | CAS | 備考 |
+| :--- | :---: | :---: | :---: | :--- |
+| **Memory** | 26,966 | 25,156 | 26,087 | ベースライン (メモリ上のHashMap) |
+| **Log** | 25,724 | 198* | 266 | *永続性のために `sync_all()` を使用 |
+| **LSM-tree** | 25,800 | 1,215 | 1,245 | グループコミット + ストライプロック |
+| **BTree** | 24,607 | 1,074 | 266 | グループコミット + 単一CASロック |
 
 ### 2. レイテンシ (リクエストあたりの平均)
 
-| エンジン | Set (平均) | Get (平均) |
-| :--- | :---: | :---: |
-| **Memory** | 0.37 ms | 0.34 ms |
-| **Log** | 50.53 ms* | 0.36 ms |
-| **LSM-tree** | 8.15 ms** | 0.36 ms*** |
-| **BTree** | 9.23 ms** | 0.38 ms |
+| エンジン | Get | Set | CAS |
+| :--- | :---: | :---: | :---: |
+| **Memory** | 0.34 ms | 0.37 ms | 0.35 ms |
+| **Log** | 0.36 ms | 50.53 ms | 37.52 ms |
+| **LSM-tree** | 0.36 ms | 8.15 ms | 8.00 ms |
+| **BTree** | 0.38 ms | 9.23 ms | 37.59 ms |
 
-***LSM-tree の Get が Memory とほぼ同等** - Leveled Compaction と Index Block Cache の効果で、SSTable の検索効率が向上しています。
-
-### 3. CAS (Compare-And-Set) 性能
-
-| エンジン | CAS (req/sec) | CAS (平均) | SET比 | 備考 |
-| :--- | :---: | :---: | :---: | :--- |
-| **Memory** | 26,087 | 0.35 ms | 1.04x | ロックフリー (SkipMap CAS) |
-| **Log** | 266 | 37.52 ms | 1.34x | 書き込みが元々シリアライズ |
-| **LSM-tree** | 1,245 | 8.00 ms | 1.02x | ストライプロック (256分割) |
-| **BTree** | 266 | 37.59 ms | 0.25x | 単一ロック (未最適化) |
-
-**CAS 性能の特徴**:
-- **Memory**: CAS は SET とほぼ同等。永続化オーバーヘッドがなく、SkipMap の CAS 操作で実装。
-- **Log**: CAS が SET より高速。書き込みが元々シリアライズされているため、CAS ロックがボトルネックにならない。
-- **LSM-tree**: ロックストライピング (256分割) により SET とほぼ同等の性能を達成。
-  - 以前: ~267 req/sec (単一ロック)
-  - 現在: ~1,245 req/sec (ストライプロック) - **4.7倍改善**
-- **BTree**: 単一ロックのため CAS は SET の約 1/4。
+**注釈**:
+- **LSM-tree Get** が Memory とほぼ同等 - Leveled Compaction と Index Block Cache の効果
+- **LSM-tree CAS** が SET と同等 - ストライプロック (256分割) による並列化
+- **BTree CAS** は SET の約 1/4 - 単一ロックによるシリアライズ (未最適化)
 
 **設計上の割り切り**: 同一キーに対して CAS と SET/DELETE を混在させるのはユーザーの誤用とし、CAS 以外の操作ではロックを取得しないことで SET のスループットを維持しています。
 
