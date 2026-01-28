@@ -1,6 +1,7 @@
 //! Unit tests for LSM-tree engine.
 
 use super::*;
+use sstable::levels::MAX_LEVELS;
 use tempfile::tempdir;
 
 /// Helper: Wait for all pending flushes to complete by checking immutable memtables

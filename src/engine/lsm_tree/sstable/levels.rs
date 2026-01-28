@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 use crate::engine::lsm_tree::SstableHandle;
 
+/// Default maximum level for leveled compaction
+pub const MAX_LEVELS: usize = 7;
+
 /// Common interface for SSTable levels
 #[allow(dead_code)]
 pub trait SstableLevel {
@@ -191,6 +194,179 @@ impl SstableLevel for SortedLevel {
 
     fn clear(&mut self) {
         self.sstables.clear();
+    }
+}
+
+/// Manages SSTables organized by levels for leveled compaction.
+///
+/// Uses separate implementations for L0 (overlapping, time-ordered) and
+/// L1+ (non-overlapping, key-sorted) levels.
+pub struct LeveledSstables {
+    /// Level 0: overlapping SSTables sorted by creation time (newest first)
+    l0: Level0,
+    /// Levels 1+: non-overlapping SSTables sorted by min_key
+    sorted_levels: Vec<SortedLevel>,
+}
+
+impl LeveledSstables {
+    /// Create a new empty LeveledSstables structure
+    pub fn new() -> Self {
+        let sorted_levels = (1..MAX_LEVELS).map(SortedLevel::new).collect();
+        Self {
+            l0: Level0::new(),
+            sorted_levels,
+        }
+    }
+
+    /// Add an SSTable to a specific level
+    pub fn add_to_level(&mut self, level: usize, handle: Arc<SstableHandle>) {
+        if level == 0 {
+            self.l0.add(handle);
+        } else {
+            // Ensure we have enough levels
+            while self.sorted_levels.len() < level {
+                self.sorted_levels
+                    .push(SortedLevel::new(self.sorted_levels.len() + 1));
+            }
+            self.sorted_levels[level - 1].add(handle);
+        }
+    }
+
+    /// Remove an SSTable from its level
+    #[cfg(test)]
+    pub fn remove(&mut self, handle: &Arc<SstableHandle>) {
+        if self.l0.remove(handle) {
+            return;
+        }
+        for level in &mut self.sorted_levels {
+            if level.remove(handle) {
+                return;
+            }
+        }
+    }
+
+    /// Get the level count (including L0)
+    pub fn level_count(&self) -> usize {
+        1 + self.sorted_levels.len()
+    }
+
+    /// Get SSTables at a specific level
+    pub fn get_level(&self, level: usize) -> &[Arc<SstableHandle>] {
+        if level == 0 {
+            self.l0.sstables()
+        } else if level <= self.sorted_levels.len() {
+            self.sorted_levels[level - 1].sstables()
+        } else {
+            &[]
+        }
+    }
+
+    /// Get all L0 SSTables (for scanning during reads)
+    pub fn l0_sstables(&self) -> &[Arc<SstableHandle>] {
+        self.l0.sstables()
+    }
+
+    /// Get SSTables in L1+ that overlap with the given key range
+    #[cfg(test)]
+    pub fn get_overlapping(
+        &self,
+        level: usize,
+        min_key: &[u8],
+        max_key: &[u8],
+    ) -> Vec<Arc<SstableHandle>> {
+        if level == 0 || level > self.sorted_levels.len() {
+            return Vec::new();
+        }
+        self.sorted_levels[level - 1].get_overlapping(min_key, max_key)
+    }
+
+    /// Get candidates for a key lookup at a specific level
+    pub fn candidates_for_key(&self, level: usize, key: &[u8]) -> Vec<Arc<SstableHandle>> {
+        if level == 0 {
+            self.l0.candidates_for_key(key)
+        } else if level <= self.sorted_levels.len() {
+            self.sorted_levels[level - 1].candidates_for_key(key)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remove an SSTable by filename from any level
+    pub fn remove_by_filename(&mut self, filename: &str) -> bool {
+        // Check L0
+        if let Some(pos) = self.l0.sstables().iter().position(|h| {
+            h.mmap
+                .path()
+                .file_name()
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .unwrap_or("")
+                == filename
+        }) {
+            let handle = self.l0.sstables()[pos].clone();
+            return self.l0.remove(&handle);
+        }
+
+        // Check sorted levels
+        for level in &mut self.sorted_levels {
+            if let Some(pos) = level.sstables().iter().position(|h| {
+                h.mmap
+                    .path()
+                    .file_name()
+                    .and_then(|n: &std::ffi::OsStr| n.to_str())
+                    .unwrap_or("")
+                    == filename
+            }) {
+                let handle = level.sstables()[pos].clone();
+                return level.remove(&handle);
+            }
+        }
+
+        false
+    }
+
+    /// Get total number of SSTables across all levels
+    #[cfg(test)]
+    pub fn total_sstable_count(&self) -> usize {
+        self.l0.len() + self.sorted_levels.iter().map(|l| l.len()).sum::<usize>()
+    }
+
+    /// Get the total size of a level in bytes
+    pub fn level_size(&self, level: usize) -> u64 {
+        if level == 0 {
+            self.l0.size_bytes()
+        } else if level <= self.sorted_levels.len() {
+            self.sorted_levels[level - 1].size_bytes()
+        } else {
+            0
+        }
+    }
+
+    /// Convert from flat SSTable list (for migration)
+    /// Places all SSTables in L0 since we don't have level info
+    #[cfg(test)]
+    pub fn from_flat_list(sstables: Vec<Arc<SstableHandle>>) -> Self {
+        let mut leveled = Self::new();
+        for handle in sstables {
+            leveled.l0.add(handle);
+        }
+        leveled
+    }
+
+    /// Convert to flat SSTable list (for backward compatibility)
+    /// Returns all SSTables from all levels, L0 first (newest first),
+    /// then L1, L2, etc.
+    pub fn to_flat_list(&self) -> Vec<Arc<SstableHandle>> {
+        let mut result: Vec<Arc<SstableHandle>> = self.l0.sstables().to_vec();
+        for level in &self.sorted_levels {
+            result.extend(level.sstables().iter().cloned());
+        }
+        result
+    }
+}
+
+impl Default for LeveledSstables {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
