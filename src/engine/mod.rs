@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
 pub mod btree;
+mod cas;
 pub mod log;
 pub mod lsm_tree;
 pub mod memory;

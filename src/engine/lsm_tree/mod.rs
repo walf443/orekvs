@@ -13,6 +13,7 @@ mod sstable;
 mod wal;
 
 use super::{Engine, current_timestamp};
+use crate::engine::cas::CasLockStripe;
 use crate::engine::wal::GroupCommitConfig;
 use block_cache::{BlockCache, DEFAULT_BLOCK_CACHE_SIZE_BYTES};
 use bloom::BloomFilter;
@@ -23,38 +24,12 @@ pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
 use sstable::MappedSSTable;
 use sstable::levels::LeveledSstables;
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
 use wal::GroupCommitWalWriter;
-
-/// Number of stripes for CAS lock (power of 2 for efficient modulo)
-const CAS_LOCK_STRIPES: usize = 256;
-
-/// Striped lock for CAS operations.
-/// Allows concurrent CAS operations on different keys while serializing
-/// operations on the same key (or keys that hash to the same stripe).
-struct CasLockStripe {
-    locks: Vec<Mutex<()>>,
-}
-
-impl CasLockStripe {
-    fn new(num_stripes: usize) -> Self {
-        let locks = (0..num_stripes).map(|_| Mutex::new(())).collect();
-        Self { locks }
-    }
-
-    fn get_lock(&self, key: &str) -> &Mutex<()> {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish() as usize;
-        &self.locks[hash % self.locks.len()]
-    }
-}
 
 /// Lock to prevent SSTable deletion during snapshot transfer.
 /// Snapshot transfer holds a read lock; compaction deletion requires a write lock.
@@ -263,7 +238,7 @@ impl LsmTreeEngine {
             snapshot_lock: Arc::new(RwLock::new(())),
             manifest: Arc::new(Mutex::new(recovery_result.manifest)),
             compaction_handler,
-            cas_locks: Arc::new(CasLockStripe::new(CAS_LOCK_STRIPES)),
+            cas_locks: Arc::new(CasLockStripe::new()),
         };
 
         // Trigger background compaction for stale SSTables (non-blocking)
