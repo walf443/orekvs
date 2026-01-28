@@ -14,6 +14,8 @@ use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use tonic::Status;
 
+use super::composite_key;
+
 /// Prefix compression restart interval for index.
 /// Every N entries, store full key for random access.
 pub const INDEX_RESTART_INTERVAL: u32 = 16;
@@ -73,7 +75,8 @@ pub fn parse_index(decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
             .map_err(|e| Status::internal(e.to_string()))?;
         let offset = u64::from_le_bytes(off_bytes);
 
-        let key_string = String::from_utf8_lossy(&key_buf).to_string();
+        // Convert bytes to String (composite key may contain non-UTF-8 bytes in expire_at portion)
+        let key_string = composite_key::string_from_bytes(key_buf.clone());
         prev_key = key_buf;
         index.push((key_string, offset));
     }

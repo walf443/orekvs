@@ -19,6 +19,7 @@ use crate::engine::lsm_tree::common_prefix_compression_index as prefix_index;
 use crate::engine::lsm_tree::mmap::MappedFile;
 
 use super::{DATA_VERSION, FOOTER_MAGIC, FOOTER_SIZE, HEADER_SIZE, MAGIC_BYTES, crc32};
+use crate::engine::lsm_tree::composite_key;
 
 // Entry with timestamp and TTL for merge-sorting during compaction
 // (timestamp, expire_at, value)
@@ -26,12 +27,17 @@ pub type TimestampedEntry = (u64, u64, Option<String>);
 
 /// Find the block offset for a key using binary search in the index.
 ///
-/// The index contains (first_key, block_offset) pairs sorted by key.
-/// This function finds the block that might contain the given key:
-/// - If the key matches an index entry exactly, returns that block's offset
+/// The index contains (composite_key, block_offset) pairs sorted by key.
+/// Composite key format: logical_key + \x00 + expire_at
+/// This function finds the block that might contain the given logical key:
+/// - If the logical key matches an index entry's logical key, returns that block's offset
 /// - Otherwise, returns the offset of the previous block (which could contain the key)
-fn find_block_offset(index: &[(String, u64)], key: &str) -> u64 {
-    match index.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+fn find_block_offset(index: &[(String, u64)], logical_key: &str) -> u64 {
+    // Compare by logical key extracted from composite key
+    match index.binary_search_by(|(composite, _)| {
+        let idx_logical = composite_key::logical_key(composite).unwrap_or(composite);
+        idx_logical.cmp(logical_key)
+    }) {
         Ok(idx) => index[idx].1,
         Err(idx) => {
             if idx == 0 {
@@ -448,12 +454,6 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
             break;
         }
 
-        // Skip expire_at (8 bytes)
-        let mut expire_at_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut expire_at_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
         let mut klen_bytes = [0u8; 8];
         cursor
             .read_exact(&mut klen_bytes)
@@ -466,13 +466,16 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         let key_len = u64::from_le_bytes(klen_bytes);
         let val_len = u64::from_le_bytes(vlen_bytes);
 
+        // Read composite key and extract logical key
         let mut key_buf = vec![0u8; key_len as usize];
         cursor
             .read_exact(&mut key_buf)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let current_key = String::from_utf8_lossy(&key_buf);
+        // Decode composite key directly from bytes
+        let (current_key, _expire_at) = composite_key::decode_from_bytes(&key_buf)
+            .ok_or_else(|| Status::internal("Invalid composite key format"))?;
 
-        if current_key == key {
+        if current_key.as_str() == key {
             if val_len == u64::MAX {
                 return Ok(None);
             }
@@ -483,8 +486,8 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
             return Ok(Some(String::from_utf8_lossy(&val_buf).to_string()));
         }
 
-        // Optimization: If current_key > key, we can stop (entries are sorted)
-        if current_key.as_ref() > key {
+        // Optimization: If current_key > key, we can stop (entries are sorted by logical key)
+        if current_key.as_str() > key {
             return Err(Status::not_found("Key not found in SSTable (sorted check)"));
         }
 
@@ -596,6 +599,7 @@ fn get_or_load_parsed_block_mmap(
 }
 
 /// Parse all entries from a decompressed block into a sorted vector
+/// Format (v10): [timestamp: u64][key_len: u64][val_len: u64][composite_key][value]
 #[allow(clippy::result_large_err)]
 fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Status> {
     let mut entries = Vec::new();
@@ -612,13 +616,6 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
             break;
         }
 
-        // Read expire_at (8 bytes)
-        let mut expire_at_bytes = [0u8; 8];
-        cursor
-            .read_exact(&mut expire_at_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let expire_at = u64::from_le_bytes(expire_at_bytes);
-
         let mut klen_bytes = [0u8; 8];
         cursor
             .read_exact(&mut klen_bytes)
@@ -631,11 +628,15 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
         let key_len = u64::from_le_bytes(klen_bytes);
         let val_len = u64::from_le_bytes(vlen_bytes);
 
+        // Read composite key (logical_key + \x00 + expire_at)
         let mut key_buf = vec![0u8; key_len as usize];
         cursor
             .read_exact(&mut key_buf)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let key = String::from_utf8_lossy(&key_buf).to_string();
+
+        // Decode composite key directly from bytes to get logical key and expire_at
+        let (logical_key, expire_at) = composite_key::decode_from_bytes(&key_buf)
+            .ok_or_else(|| Status::internal("Invalid composite key format"))?;
 
         let value = if val_len == u64::MAX {
             None // Tombstone
@@ -647,7 +648,7 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
             Some(String::from_utf8_lossy(&val_buf).to_string())
         };
 
-        entries.push((key, value, expire_at));
+        entries.push((logical_key, value, expire_at));
     }
 
     // Entries are already sorted by key (written in BTreeMap order)
@@ -791,7 +792,11 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
             cursor
                 .read_exact(&mut key_buf)
                 .map_err(|e| Status::internal(e.to_string()))?;
-            keys.push(String::from_utf8_lossy(&key_buf).to_string());
+            // Decode composite key to get logical key
+            let logical_key = composite_key::decode_from_bytes(&key_buf)
+                .map(|(k, _)| k)
+                .unwrap_or_else(|| String::from_utf8_lossy(&key_buf).to_string());
+            keys.push(logical_key);
 
             if val_len != u64::MAX {
                 cursor
@@ -905,12 +910,6 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
             }
             let timestamp = u64::from_le_bytes(ts_bytes);
 
-            let mut expire_at_bytes = [0u8; 8];
-            cursor
-                .read_exact(&mut expire_at_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let expire_at = u64::from_le_bytes(expire_at_bytes);
-
             let mut klen_bytes = [0u8; 8];
             cursor
                 .read_exact(&mut klen_bytes)
@@ -923,11 +922,13 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
             let key_len = u64::from_le_bytes(klen_bytes);
             let val_len = u64::from_le_bytes(vlen_bytes);
 
+            // Read composite key and decode directly from bytes
             let mut key_buf = vec![0u8; key_len as usize];
             cursor
                 .read_exact(&mut key_buf)
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let key = String::from_utf8_lossy(&key_buf).to_string();
+            let (key, expire_at) = composite_key::decode_from_bytes(&key_buf)
+                .ok_or_else(|| Status::internal("Invalid composite key format"))?;
 
             let value = if val_len == u64::MAX {
                 None

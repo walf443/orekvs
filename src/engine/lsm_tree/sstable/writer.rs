@@ -12,6 +12,7 @@ use tonic::Status;
 
 use crate::engine::lsm_tree::bloom::BloomFilter;
 use crate::engine::lsm_tree::common_prefix_compression_index as prefix_index;
+use crate::engine::lsm_tree::composite_key;
 use crate::engine::lsm_tree::memtable::{MemTable, MemValue};
 
 use super::reader::TimestampedEntry;
@@ -70,36 +71,37 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
     file.write_all(&DATA_VERSION.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // Build Bloom filter from keys
+    // Build Bloom filter from logical keys (not composite keys)
     let mut bloom = BloomFilter::new(memtable.len().max(1), 0.01);
     for key in memtable.keys() {
-        bloom.insert(key);
+        bloom.insert(key); // Use logical key for bloom filter
     }
 
     let mut current_offset = HEADER_SIZE;
     let mut index: Vec<(String, u64)> = Vec::new();
     let mut block_buffer = Vec::with_capacity(BLOCK_SIZE);
-    let mut first_key_in_block = String::new();
+    let mut first_composite_key_in_block = String::new();
 
     // Write entries
-    for (key, mem_value) in memtable.iter() {
-        if block_buffer.is_empty() {
-            first_key_in_block = key.clone();
+    for (logical_key, mem_value) in memtable.iter() {
+        let (composite_key, _bytes) = write_entry(&mut block_buffer, logical_key, mem_value, None)?;
+
+        if first_composite_key_in_block.is_empty() {
+            first_composite_key_in_block = composite_key;
         }
 
-        write_entry(&mut block_buffer, key, mem_value, None)?;
-
         if block_buffer.len() >= BLOCK_SIZE {
-            index.push((first_key_in_block.clone(), current_offset));
+            index.push((first_composite_key_in_block.clone(), current_offset));
             current_offset +=
                 write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_FLUSH)?;
             block_buffer.clear();
+            first_composite_key_in_block.clear();
         }
     }
 
     // Write remaining block
     if !block_buffer.is_empty() {
-        index.push((first_key_in_block, current_offset));
+        index.push((first_composite_key_in_block, current_offset));
         current_offset +=
             write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_FLUSH)?;
     }
@@ -119,27 +121,23 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
         .map_err(|e| Status::internal(e.to_string()))?;
     current_offset += 8 + bloom_len;
 
-    // Write key range section (V8)
+    // Write key range section (V10) - uses logical keys for range checks
     let keyrange_offset = current_offset;
-    // Get min/max keys from memtable (BTreeMap is sorted)
-    let min_key = memtable.keys().next().map(|k| k.as_bytes()).unwrap_or(&[]);
-    let max_key = memtable
-        .keys()
-        .next_back()
-        .map(|k| k.as_bytes())
-        .unwrap_or(&[]);
+    // Get min/max logical keys from memtable (used for leveled compaction range checks)
+    let min_key = memtable.keys().next().cloned().unwrap_or_default();
+    let max_key = memtable.keys().next_back().cloned().unwrap_or_default();
     let entry_count = memtable.len() as u64;
 
     // Write min_key: [len: u32][key: bytes]
     file.write_all(&(min_key.len() as u32).to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(min_key)
+    file.write_all(min_key.as_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Write max_key: [len: u32][key: bytes]
     file.write_all(&(max_key.len() as u32).to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(max_key)
+    file.write_all(max_key.as_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Write entry_count: [count: u64] (V8)
@@ -190,37 +188,39 @@ pub fn write_timestamped_entries(
     file.write_all(&DATA_VERSION.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // Build Bloom filter from keys
+    // Build Bloom filter from logical keys (not composite keys)
     let mut bloom = BloomFilter::new(entries.len().max(1), 0.01);
     for key in entries.keys() {
-        bloom.insert(key);
+        bloom.insert(key); // Use logical key for bloom filter
     }
 
     let mut current_offset = HEADER_SIZE;
     let mut index: Vec<(String, u64)> = Vec::new();
     let mut block_buffer = Vec::with_capacity(BLOCK_SIZE);
-    let mut first_key_in_block = String::new();
+    let mut first_composite_key_in_block = String::new();
 
     // Write entries
-    for (key, (timestamp, expire_at, value_opt)) in entries {
-        if block_buffer.is_empty() {
-            first_key_in_block = key.clone();
+    for (logical_key, (timestamp, expire_at, value_opt)) in entries {
+        let mem_value = MemValue::new_with_ttl(value_opt.clone(), *expire_at);
+        let (composite_key, _bytes) =
+            write_entry(&mut block_buffer, logical_key, &mem_value, Some(*timestamp))?;
+
+        if first_composite_key_in_block.is_empty() {
+            first_composite_key_in_block = composite_key;
         }
 
-        let mem_value = MemValue::new_with_ttl(value_opt.clone(), *expire_at);
-        write_entry(&mut block_buffer, key, &mem_value, Some(*timestamp))?;
-
         if block_buffer.len() >= BLOCK_SIZE {
-            index.push((first_key_in_block.clone(), current_offset));
+            index.push((first_composite_key_in_block.clone(), current_offset));
             current_offset +=
                 write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_COMPACTION)?;
             block_buffer.clear();
+            first_composite_key_in_block.clear();
         }
     }
 
     // Write remaining block
     if !block_buffer.is_empty() {
-        index.push((first_key_in_block, current_offset));
+        index.push((first_composite_key_in_block, current_offset));
         current_offset +=
             write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_COMPACTION)?;
     }
@@ -240,27 +240,23 @@ pub fn write_timestamped_entries(
         .map_err(|e| Status::internal(e.to_string()))?;
     current_offset += 8 + bloom_len;
 
-    // Write key range section (V8)
+    // Write key range section (V10) - uses logical keys for range checks
     let keyrange_offset = current_offset;
-    // Get min/max keys from entries (BTreeMap is sorted)
-    let min_key = entries.keys().next().map(|k| k.as_bytes()).unwrap_or(&[]);
-    let max_key = entries
-        .keys()
-        .next_back()
-        .map(|k| k.as_bytes())
-        .unwrap_or(&[]);
+    // Get min/max logical keys from entries (used for leveled compaction range checks)
+    let min_key = entries.keys().next().cloned().unwrap_or_default();
+    let max_key = entries.keys().next_back().cloned().unwrap_or_default();
     let entry_count = entries.len() as u64;
 
     // Write min_key: [len: u32][key: bytes]
     file.write_all(&(min_key.len() as u32).to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(min_key)
+    file.write_all(min_key.as_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Write max_key: [len: u32][key: bytes]
     file.write_all(&(max_key.len() as u32).to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
-    file.write_all(max_key)
+    file.write_all(max_key.as_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
 
     // Write entry_count: [count: u64] (V8)
@@ -289,16 +285,20 @@ pub fn write_timestamped_entries(
 }
 
 /// Write a single entry to a writer
-/// Format: [timestamp: u64][expire_at: u64][key_len: u64][val_len: u64][key][value]
+/// Format (v10): [timestamp: u64][key_len: u64][val_len: u64][composite_key][value]
+/// where composite_key = logical_key + \x00 + expire_at (8 bytes big-endian)
 #[allow(clippy::result_large_err)]
 fn write_entry(
     writer: &mut impl Write,
-    key: &str,
+    logical_key: &str,
     mem_value: &MemValue,
     timestamp: Option<u64>,
-) -> Result<u64, Status> {
-    let key_bytes = key.as_bytes();
+) -> Result<(String, u64), Status> {
+    // Create composite key: logical_key + \x00 + expire_at
+    let composite = composite_key::encode(logical_key, mem_value.expire_at);
+    let key_bytes = composite.as_bytes();
     let key_len = key_bytes.len() as u64;
+
     let (val_len, val_bytes) = match &mem_value.value {
         Some(v) => (v.len() as u64, v.as_bytes()),
         None => (u64::MAX, &[] as &[u8]),
@@ -315,9 +315,6 @@ fn write_entry(
         .write_all(&ts.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     writer
-        .write_all(&mem_value.expire_at.to_le_bytes())
-        .map_err(|e| Status::internal(e.to_string()))?;
-    writer
         .write_all(&key_len.to_le_bytes())
         .map_err(|e| Status::internal(e.to_string()))?;
     writer
@@ -332,9 +329,9 @@ fn write_entry(
             .map_err(|e| Status::internal(e.to_string()))?;
     }
 
-    // 8 (ts) + 8 (expire_at) + 8 (key_len) + 8 (val_len) + key + value
-    let written = 8 + 8 + 8 + 8 + key_len + if val_len == u64::MAX { 0 } else { val_len };
-    Ok(written)
+    // 8 (ts) + 8 (key_len) + 8 (val_len) + composite_key + value
+    let written = 8 + 8 + 8 + key_len + if val_len == u64::MAX { 0 } else { val_len };
+    Ok((composite, written))
 }
 
 #[cfg(test)]

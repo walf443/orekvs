@@ -3,6 +3,7 @@ mod bloom;
 mod buffer_pool;
 mod common_prefix_compression_index;
 mod compaction;
+pub mod composite_key;
 mod manifest;
 mod memtable;
 mod metrics;

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 pub use reader::{read_bloom_filter, read_keys, search_key};
 
 pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
-pub const DATA_VERSION: u32 = 9; // v9: added expire_at field for TTL support
+pub const DATA_VERSION: u32 = 10; // v10: composite key format (key + \x00 + expire_at)
 
 /// Compute CRC32C checksum
 pub(crate) fn crc32(data: &[u8]) -> u32 {
