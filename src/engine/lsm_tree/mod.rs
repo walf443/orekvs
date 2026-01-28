@@ -22,12 +22,38 @@ pub use metrics::{EngineMetrics, MetricsSnapshot};
 use rayon::prelude::*;
 use sstable::MappedSSTable;
 use sstable::levels::{Level0, SortedLevel, SstableLevel};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
 use wal::GroupCommitWalWriter;
+
+/// Number of stripes for CAS lock (power of 2 for efficient modulo)
+const CAS_LOCK_STRIPES: usize = 256;
+
+/// Striped lock for CAS operations.
+/// Allows concurrent CAS operations on different keys while serializing
+/// operations on the same key (or keys that hash to the same stripe).
+struct CasLockStripe {
+    locks: Vec<Mutex<()>>,
+}
+
+impl CasLockStripe {
+    fn new(num_stripes: usize) -> Self {
+        let locks = (0..num_stripes).map(|_| Mutex::new(())).collect();
+        Self { locks }
+    }
+
+    fn get_lock(&self, key: &str) -> &Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        &self.locks[hash % self.locks.len()]
+    }
+}
 
 /// Lock to prevent SSTable deletion during snapshot transfer.
 /// Snapshot transfer holds a read lock; compaction deletion requires a write lock.
@@ -249,9 +275,9 @@ pub struct LsmTreeEngine {
     manifest: Arc<Mutex<Manifest>>,
     // Leveled compaction handler
     compaction_handler: LeveledCompaction,
-    // Lock for CAS (compare-and-set) atomicity
-    // Only CAS operations use this lock to serialize against each other
-    cas_lock: Arc<Mutex<()>>,
+    // Striped locks for CAS (compare-and-set) atomicity
+    // Allows concurrent CAS on different keys while serializing same-key operations
+    cas_locks: Arc<CasLockStripe>,
 }
 
 impl Clone for LsmTreeEngine {
@@ -276,7 +302,7 @@ impl Clone for LsmTreeEngine {
                     ..CompactionConfig::default()
                 },
             ),
-            cas_lock: Arc::clone(&self.cas_lock),
+            cas_locks: Arc::clone(&self.cas_locks),
         }
     }
 }
@@ -372,7 +398,7 @@ impl LsmTreeEngine {
             snapshot_lock: Arc::new(RwLock::new(())),
             manifest: Arc::new(Mutex::new(recovery_result.manifest)),
             compaction_handler,
-            cas_lock: Arc::new(Mutex::new(())),
+            cas_locks: Arc::new(CasLockStripe::new(CAS_LOCK_STRIPES)),
         }
     }
 
@@ -1133,8 +1159,8 @@ impl Engine for LsmTreeEngine {
         new_value: String,
         expire_at: u64,
     ) -> Result<(bool, Option<String>), Status> {
-        // Take CAS lock for atomicity (serializes CAS operations against each other)
-        let _cas_guard = self.cas_lock.lock().unwrap();
+        // Take striped CAS lock for atomicity (serializes CAS operations on the same key)
+        let _cas_guard = self.cas_locks.get_lock(&key).lock().unwrap();
 
         let now = current_timestamp();
 
