@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
 
+pub mod cli;
+
 pub mod kv {
     tonic::include_proto!("kv");
 }
