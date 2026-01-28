@@ -250,8 +250,8 @@ pub struct LsmTreeEngine {
     // Leveled compaction handler
     compaction_handler: LeveledCompaction,
     // Lock for CAS (compare-and-set) atomicity
-    // Regular writes take read lock (shared), CAS takes write lock (exclusive)
-    write_lock: Arc<RwLock<()>>,
+    // Only CAS operations use this lock to serialize against each other
+    cas_lock: Arc<Mutex<()>>,
 }
 
 impl Clone for LsmTreeEngine {
@@ -276,7 +276,7 @@ impl Clone for LsmTreeEngine {
                     ..CompactionConfig::default()
                 },
             ),
-            write_lock: Arc::clone(&self.write_lock),
+            cas_lock: Arc::clone(&self.cas_lock),
         }
     }
 }
@@ -372,7 +372,7 @@ impl LsmTreeEngine {
             snapshot_lock: Arc::new(RwLock::new(())),
             manifest: Arc::new(Mutex::new(recovery_result.manifest)),
             compaction_handler,
-            write_lock: Arc::new(RwLock::new(())),
+            cas_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1124,8 +1124,8 @@ impl Engine for LsmTreeEngine {
         new_value: String,
         expire_at: u64,
     ) -> Result<(bool, Option<String>), Status> {
-        // Take exclusive write lock for CAS atomicity
-        let _write_guard = self.write_lock.write().unwrap();
+        // Take CAS lock for atomicity (serializes CAS operations against each other)
+        let _cas_guard = self.cas_lock.lock().unwrap();
 
         let now = current_timestamp();
 
