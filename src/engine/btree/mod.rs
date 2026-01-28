@@ -26,10 +26,36 @@ use self::page_manager::PageManager;
 use self::wal::{GroupCommitWalWriter, RecordType};
 use crate::engine::wal::GroupCommitConfig;
 use crate::engine::{Engine, current_timestamp};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
+
+/// Number of stripes for CAS lock (power of 2 for efficient modulo)
+const CAS_LOCK_STRIPES: usize = 256;
+
+/// Striped lock for CAS operations.
+/// Allows concurrent CAS operations on different keys while serializing
+/// operations on the same key (or keys that hash to the same stripe).
+struct CasLockStripe {
+    locks: Vec<Mutex<()>>,
+}
+
+impl CasLockStripe {
+    fn new(num_stripes: usize) -> Self {
+        let locks = (0..num_stripes).map(|_| Mutex::new(())).collect();
+        Self { locks }
+    }
+
+    fn get_lock(&self, key: &str) -> &Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        &self.locks[hash % self.locks.len()]
+    }
+}
 
 /// B-tree storage engine configuration
 #[derive(Debug, Clone)]
@@ -87,6 +113,8 @@ pub struct BTreeEngine {
     config: BTreeConfig,
     /// Latest WAL sequence number written (for tracking during flush)
     current_wal_seq: AtomicU64,
+    /// Striped locks for CAS (compare-and-set) atomicity
+    cas_locks: Arc<CasLockStripe>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -169,6 +197,7 @@ impl BTreeEngine {
             wal,
             config,
             current_wal_seq,
+            cas_locks: Arc::new(CasLockStripe::new(CAS_LOCK_STRIPES)),
         };
 
         // Perform recovery if needed
@@ -665,20 +694,23 @@ impl Engine for BTreeEngine {
         new_value: String,
         expire_at: u64,
     ) -> Result<(bool, Option<String>), Status> {
+        // Take striped CAS lock for atomicity (serializes CAS operations on the same key)
+        let _cas_guard = self.cas_locks.get_lock(&key).lock().unwrap();
+
         let now = current_timestamp();
 
-        // Take write lock on meta for atomicity (held throughout the entire CAS operation)
-        let mut meta = self.meta.write().unwrap();
-
-        // Get current value if exists
-        let current_value = if meta.root_page_id == 0 {
-            None
-        } else {
-            let leaf_page_id = self.find_leaf(meta.root_page_id, &key, meta.tree_height)?;
-            let leaf = self.get_leaf(leaf_page_id)?;
-            match leaf.get(&key) {
-                Some(entry) if entry.is_valid(now) => entry.value.clone(),
-                _ => None,
+        // Read current value with read lock (shorter lock duration)
+        let current_value = {
+            let meta = self.meta.read().unwrap();
+            if meta.root_page_id == 0 {
+                None
+            } else {
+                let leaf_page_id = self.find_leaf(meta.root_page_id, &key, meta.tree_height)?;
+                let leaf = self.get_leaf(leaf_page_id)?;
+                match leaf.get(&key) {
+                    Some(entry) if entry.is_valid(now) => entry.value.clone(),
+                    _ => None,
+                }
             }
         };
 
@@ -694,8 +726,11 @@ impl Engine for BTreeEngine {
             return Ok((false, current_value));
         }
 
-        // Perform the update while holding the meta lock
+        // Log to WAL outside of meta lock (CAS lock ensures atomicity for this key)
         self.log_to_wal(&key, &new_value, expire_at)?;
+
+        // Take write lock only for the insert
+        let mut meta = self.meta.write().unwrap();
         self.insert_entry_with_meta(&mut meta, key, new_value, expire_at)?;
 
         Ok((true, current_value))
