@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use super::common_prefix_compression_index::IndexEntry;
+
 /// Default block cache size: 64 MB
 pub const DEFAULT_BLOCK_CACHE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -39,8 +41,8 @@ pub type ParsedBlockEntry = (String, Option<String>, u64);
 /// Cached entry types
 #[derive(Clone)]
 pub enum CacheEntry {
-    /// Decompressed and parsed index
-    Index(Arc<Vec<(String, u64)>>),
+    /// Decompressed and parsed index (composite_key, block_offset, max_expire_at)
+    Index(Arc<Vec<IndexEntry>>),
     /// Parsed block entries (sorted by key for binary search)
     ParsedBlock(Arc<Vec<ParsedBlockEntry>>),
 }
@@ -48,7 +50,8 @@ pub enum CacheEntry {
 impl CacheEntry {
     pub fn size_bytes(&self) -> usize {
         match self {
-            CacheEntry::Index(index) => index.iter().map(|(k, _)| k.len() + 8).sum::<usize>(),
+            // key.len() + block_offset(8) + max_expire_at(8)
+            CacheEntry::Index(index) => index.iter().map(|(k, _, _)| k.len() + 16).sum::<usize>(),
             CacheEntry::ParsedBlock(entries) => entries
                 .iter()
                 .map(|(k, v, _expire_at)| k.len() + v.as_ref().map_or(0, |s| s.len()) + 8)

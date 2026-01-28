@@ -3,12 +3,14 @@
 //! This module implements prefix compression for SSTable index entries.
 //! Keys are stored with common prefix elimination to reduce storage size.
 //!
-//! Format:
+//! Format (v11):
 //! - num_entries: u64
 //! - restart_interval: u32
 //! - For each entry:
-//!   - prefix_len (u16) + suffix_len (u16) + suffix + offset (u64)
+//!   - prefix_len (u16) + suffix_len (u16) + suffix + offset (u64) + max_expire_at (u64)
 //!   - Restart points (every N entries) have prefix_len = 0
+//!
+//! max_expire_at allows skipping entire blocks during compaction if all entries are expired.
 
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
@@ -25,9 +27,12 @@ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-/// Parse prefix-compressed index from decompressed data
+/// Index entry type: (composite_key, block_offset, max_expire_at)
+pub type IndexEntry = (String, u64, u64);
+
+/// Parse prefix-compressed index from decompressed data (v11 format with max_expire_at)
 #[allow(clippy::result_large_err)]
-pub fn parse_index(decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
+pub fn parse_index(decompressed: &[u8]) -> Result<Vec<IndexEntry>, Status> {
     let mut cursor = Cursor::new(decompressed);
 
     // Read header
@@ -75,20 +80,27 @@ pub fn parse_index(decompressed: &[u8]) -> Result<Vec<(String, u64)>, Status> {
             .map_err(|e| Status::internal(e.to_string()))?;
         let offset = u64::from_le_bytes(off_bytes);
 
+        // Read max_expire_at (v11)
+        let mut expire_bytes = [0u8; 8];
+        cursor
+            .read_exact(&mut expire_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let max_expire_at = u64::from_le_bytes(expire_bytes);
+
         // Convert bytes to String (composite key may contain non-UTF-8 bytes in expire_at portion)
         let key_string = composite_key::string_from_bytes(key_buf.clone());
         prev_key = key_buf;
-        index.push((key_string, offset));
+        index.push((key_string, offset, max_expire_at));
     }
 
     Ok(index)
 }
 
-/// Write index with prefix compression and checksum
+/// Write index with prefix compression and checksum (v11 format with max_expire_at)
 #[allow(clippy::result_large_err)]
 pub fn write_index(
     file: &mut File,
-    index: &[(String, u64)],
+    index: &[IndexEntry],
     compression_level: i32,
 ) -> Result<u64, Status> {
     let mut buffer = Vec::new();
@@ -103,7 +115,7 @@ pub fn write_index(
 
     let mut prev_key: &[u8] = &[];
 
-    for (i, (key, offset)) in index.iter().enumerate() {
+    for (i, (key, offset, max_expire_at)) in index.iter().enumerate() {
         let key_bytes = key.as_bytes();
 
         let prefix_len = if (i as u32).is_multiple_of(INDEX_RESTART_INTERVAL) {
@@ -125,6 +137,10 @@ pub fn write_index(
         buffer
             .write_all(&offset.to_le_bytes())
             .map_err(|e| Status::internal(e.to_string()))?;
+        // Write max_expire_at (v11)
+        buffer
+            .write_all(&max_expire_at.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         prev_key = key_bytes;
     }
@@ -145,10 +161,10 @@ pub fn write_index(
     Ok(8 + len + 4) // size + data + checksum
 }
 
-/// Read index with prefix compression and checksum verification
+/// Read index with prefix compression and checksum verification (v11 format)
 #[allow(dead_code)]
 #[allow(clippy::result_large_err)]
-pub fn read_index(file: &mut File, index_offset: u64) -> Result<Vec<(String, u64)>, Status> {
+pub fn read_index(file: &mut File, index_offset: u64) -> Result<Vec<IndexEntry>, Status> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(index_offset))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -157,6 +173,15 @@ pub fn read_index(file: &mut File, index_offset: u64) -> Result<Vec<(String, u64
     file.read_exact(&mut len_bytes)
         .map_err(|e| Status::internal(e.to_string()))?;
     let len = u64::from_le_bytes(len_bytes);
+
+    // Sanity check: index should not be larger than 1GB
+    const MAX_INDEX_SIZE: u64 = 1024 * 1024 * 1024;
+    if len > MAX_INDEX_SIZE {
+        return Err(Status::data_loss(format!(
+            "Index size {} exceeds maximum allowed size {}",
+            len, MAX_INDEX_SIZE
+        )));
+    }
 
     let mut compressed = vec![0u8; len as usize];
     file.read_exact(&mut compressed)
@@ -207,9 +232,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let index_path = dir.path().join("index_test.data");
 
-        // Create index with keys that have common prefixes
-        let index: Vec<(String, u64)> = (0..50)
-            .map(|i| (format!("user:profile:{:05}", i), i * 100))
+        // Create index with keys that have common prefixes (v11 format with max_expire_at)
+        let index: Vec<IndexEntry> = (0..50)
+            .map(|i| (format!("user:profile:{:05}", i), i * 100, 1000 + i))
             .collect();
 
         // Write index with prefix compression
@@ -229,6 +254,7 @@ mod tests {
         for (original, read) in index.iter().zip(read_index.iter()) {
             assert_eq!(original.0, read.0, "Key mismatch");
             assert_eq!(original.1, read.1, "Offset mismatch");
+            assert_eq!(original.2, read.2, "max_expire_at mismatch");
         }
     }
 
@@ -239,8 +265,9 @@ mod tests {
 
         // Create index with 20 entries (more than restart interval of 16)
         // to verify restart points work correctly
-        let index: Vec<(String, u64)> =
-            (0..20).map(|i| (format!("key:{:03}", i), i * 50)).collect();
+        let index: Vec<IndexEntry> = (0..20)
+            .map(|i| (format!("key:{:03}", i), i * 50, 0))
+            .collect();
 
         {
             let mut file = File::create(&index_path).unwrap();
@@ -264,11 +291,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let index_path = dir.path().join("no_prefix_test.data");
 
-        // Keys with no common prefix
-        let index: Vec<(String, u64)> = vec![
-            ("apple".to_string(), 100),
-            ("banana".to_string(), 200),
-            ("cherry".to_string(), 300),
+        // Keys with no common prefix (with max_expire_at)
+        let index: Vec<IndexEntry> = vec![
+            ("apple".to_string(), 100, 500),
+            ("banana".to_string(), 200, 600),
+            ("cherry".to_string(), 300, 0), // no TTL
         ];
 
         {
@@ -289,7 +316,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let index_path = dir.path().join("empty_index_test.data");
 
-        let index: Vec<(String, u64)> = vec![];
+        let index: Vec<IndexEntry> = vec![];
 
         {
             let mut file = File::create(&index_path).unwrap();

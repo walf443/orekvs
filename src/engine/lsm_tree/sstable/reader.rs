@@ -15,7 +15,7 @@ use crate::engine::lsm_tree::block_cache::{
 };
 use crate::engine::lsm_tree::bloom::BloomFilter;
 use crate::engine::lsm_tree::buffer_pool::PooledBuffer;
-use crate::engine::lsm_tree::common_prefix_compression_index as prefix_index;
+use crate::engine::lsm_tree::common_prefix_compression_index::{self as prefix_index, IndexEntry};
 use crate::engine::lsm_tree::mmap::MappedFile;
 
 use super::{DATA_VERSION, FOOTER_MAGIC, FOOTER_SIZE, HEADER_SIZE, MAGIC_BYTES, crc32};
@@ -27,14 +27,14 @@ pub type TimestampedEntry = (u64, u64, Option<String>);
 
 /// Find the block offset for a key using binary search in the index.
 ///
-/// The index contains (composite_key, block_offset) pairs sorted by key.
+/// The index contains (composite_key, block_offset, max_expire_at) entries sorted by key.
 /// Composite key format: logical_key + \x00 + expire_at
 /// This function finds the block that might contain the given logical key:
 /// - If the logical key matches an index entry's logical key, returns that block's offset
 /// - Otherwise, returns the offset of the previous block (which could contain the key)
-fn find_block_offset(index: &[(String, u64)], logical_key: &str) -> u64 {
+fn find_block_offset(index: &[IndexEntry], logical_key: &str) -> u64 {
     // Compare by logical key extracted from composite key
-    match index.binary_search_by(|(composite, _)| {
+    match index.binary_search_by(|(composite, _, _)| {
         let idx_logical = composite_key::logical_key(composite).unwrap_or(composite);
         idx_logical.cmp(logical_key)
     }) {
@@ -69,7 +69,8 @@ pub struct MappedSSTable {
     /// Number of entries in this SSTable (used for approximate count/rank)
     entry_count: u64,
     /// Cached decompressed index (lazy loaded on first access)
-    cached_index: OnceLock<Vec<(String, u64)>>,
+    /// Each entry is (composite_key, block_offset, max_expire_at)
+    cached_index: OnceLock<Vec<IndexEntry>>,
 }
 
 impl MappedSSTable {
@@ -214,7 +215,7 @@ impl MappedSSTable {
     /// for subsequent lookups. This avoids repeated decompression overhead.
     #[cfg(test)]
     #[allow(clippy::result_large_err)]
-    pub fn read_index(&self) -> Result<&[(String, u64)], Status> {
+    pub fn read_index(&self) -> Result<&[IndexEntry], Status> {
         // Fast path: already cached
         if let Some(cached) = self.cached_index.get() {
             return Ok(cached.as_slice());
@@ -232,7 +233,7 @@ impl MappedSSTable {
     ///
     /// Use this when you need ownership of the index data.
     #[allow(clippy::result_large_err)]
-    pub fn read_index_owned(&self) -> Result<Vec<(String, u64)>, Status> {
+    pub fn read_index_owned(&self) -> Result<Vec<IndexEntry>, Status> {
         // If already cached, clone from cache
         if let Some(cached) = self.cached_index.get() {
             return Ok(cached.clone());
@@ -245,7 +246,7 @@ impl MappedSSTable {
 
     /// Internal: decompress and parse index from disk
     #[allow(clippy::result_large_err)]
-    fn decompress_index(&self) -> Result<Vec<(String, u64)>, Status> {
+    fn decompress_index(&self) -> Result<Vec<IndexEntry>, Status> {
         let offset = self.index_offset as usize;
 
         // Read compressed size
@@ -405,10 +406,11 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
         .map_err(|e| Status::internal(e.to_string()))?;
     let index_offset = u64::from_le_bytes(footer);
 
-    // Read index (v5+ uses prefix compression)
+    // Read index (v11 uses prefix compression with max_expire_at)
     let index = prefix_index::read_index(&mut file, index_offset)?;
 
     // Binary search in index to find the block that might contain the key
+    // Convert IndexEntry to (String, u64) for find_block_offset
     let start_offset = find_block_offset(&index, key);
 
     file.seek(SeekFrom::Start(start_offset))
@@ -552,7 +554,7 @@ fn get_or_load_index_mmap(
     sst: &MappedSSTable,
     canonical_path: &Path,
     cache: &BlockCache,
-) -> Result<Arc<Vec<(String, u64)>>, Status> {
+) -> Result<Arc<Vec<IndexEntry>>, Status> {
     let cache_key = BlockCacheKey::for_index(canonical_path.to_path_buf());
 
     // Check cache first
@@ -818,14 +820,170 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
 
 /// Read entries from an SSTable file for compaction, skipping expired entries.
 ///
-/// This function uses composite keys to check expiration before reading values,
-/// saving memory and I/O for expired entries that will be discarded anyway.
+/// This function uses two levels of optimization:
+/// 1. Block-level: skips entire blocks where all entries are expired (max_expire_at <= now)
+/// 2. Entry-level: within non-skipped blocks, skips individual expired entries
+///
+/// The block-level optimization avoids expensive zstd decompression for fully expired blocks.
 #[allow(clippy::result_large_err)]
 pub fn read_entries_for_compaction(
     path: &Path,
     now: u64,
 ) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
-    read_entries_internal(path, Some(now))
+    read_entries_with_block_skip(path, now)
+}
+
+/// Internal implementation that uses index-based block skipping for compaction.
+#[allow(clippy::result_large_err)]
+fn read_entries_with_block_skip(
+    path: &Path,
+    now: u64,
+) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeMap::new());
+        }
+        Err(e) => return Err(Status::internal(e.to_string())),
+    };
+
+    // Read and validate header
+    let mut magic = [0u8; 6];
+    if file.read_exact(&mut magic).is_err() || &magic != MAGIC_BYTES {
+        return Err(Status::internal("Invalid SSTable magic"));
+    }
+
+    let mut ver_bytes = [0u8; 4];
+    file.read_exact(&mut ver_bytes)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let version = u32::from_le_bytes(ver_bytes);
+
+    if version != DATA_VERSION {
+        return Err(Status::internal(format!(
+            "Unsupported SSTable version: {}. Only version {} is supported.",
+            version, DATA_VERSION
+        )));
+    }
+
+    let file_len = file
+        .metadata()
+        .map_err(|e| Status::internal(e.to_string()))?
+        .len();
+
+    if file_len < HEADER_SIZE + FOOTER_SIZE {
+        return Ok(BTreeMap::new());
+    }
+
+    // Read footer to get index offset
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut footer = [0u8; 8];
+    file.read_exact(&mut footer)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let index_offset = u64::from_le_bytes(footer);
+
+    // Read index to get block information (includes max_expire_at per block)
+    let index = prefix_index::read_index(&mut file, index_offset)?;
+
+    let mut entries = BTreeMap::new();
+
+    // Process each block using index information
+    for (_composite_key, block_offset, max_expire_at) in &index {
+        // Block-level optimization: skip entire block if all entries are expired
+        // max_expire_at > 0 means at least one entry has TTL
+        // max_expire_at <= now means all entries with TTL are expired
+        // Note: if max_expire_at == 0, the block has no TTL entries, so we must process it
+        if *max_expire_at > 0 && now > *max_expire_at {
+            continue;
+        }
+
+        // Read this block
+        file.seek(SeekFrom::Start(*block_offset))
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut len_bytes = [0u8; 4];
+        file.read_exact(&mut len_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let len = u32::from_le_bytes(len_bytes);
+
+        let mut compressed_block = PooledBuffer::new_zeroed(len as usize);
+        file.read_exact(&mut compressed_block)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Verify checksum
+        let mut checksum_bytes = [0u8; 4];
+        file.read_exact(&mut checksum_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let stored_checksum = u32::from_le_bytes(checksum_bytes);
+        let computed_checksum = crc32(&compressed_block);
+        if stored_checksum != computed_checksum {
+            return Err(Status::data_loss(format!(
+                "Block checksum mismatch: expected {:08x}, got {:08x}",
+                stored_checksum, computed_checksum
+            )));
+        }
+
+        // Decompress block
+        let decompressed = zstd::decode_all(Cursor::new(&compressed_block))
+            .map_err(|e| Status::internal(format!("Block decompression error: {}", e)))?;
+
+        // Parse entries from decompressed block
+        let mut cursor = Cursor::new(decompressed);
+        loop {
+            if cursor.position() == cursor.get_ref().len() as u64 {
+                break;
+            }
+
+            let mut ts_bytes = [0u8; 8];
+            if cursor.read_exact(&mut ts_bytes).is_err() {
+                break;
+            }
+            let timestamp = u64::from_le_bytes(ts_bytes);
+
+            let mut klen_bytes = [0u8; 8];
+            cursor
+                .read_exact(&mut klen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let mut vlen_bytes = [0u8; 8];
+            cursor
+                .read_exact(&mut vlen_bytes)
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            let key_len = u64::from_le_bytes(klen_bytes);
+            let val_len = u64::from_le_bytes(vlen_bytes);
+
+            let mut key_buf = vec![0u8; key_len as usize];
+            cursor
+                .read_exact(&mut key_buf)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let (key, expire_at) = composite_key::decode_from_bytes(&key_buf)
+                .ok_or_else(|| Status::internal("Invalid composite key format"))?;
+
+            // Entry-level optimization: skip individual expired entries
+            if expire_at > 0 && now > expire_at {
+                if val_len != u64::MAX {
+                    cursor
+                        .seek(SeekFrom::Current(val_len as i64))
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                continue;
+            }
+
+            let value = if val_len == u64::MAX {
+                None
+            } else {
+                let mut val_buf = vec![0u8; val_len as usize];
+                cursor
+                    .read_exact(&mut val_buf)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Some(String::from_utf8_lossy(&val_buf).to_string())
+            };
+
+            entries.insert(key, (timestamp, expire_at, value));
+        }
+    }
+
+    Ok(entries)
 }
 
 /// Internal implementation for reading entries with optional expiration filtering.

@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
 use crate::engine::lsm_tree::bloom::BloomFilter;
-use crate::engine::lsm_tree::common_prefix_compression_index as prefix_index;
+use crate::engine::lsm_tree::common_prefix_compression_index::{self as prefix_index, IndexEntry};
 use crate::engine::lsm_tree::composite_key;
 use crate::engine::lsm_tree::memtable::{MemTable, MemValue};
 
@@ -78,9 +78,11 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
     }
 
     let mut current_offset = HEADER_SIZE;
-    let mut index: Vec<(String, u64)> = Vec::new();
+    let mut index: Vec<IndexEntry> = Vec::new();
     let mut block_buffer = Vec::with_capacity(BLOCK_SIZE);
     let mut first_composite_key_in_block = String::new();
+    let mut block_max_expire_at: u64 = 0;
+    let mut block_has_no_ttl = false; // True if block contains entry with no TTL
 
     // Write entries
     for (logical_key, mem_value) in memtable.iter() {
@@ -90,18 +92,47 @@ pub fn create_from_memtable(path: &Path, memtable: &MemTable) -> Result<BloomFil
             first_composite_key_in_block = composite_key;
         }
 
+        // Track max expire_at for this block
+        // expire_at = 0 means no TTL (never expires), so block cannot be skipped
+        if mem_value.expire_at == 0 {
+            block_has_no_ttl = true;
+        } else if mem_value.expire_at > block_max_expire_at {
+            block_max_expire_at = mem_value.expire_at;
+        }
+
         if block_buffer.len() >= BLOCK_SIZE {
-            index.push((first_composite_key_in_block.clone(), current_offset));
+            // If block has any no-TTL entry, set max_expire_at to 0 (cannot skip)
+            let stored_max_expire_at = if block_has_no_ttl {
+                0
+            } else {
+                block_max_expire_at
+            };
+            index.push((
+                first_composite_key_in_block.clone(),
+                current_offset,
+                stored_max_expire_at,
+            ));
             current_offset +=
                 write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_FLUSH)?;
             block_buffer.clear();
             first_composite_key_in_block.clear();
+            block_max_expire_at = 0;
+            block_has_no_ttl = false;
         }
     }
 
     // Write remaining block
     if !block_buffer.is_empty() {
-        index.push((first_composite_key_in_block, current_offset));
+        let stored_max_expire_at = if block_has_no_ttl {
+            0
+        } else {
+            block_max_expire_at
+        };
+        index.push((
+            first_composite_key_in_block,
+            current_offset,
+            stored_max_expire_at,
+        ));
         current_offset +=
             write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_FLUSH)?;
     }
@@ -195,9 +226,11 @@ pub fn write_timestamped_entries(
     }
 
     let mut current_offset = HEADER_SIZE;
-    let mut index: Vec<(String, u64)> = Vec::new();
+    let mut index: Vec<IndexEntry> = Vec::new();
     let mut block_buffer = Vec::with_capacity(BLOCK_SIZE);
     let mut first_composite_key_in_block = String::new();
+    let mut block_max_expire_at: u64 = 0;
+    let mut block_has_no_ttl = false; // True if block contains entry with no TTL
 
     // Write entries
     for (logical_key, (timestamp, expire_at, value_opt)) in entries {
@@ -209,18 +242,47 @@ pub fn write_timestamped_entries(
             first_composite_key_in_block = composite_key;
         }
 
+        // Track max expire_at for this block
+        // expire_at = 0 means no TTL (never expires), so block cannot be skipped
+        if *expire_at == 0 {
+            block_has_no_ttl = true;
+        } else if *expire_at > block_max_expire_at {
+            block_max_expire_at = *expire_at;
+        }
+
         if block_buffer.len() >= BLOCK_SIZE {
-            index.push((first_composite_key_in_block.clone(), current_offset));
+            // If block has any no-TTL entry, set max_expire_at to 0 (cannot skip)
+            let stored_max_expire_at = if block_has_no_ttl {
+                0
+            } else {
+                block_max_expire_at
+            };
+            index.push((
+                first_composite_key_in_block.clone(),
+                current_offset,
+                stored_max_expire_at,
+            ));
             current_offset +=
                 write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_COMPACTION)?;
             block_buffer.clear();
             first_composite_key_in_block.clear();
+            block_max_expire_at = 0;
+            block_has_no_ttl = false;
         }
     }
 
     // Write remaining block
     if !block_buffer.is_empty() {
-        index.push((first_composite_key_in_block, current_offset));
+        let stored_max_expire_at = if block_has_no_ttl {
+            0
+        } else {
+            block_max_expire_at
+        };
+        index.push((
+            first_composite_key_in_block,
+            current_offset,
+            stored_max_expire_at,
+        ));
         current_offset +=
             write_compressed_block(&mut file, &block_buffer, COMPRESSION_LEVEL_COMPACTION)?;
     }
@@ -337,7 +399,7 @@ fn write_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::lsm_tree::sstable::reader::read_entries;
+    use crate::engine::lsm_tree::sstable::reader::{read_entries, read_entries_for_compaction};
     use tempfile::tempdir;
 
     #[test]
@@ -358,5 +420,57 @@ mod tests {
             &(100, 0, Some("v1".to_string()))
         );
         assert_eq!(read_back.get("k2").unwrap(), &(200, 0, None));
+    }
+
+    /// Test that blocks with mixed TTL and no-TTL entries are not skipped during compaction
+    #[test]
+    fn test_mixed_ttl_block_not_skipped() {
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_mixed_ttl.data");
+
+        let now = 1000u64;
+
+        // Create entries with mixed TTL: some expired, some no-TTL
+        let mut entries = BTreeMap::new();
+        // Expired entry (TTL)
+        entries.insert(
+            "key1".to_string(),
+            (100, now - 100, Some("expired".to_string())),
+        );
+        // No-TTL entry (should never be skipped)
+        entries.insert(
+            "key2".to_string(),
+            (100, 0, Some("no_ttl_value".to_string())),
+        );
+        // Another expired entry
+        entries.insert(
+            "key3".to_string(),
+            (100, now - 50, Some("also_expired".to_string())),
+        );
+
+        write_timestamped_entries(&sst_path, &entries).unwrap();
+
+        // Read with compaction optimization
+        let read_back = read_entries_for_compaction(&sst_path, now).unwrap();
+
+        // The no-TTL entry MUST be present (block should not be skipped)
+        assert!(
+            read_back.contains_key("key2"),
+            "No-TTL entry should not be skipped even if other entries in block are expired"
+        );
+        assert_eq!(
+            read_back.get("key2").unwrap().2,
+            Some("no_ttl_value".to_string())
+        );
+
+        // Expired entries should be skipped
+        assert!(
+            !read_back.contains_key("key1"),
+            "Expired entry should be skipped"
+        );
+        assert!(
+            !read_back.contains_key("key3"),
+            "Expired entry should be skipped"
+        );
     }
 }
