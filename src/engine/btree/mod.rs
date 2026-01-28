@@ -275,21 +275,38 @@ impl BTreeEngine {
         log_wal: bool,
     ) -> Result<(), Status> {
         // Log to WAL first (with TTL)
-        if log_wal && let Some(wal) = &self.wal {
-            let seq = wal
-                .log_insert_with_ttl(&key, &value, expire_at)
-                .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
-            // Track the latest WAL sequence number
-            self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
+        if log_wal {
+            self.log_to_wal(&key, &value, expire_at)?;
         }
 
+        let mut meta = self.meta.write().unwrap();
+        self.insert_entry_with_meta(&mut meta, key, value, expire_at)
+    }
+
+    /// Log entry to WAL
+    fn log_to_wal(&self, key: &str, value: &str, expire_at: u64) -> Result<(), Status> {
+        if let Some(wal) = &self.wal {
+            let seq = wal
+                .log_insert_with_ttl(key, value, expire_at)
+                .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
+            self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Insert entry into BTree with an already-acquired meta lock
+    fn insert_entry_with_meta(
+        &self,
+        meta: &mut MetaPage,
+        key: String,
+        value: String,
+        expire_at: u64,
+    ) -> Result<(), Status> {
         let entry = if expire_at > 0 {
             LeafEntry::new_with_ttl(key, value, expire_at)
         } else {
             LeafEntry::new(key, value)
         };
-
-        let mut meta = self.meta.write().unwrap();
 
         if meta.root_page_id == 0 {
             // Empty tree - create root leaf
@@ -678,52 +695,8 @@ impl Engine for BTreeEngine {
         }
 
         // Perform the update while holding the meta lock
-        // Log to WAL first
-        if let Some(wal) = &self.wal {
-            let seq = wal
-                .log_insert_with_ttl(&key, &new_value, expire_at)
-                .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
-            self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
-        }
-
-        let entry = if expire_at > 0 {
-            LeafEntry::new_with_ttl(key, new_value, expire_at)
-        } else {
-            LeafEntry::new(key, new_value)
-        };
-
-        if meta.root_page_id == 0 {
-            // Empty tree - create root leaf
-            let (page_id, mut leaf) = self
-                .buffer_pool
-                .new_leaf()
-                .map_err(|e| Status::internal(format!("Failed to create leaf: {}", e)))?;
-            leaf.insert(entry);
-            self.buffer_pool
-                .put(page_id, CachedNode::Leaf(leaf))
-                .map_err(|e| Status::internal(format!("Failed to cache leaf: {}", e)))?;
-            meta.root_page_id = page_id;
-            meta.tree_height = 1;
-            meta.entry_count = 1;
-            meta.page_count = self.buffer_pool.page_count();
-            return Ok((true, current_value));
-        }
-
-        // Traverse to leaf and insert
-        let insert_result = self.insert_recursive(meta.root_page_id, entry, meta.tree_height)?;
-
-        if let Some((split_key, right_page_id)) = insert_result {
-            // Root split - create new root
-            let (new_root_id, _) = self
-                .buffer_pool
-                .new_internal(meta.root_page_id, split_key, right_page_id)
-                .map_err(|e| Status::internal(format!("Failed to create root: {}", e)))?;
-            meta.root_page_id = new_root_id;
-            meta.tree_height += 1;
-        }
-
-        meta.entry_count += 1;
-        meta.page_count = self.buffer_pool.page_count();
+        self.log_to_wal(&key, &new_value, expire_at)?;
+        self.insert_entry_with_meta(&mut meta, key, new_value, expire_at)?;
 
         Ok((true, current_value))
     }

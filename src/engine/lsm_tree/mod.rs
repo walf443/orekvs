@@ -823,16 +823,25 @@ impl LsmTreeEngine {
     #[allow(clippy::result_large_err)]
     fn set_internal(&self, key: String, value: String, expire_at: u64) -> Result<(), Status> {
         self.metrics.record_set();
+        self.write_entry(key, Some(value), expire_at)
+    }
 
-        // 0. Wait if too many immutable memtables are pending (write stall prevention)
+    /// Common write logic for SET and CAS operations
+    /// Writes to WAL, updates MemTable, and waits for durability
+    #[allow(clippy::result_large_err)]
+    fn write_entry(
+        &self,
+        key: String,
+        value: Option<String>,
+        expire_at: u64,
+    ) -> Result<(), Status> {
+        // Wait if too many immutable memtables are pending (write stall prevention)
         self.mem_state.wait_if_stalled();
-
-        let value_opt = Some(value);
 
         // 1. Start writing to WAL
         let wal = self.wal.clone();
         let key_clone = key.clone();
-        let val_clone = value_opt.clone();
+        let val_clone = value.clone();
         let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(wal.append_pipelined_with_ttl(&key_clone, &val_clone, expire_at))
@@ -844,7 +853,7 @@ impl LsmTreeEngine {
 
         // 3. Update MemTable immediately (it becomes visible to Get)
         self.mem_state
-            .insert(key, MemValue::new_with_ttl(value_opt, expire_at));
+            .insert(key, MemValue::new_with_ttl(value, expire_at));
         self.trigger_flush_if_needed();
 
         // 4. Finally wait for disk sync for durability
@@ -1188,37 +1197,9 @@ impl Engine for LsmTreeEngine {
             return Ok((false, current_value));
         }
 
-        // Perform the update (still holding the write lock)
+        // Perform the update (still holding the CAS lock)
         self.metrics.record_set();
-        self.mem_state.wait_if_stalled();
-
-        let value_opt = Some(new_value);
-
-        // Write to WAL
-        let wal = self.wal.clone();
-        let key_clone = key.clone();
-        let val_clone = value_opt.clone();
-        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(wal.append_pipelined_with_ttl(&key_clone, &val_clone, expire_at))
-        })?;
-
-        // Wait for WAL to be written to OS buffer
-        let _ =
-            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
-
-        // Update MemTable
-        self.mem_state
-            .insert(key, MemValue::new_with_ttl(value_opt, expire_at));
-        self.trigger_flush_if_needed();
-
-        // Wait for disk sync
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(synced_rx)
-                .map_err(|_| Status::internal("WAL synced channel closed"))?
-                .map(|_seq| ())
-        })?;
+        self.write_entry(key, Some(new_value), expire_at)?;
 
         Ok((true, current_value))
     }

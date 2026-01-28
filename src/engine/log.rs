@@ -341,13 +341,73 @@ impl LogEngine {
 }
 
 impl LogEngine {
+    /// Write entry to file and update index with already-acquired locks
+    /// Returns the current file length for compaction check
     #[allow(clippy::result_large_err)]
-    fn set_internal(&self, key: String, value: String, expire_at: u64) -> Result<(), Status> {
+    fn write_entry_with_locks(
+        &self,
+        writer: &mut File,
+        index: &mut HashMap<String, IndexEntry>,
+        key: String,
+        value: String,
+        expire_at: u64,
+    ) -> Result<u64, Status> {
         let key_bytes = key.as_bytes();
         let val_bytes = value.as_bytes();
-
         let key_len = key_bytes.len() as u64;
         let val_len = val_bytes.len() as u64;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Get current offset (end of file)
+        let start_offset = writer
+            .seek(SeekFrom::End(0))
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Write Format: [timestamp(8)][expire_at(8)][key_len(8)][val_len(8)][key][value]
+        writer
+            .write_all(&timestamp.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&expire_at.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&key_len.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&val_len.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(key_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(val_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .sync_data()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Calculate where the value starts:
+        // timestamp(8) + expire_at(8) + key_len(8) + val_len(8) + key
+        let value_offset = start_offset + 8 + 8 + 8 + 8 + key_len;
+
+        // Update in-memory index
+        index.insert(key, (value_offset, val_len as usize, expire_at));
+
+        // Return file length for compaction check
+        writer
+            .metadata()
+            .map_err(|e| Status::internal(e.to_string()))
+            .map(|m| m.len())
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn set_internal(&self, key: String, value: String, expire_at: u64) -> Result<(), Status> {
+        let key_len = key.len() as u64;
+        let val_len = value.len() as u64;
 
         // Entry size = timestamp(8) + expire_at(8) + key_len_size(8) + val_len_size(8) + key + value
         let entry_size = 8 + 8 + 8 + 8 + key_len + val_len;
@@ -358,56 +418,13 @@ impl LogEngine {
             )));
         }
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
         // Scope for locks
         let should_compact = {
             let mut writer = self.writer.lock().unwrap();
-
-            // Get current offset (end of file)
-            let start_offset = writer
-                .seek(SeekFrom::End(0))
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Write Format: [timestamp(8)][expire_at(8)][key_len(8)][val_len(8)][key][value]
-            writer
-                .write_all(&timestamp.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            writer
-                .write_all(&expire_at.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            writer
-                .write_all(&key_len.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            writer
-                .write_all(&val_len.to_le_bytes())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            writer
-                .write_all(key_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            writer
-                .write_all(val_bytes)
-                .map_err(|e| Status::internal(e.to_string()))?;
-            writer
-                .sync_data()
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Calculate where the value starts:
-            // timestamp(8) + expire_at(8) + key_len(8) + val_len(8) + key
-            let value_offset = start_offset + 8 + 8 + 8 + 8 + key_len;
-
-            // Update in-memory index
             let mut index = self.index.lock().unwrap();
-            index.insert(key, (value_offset, val_len as usize, expire_at));
-
-            writer
-                .metadata()
-                .map_err(|e| Status::internal(e.to_string()))?
-                .len()
-                > self.log_capacity_bytes
+            let file_len =
+                self.write_entry_with_locks(&mut writer, &mut index, key, value, expire_at)?;
+            file_len > self.log_capacity_bytes
         };
 
         #[allow(clippy::collapsible_if)]
@@ -595,44 +612,7 @@ impl Engine for LogEngine {
         }
 
         // Perform the update
-        let key_bytes = key.as_bytes();
-        let val_bytes = new_value.as_bytes();
-        let key_len = key_bytes.len() as u64;
-        let val_len = val_bytes.len() as u64;
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let start_offset = writer
-            .seek(SeekFrom::End(0))
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        writer
-            .write_all(&timestamp.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&expire_at.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&key_len.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(&val_len.to_le_bytes())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(key_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .write_all(val_bytes)
-            .map_err(|e| Status::internal(e.to_string()))?;
-        writer
-            .sync_data()
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let value_offset = start_offset + 8 + 8 + 8 + 8 + key_len;
-        index.insert(key, (value_offset, val_len as usize, expire_at));
+        self.write_entry_with_locks(&mut writer, &mut index, key, new_value, expire_at)?;
 
         Ok((true, current_value))
     }
