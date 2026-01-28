@@ -348,6 +348,25 @@ impl LsmTreeEngine {
         wal_batch_interval_micros: u64,
         wal_archive_config: WalArchiveConfig,
     ) -> Self {
+        Self::new_with_full_config(
+            data_dir_str,
+            memtable_capacity_bytes,
+            compaction_trigger_file_count,
+            wal_batch_interval_micros,
+            wal_archive_config,
+            true, // enable_stale_compaction
+        )
+    }
+
+    /// Create a new LSM-Tree engine with full configuration options
+    pub fn new_with_full_config(
+        data_dir_str: String,
+        memtable_capacity_bytes: u64,
+        compaction_trigger_file_count: usize,
+        wal_batch_interval_micros: u64,
+        wal_archive_config: WalArchiveConfig,
+        enable_stale_compaction: bool,
+    ) -> Self {
         let data_dir = PathBuf::from(&data_dir_str);
 
         if !data_dir.exists() {
@@ -406,7 +425,7 @@ impl LsmTreeEngine {
         };
         let compaction_handler = LeveledCompaction::new(data_dir.clone(), compaction_config);
 
-        LsmTreeEngine {
+        let engine = LsmTreeEngine {
             mem_state,
             leveled_sstables: Arc::new(Mutex::new(recovery_result.leveled_sstables)),
             data_dir,
@@ -421,7 +440,14 @@ impl LsmTreeEngine {
             manifest: Arc::new(Mutex::new(recovery_result.manifest)),
             compaction_handler,
             cas_locks: Arc::new(CasLockStripe::new(CAS_LOCK_STRIPES)),
+        };
+
+        // Trigger background compaction for stale SSTables (non-blocking)
+        if enable_stale_compaction {
+            engine.trigger_stale_compaction();
         }
+
+        engine
     }
 
     // Check if MemTable needs to be flushed and trigger if necessary
@@ -568,6 +594,114 @@ impl LsmTreeEngine {
     /// Shutdown the engine gracefully, flushing all pending WAL writes
     pub async fn shutdown(&self) {
         self.wal.shutdown().await;
+    }
+
+    /// Check if there are stale SSTables that need compaction.
+    /// A SSTable is considered stale if its WAL ID is significantly older than the current WAL ID.
+    /// Returns the count of stale SSTables.
+    fn count_stale_sstables(&self, current_wal_id: u64, threshold: u64) -> usize {
+        let leveled = self.leveled_sstables.lock().unwrap();
+        let mut stale_count = 0;
+
+        for level in 0..leveled.level_count() {
+            for handle in leveled.get_level(level) {
+                if let Some(wal_id) = sstable::extract_wal_id_from_sstable(handle.mmap.path())
+                    && current_wal_id > wal_id
+                    && current_wal_id - wal_id >= threshold
+                {
+                    stale_count += 1;
+                }
+            }
+        }
+
+        stale_count
+    }
+
+    /// Trigger compaction for stale SSTables asynchronously.
+    /// This runs in the background and doesn't block startup.
+    fn trigger_stale_compaction(&self) {
+        let current_wal_id = self.wal.current_id();
+
+        // Only check for stale files if WAL ID is high enough
+        // This prevents unnecessary compaction on fresh/test setups
+        const MIN_WAL_ID_FOR_STALE_CHECK: u64 = 3;
+        if current_wal_id < MIN_WAL_ID_FOR_STALE_CHECK {
+            return;
+        }
+
+        // Consider SSTables stale if their WAL ID is at least 2 behind current
+        const STALE_THRESHOLD: u64 = 2;
+
+        let stale_count = self.count_stale_sstables(current_wal_id, STALE_THRESHOLD);
+
+        if stale_count == 0 {
+            return;
+        }
+
+        println!(
+            "Found {} stale SSTables (WAL ID < {}), triggering background compaction",
+            stale_count,
+            current_wal_id.saturating_sub(STALE_THRESHOLD)
+        );
+
+        let engine_clone = self.clone();
+        tokio::spawn(async move {
+            engine_clone.compact_all_levels().await;
+        });
+    }
+
+    /// Compact all levels sequentially, starting from L0.
+    /// This is used to clean up stale SSTables after recovery.
+    async fn compact_all_levels(&self) {
+        // Wait a bit before starting to allow the engine to fully initialize
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let level_count = {
+            let leveled = self.leveled_sstables.lock().unwrap();
+            leveled.level_count()
+        };
+
+        for level in 0..level_count {
+            // Check if compaction is already in progress
+            let is_in_progress = {
+                let in_progress = self.compaction_in_progress.lock().unwrap();
+                *in_progress
+            };
+
+            if is_in_progress {
+                // Wait for ongoing compaction to finish
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                continue;
+            }
+
+            // Check if this level has files to compact
+            let has_files = {
+                let leveled = self.leveled_sstables.lock().unwrap();
+                !leveled.get_level(level).is_empty()
+            };
+
+            if has_files {
+                let should_run = {
+                    let mut in_progress = self.compaction_in_progress.lock().unwrap();
+                    if !*in_progress {
+                        *in_progress = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if should_run {
+                    if let Err(e) = self.run_compaction_for_level(level).await {
+                        eprintln!("Stale compaction failed for level {}: {}", level, e);
+                    }
+
+                    *self.compaction_in_progress.lock().unwrap() = false;
+                }
+            }
+        }
+
+        println!("Background stale SSTable compaction finished");
     }
 
     /// Archive old WAL files based on LSN, retention period and size limits.

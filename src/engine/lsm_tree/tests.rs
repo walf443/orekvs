@@ -1112,13 +1112,27 @@ async fn test_leveled_sstables_get_overlapping() {
 /// Only entries with seq > last_flushed_wal_seq should be recovered
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lsn_based_incremental_recovery() {
+    use super::WalArchiveConfig;
+
     let dir = tempdir().unwrap();
     let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Helper to create engine without stale compaction (to avoid race conditions in tests)
+    let create_engine = |capacity: u64| {
+        LsmTreeEngine::new_with_full_config(
+            data_dir.clone(),
+            capacity,
+            100,
+            100,
+            WalArchiveConfig::default(),
+            false, // disable stale compaction for this test
+        )
+    };
 
     // Phase 1: Write some data and flush to SSTable
     // This will update manifest.last_flushed_wal_seq
     {
-        let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+        let engine = create_engine(30);
 
         // k1 and k2 will be flushed to SSTable
         engine.set("k1".to_string(), "v1".to_string()).unwrap();
@@ -1144,7 +1158,7 @@ async fn test_lsn_based_incremental_recovery() {
 
     // Phase 2: Write more data WITHOUT flushing (only in WAL)
     {
-        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+        let engine = create_engine(1024 * 1024);
 
         // k1 and k2 are already persisted in SSTables
         assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
@@ -1170,7 +1184,7 @@ async fn test_lsn_based_incremental_recovery() {
     // Only k3, k4, and updated k1 should be recovered from WAL
     // k1's old value and k2 should come from SSTable (not replayed from WAL)
     {
-        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+        let engine = create_engine(1024 * 1024);
 
         // k1 should have the updated value from WAL
         assert_eq!(
