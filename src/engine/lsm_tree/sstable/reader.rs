@@ -811,7 +811,29 @@ pub fn read_keys(path: &Path) -> Result<Vec<String>, Status> {
 
 /// Read all entries from an SSTable file
 #[allow(clippy::result_large_err)]
+#[allow(dead_code)] // Used in tests
 pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
+    read_entries_internal(path, None)
+}
+
+/// Read entries from an SSTable file for compaction, skipping expired entries.
+///
+/// This function uses composite keys to check expiration before reading values,
+/// saving memory and I/O for expired entries that will be discarded anyway.
+#[allow(clippy::result_large_err)]
+pub fn read_entries_for_compaction(
+    path: &Path,
+    now: u64,
+) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
+    read_entries_internal(path, Some(now))
+}
+
+/// Internal implementation for reading entries with optional expiration filtering.
+#[allow(clippy::result_large_err)]
+fn read_entries_internal(
+    path: &Path,
+    skip_expired_before: Option<u64>,
+) -> Result<BTreeMap<String, TimestampedEntry>, Status> {
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -929,6 +951,20 @@ pub fn read_entries(path: &Path) -> Result<BTreeMap<String, TimestampedEntry>, S
                 .map_err(|e| Status::internal(e.to_string()))?;
             let (key, expire_at) = composite_key::decode_from_bytes(&key_buf)
                 .ok_or_else(|| Status::internal("Invalid composite key format"))?;
+
+            // Skip expired entries during compaction (optimization using composite key)
+            if let Some(now) = skip_expired_before
+                && expire_at > 0
+                && now > expire_at
+            {
+                // Skip value bytes without reading them
+                if val_len != u64::MAX {
+                    cursor
+                        .seek(SeekFrom::Current(val_len as i64))
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
+                continue;
+            }
 
             let value = if val_len == u64::MAX {
                 None

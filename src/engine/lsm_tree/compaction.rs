@@ -245,12 +245,10 @@ impl LeveledCompaction {
 
         let now = crate::engine::current_timestamp();
         for path in files {
-            let entries = sstable::read_entries(path)?;
+            // Use read_entries_for_compaction to skip expired entries' values
+            // This optimization uses composite keys to check expiration before reading values
+            let entries = sstable::read_entries_for_compaction(path, now)?;
             for (key, (timestamp, expire_at, value)) in entries {
-                // Skip expired entries during compaction
-                if expire_at > 0 && now > expire_at {
-                    continue;
-                }
                 match merged.get(&key) {
                     Some((existing_ts, _, _)) if *existing_ts >= timestamp => {
                         // Keep existing entry (newer timestamp)

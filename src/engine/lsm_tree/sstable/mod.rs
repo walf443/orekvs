@@ -9,9 +9,10 @@ pub mod levels;
 mod reader;
 mod writer;
 
+#[allow(unused_imports)] // read_entries is used in tests
 pub use reader::{
-    MappedSSTable, TimestampedEntry, extract_wal_id_from_sstable, read_entries, search_key_mmap,
-    search_key_mmap_with_expire,
+    MappedSSTable, TimestampedEntry, extract_wal_id_from_sstable, read_entries,
+    read_entries_for_compaction, search_key_mmap, search_key_mmap_with_expire,
 };
 pub use writer::{create_from_memtable, write_timestamped_entries};
 

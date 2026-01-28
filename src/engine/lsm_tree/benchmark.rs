@@ -365,3 +365,84 @@ async fn bench_index_cache() {
     );
     println!("=====================================\n");
 }
+
+/// Benchmark test to measure compaction optimization for expired entries
+/// Compares read_entries vs read_entries_for_compaction at different expiration rates
+/// Run with: cargo test bench_compaction_expired --release -- --nocapture --ignored
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_compaction_expired_entries() {
+    use crate::engine::current_timestamp;
+    use crate::engine::lsm_tree::memtable::MemValue;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    println!("\n=== Compaction Expired Entries Benchmark ===");
+
+    // Parameters
+    let num_entries = 5000;
+    let value_size = 1024; // 1KB values
+    let expired_ratios = [0.0, 0.25, 0.50, 0.75, 0.90, 1.0];
+
+    println!("Parameters:");
+    println!("  - Entries: {}", num_entries);
+    println!("  - Value size: {} bytes", value_size);
+    println!("\n| Expired % | Standard | Optimized | Speedup |");
+    println!("|-----------|----------|-----------|---------|");
+
+    for expired_ratio in expired_ratios {
+        let dir = tempdir().unwrap();
+        let now = current_timestamp();
+        let value = "x".repeat(value_size);
+
+        // Create memtable with mixed expired/non-expired entries
+        let mut memtable: BTreeMap<String, MemValue> = BTreeMap::new();
+        for i in 0..num_entries {
+            let expire_at = if (i as f64) < (num_entries as f64 * expired_ratio) {
+                // Expired entry
+                now - 1
+            } else {
+                // Valid entry (has TTL but not expired yet)
+                now + 3600
+            };
+            memtable.insert(
+                format!("key{:06}", i),
+                MemValue::new_with_ttl(Some(value.clone()), expire_at),
+            );
+        }
+
+        // Write SSTable
+        let sst_path = dir.path().join("test_bench.data");
+        sstable::create_from_memtable(&sst_path, &memtable).unwrap();
+
+        let iterations = 30;
+
+        // Benchmark: read_entries (without optimization)
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = sstable::read_entries(&sst_path).unwrap();
+        }
+        let standard_duration = start.elapsed();
+
+        // Benchmark: read_entries_for_compaction (with optimization)
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = sstable::read_entries_for_compaction(&sst_path, now).unwrap();
+        }
+        let optimized_duration = start.elapsed();
+
+        let standard_ms = standard_duration.as_secs_f64() * 1000.0 / iterations as f64;
+        let optimized_ms = optimized_duration.as_secs_f64() * 1000.0 / iterations as f64;
+        let speedup = standard_duration.as_secs_f64() / optimized_duration.as_secs_f64();
+
+        println!(
+            "| {:>8}% | {:>6.2}ms | {:>7.2}ms | {:>6.2}x |",
+            (expired_ratio * 100.0) as u32,
+            standard_ms,
+            optimized_ms,
+            speedup
+        );
+    }
+
+    println!("\n=====================================\n");
+}
