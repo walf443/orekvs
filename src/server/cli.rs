@@ -5,6 +5,49 @@ use crate::engine::lsm_tree::{
 };
 use crate::server::{EngineType, run_follower, run_server};
 
+/// Parse a size string with optional suffix (e.g., "4MiB", "1GiB", "512KiB", "1024")
+/// Supports:
+/// - Binary: KiB (1024), MiB (1024^2), GiB (1024^3), TiB (1024^4)
+/// - Decimal: KB (1000), MB (1000^2), GB (1000^3), TB (1000^4)
+/// - Plain numbers (bytes)
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty string".to_string());
+    }
+
+    // Find where the numeric part ends
+    let num_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+
+    let (num_str, suffix) = s.split_at(num_end);
+    let suffix = suffix.trim();
+
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid number: {}", num_str))?;
+
+    let multiplier: u64 = match suffix.to_uppercase().as_str() {
+        "" => 1,
+        // Binary (IEC)
+        "KIB" => 1024,
+        "MIB" => 1024 * 1024,
+        "GIB" => 1024 * 1024 * 1024,
+        "TIB" => 1024 * 1024 * 1024 * 1024,
+        // Decimal (SI)
+        "KB" | "K" => 1000,
+        "MB" | "M" => 1000 * 1000,
+        "GB" | "G" => 1000 * 1000 * 1000,
+        "TB" | "T" => 1000 * 1000 * 1000 * 1000,
+        // Also allow B suffix
+        "B" => 1,
+        _ => return Err(format!("unknown suffix: {}", suffix)),
+    };
+
+    Ok((num * multiplier as f64) as u64)
+}
+
 #[derive(Args)]
 pub struct Command {
     #[arg(long, default_value = "127.0.0.1:50051")]
@@ -18,12 +61,12 @@ pub struct Command {
     #[arg(long, default_value = "kv_data")]
     pub data_dir: String,
 
-    /// Max size for log file in bytes for Log engine
-    #[arg(long = "log-engine-capacity-bytes", default_value_t = 1024)]
+    /// Max size for log file in bytes for Log engine (e.g., 1024, 1KiB, 1MiB)
+    #[arg(long = "log-engine-capacity-bytes", default_value = "1KiB", value_parser = parse_size)]
     pub log_capacity_bytes: u64,
 
-    /// MemTable flush trigger size in bytes for LSM-tree engine
-    #[arg(long = "lsm-engine-memtable-capacity-bytes", default_value_t = 4194304)]
+    /// MemTable flush trigger size in bytes for LSM-tree engine (e.g., 4MiB, 64MiB)
+    #[arg(long = "lsm-engine-memtable-capacity-bytes", default_value = "4MiB", value_parser = parse_size)]
     pub lsm_memtable_capacity_bytes: u64,
 
     /// Compaction trigger (number of SSTables) for LSM-tree engine
@@ -52,8 +95,8 @@ pub struct Command {
     #[arg(long = "lsm-engine-wal-retention-secs")]
     pub lsm_wal_retention_secs: Option<u64>,
 
-    /// Maximum total WAL size in bytes for LSM-tree engine (default: 1073741824 = 1GB, 0 = disabled)
-    #[arg(long = "lsm-engine-wal-max-size-bytes")]
+    /// Maximum total WAL size in bytes for LSM-tree engine (e.g., 1GiB, 100MiB, 0 = disabled)
+    #[arg(long = "lsm-engine-wal-max-size-bytes", value_parser = parse_size)]
     pub lsm_wal_max_size_bytes: Option<u64>,
 
     /// Disable WAL archiving for LSM-tree engine (keep all WAL files for replication)
@@ -116,4 +159,85 @@ pub async fn run(cmd: &Command) -> Result<(), Box<dyn std::error::Error>> {
         .await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_size_plain_numbers() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("1").unwrap(), 1);
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("4194304").unwrap(), 4194304);
+    }
+
+    #[test]
+    fn test_parse_size_binary_suffixes() {
+        // KiB
+        assert_eq!(parse_size("1KiB").unwrap(), 1024);
+        assert_eq!(parse_size("20KiB").unwrap(), 20 * 1024);
+        // MiB
+        assert_eq!(parse_size("1MiB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("4MiB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_size("64MiB").unwrap(), 64 * 1024 * 1024);
+        // GiB
+        assert_eq!(parse_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("4GiB").unwrap(), 4 * 1024 * 1024 * 1024);
+        // TiB
+        assert_eq!(parse_size("1TiB").unwrap(), 1024 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_decimal_suffixes() {
+        // KB
+        assert_eq!(parse_size("1KB").unwrap(), 1000);
+        assert_eq!(parse_size("1K").unwrap(), 1000);
+        // MB
+        assert_eq!(parse_size("1MB").unwrap(), 1000 * 1000);
+        assert_eq!(parse_size("1M").unwrap(), 1000 * 1000);
+        // GB
+        assert_eq!(parse_size("1GB").unwrap(), 1000 * 1000 * 1000);
+        assert_eq!(parse_size("1G").unwrap(), 1000 * 1000 * 1000);
+        // TB
+        assert_eq!(parse_size("1TB").unwrap(), 1000 * 1000 * 1000 * 1000);
+        assert_eq!(parse_size("1T").unwrap(), 1000 * 1000 * 1000 * 1000);
+    }
+
+    #[test]
+    fn test_parse_size_case_insensitive() {
+        assert_eq!(parse_size("1kib").unwrap(), 1024);
+        assert_eq!(parse_size("1KIB").unwrap(), 1024);
+        assert_eq!(parse_size("1Kib").unwrap(), 1024);
+        assert_eq!(parse_size("1mib").unwrap(), 1024 * 1024);
+        assert_eq!(parse_size("1gib").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_with_spaces() {
+        assert_eq!(parse_size("  1024  ").unwrap(), 1024);
+        assert_eq!(parse_size("4 MiB").unwrap(), 4 * 1024 * 1024);
+        assert_eq!(parse_size("1 GiB").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_size_with_b_suffix() {
+        assert_eq!(parse_size("100B").unwrap(), 100);
+        assert_eq!(parse_size("1024B").unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_parse_size_fractional() {
+        assert_eq!(parse_size("1.5KiB").unwrap(), 1536); // 1.5 * 1024
+        assert_eq!(parse_size("2.5MiB").unwrap(), 2621440); // 2.5 * 1024 * 1024
+    }
+
+    #[test]
+    fn test_parse_size_errors() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("1XiB").is_err());
+        assert!(parse_size("1PiB").is_err()); // PiB not supported
+    }
 }
