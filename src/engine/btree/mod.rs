@@ -563,23 +563,6 @@ impl Engine for BTreeEngine {
         self.set_internal_with_ttl(key, value, expire_at, true)
     }
 
-    fn get(&self, key: String) -> Result<String, Status> {
-        let meta = self.meta.read().unwrap();
-
-        if meta.root_page_id == 0 {
-            return Err(Status::not_found("Key not found"));
-        }
-
-        // Traverse to leaf
-        let leaf_page_id = self.find_leaf(meta.root_page_id, &key, meta.tree_height)?;
-        let leaf = self.get_leaf(leaf_page_id)?;
-
-        match leaf.get(&key) {
-            Some(entry) if entry.is_valid(current_timestamp()) => Ok(entry.value.clone().unwrap()),
-            _ => Err(Status::not_found("Key not found")),
-        }
-    }
-
     fn delete(&self, key: String) -> Result<(), Status> {
         self.delete_internal(key, true)
     }
@@ -639,11 +622,11 @@ impl Engine for BTreeEngine {
         Ok(count)
     }
 
-    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
+    fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         let meta = self.meta.read().unwrap();
 
         if meta.root_page_id == 0 {
-            return Ok((false, 0));
+            return Err(Status::not_found("Key not found"));
         }
 
         // Traverse to leaf
@@ -651,8 +634,10 @@ impl Engine for BTreeEngine {
         let leaf = self.get_leaf(leaf_page_id)?;
 
         match leaf.get(&key) {
-            Some(entry) if entry.is_valid(current_timestamp()) => Ok((true, entry.expire_at)),
-            _ => Ok((false, 0)),
+            Some(entry) if entry.is_valid(current_timestamp()) => {
+                Ok((entry.value.clone().unwrap(), entry.expire_at))
+            }
+            _ => Err(Status::not_found("Key not found")),
         }
     }
 }
@@ -711,10 +696,6 @@ impl Engine for BTreeEngineWrapper {
         self.0.set(key, value)
     }
 
-    fn get(&self, key: String) -> Result<String, Status> {
-        self.0.get(key)
-    }
-
     fn delete(&self, key: String) -> Result<(), Status> {
         self.0.delete(key)
     }
@@ -731,7 +712,7 @@ impl Engine for BTreeEngineWrapper {
         self.0.batch_delete(keys)
     }
 
-    fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
-        self.0.get_expire_at(key)
+    fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
+        self.0.get_with_expire_at(key)
     }
 }

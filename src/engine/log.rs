@@ -441,7 +441,7 @@ impl Engine for LogEngine {
         self.set_internal(key, value, expire_at)
     }
 
-    fn get(&self, key: String) -> Result<String, Status> {
+    fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         let (offset, length, expire_at) = {
             let index = self.index.lock().unwrap();
             match index.get(&key) {
@@ -466,7 +466,7 @@ impl Engine for LogEngine {
 
         let value = String::from_utf8(buffer)
             .map_err(|e| Status::internal(format!("Invalid UTF-8: {}", e)))?;
-        Ok(value)
+        Ok((value, expire_at))
     }
 
     fn delete(&self, key: String) -> Result<(), Status> {
@@ -581,12 +581,12 @@ impl Engine for LogEngineWrapper {
         self.0.set(key, value)
     }
 
-    fn get(&self, key: String) -> Result<String, Status> {
-        self.0.get(key)
-    }
-
     fn delete(&self, key: String) -> Result<(), Status> {
         self.0.delete(key)
+    }
+
+    fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
+        self.0.get_with_expire_at(key)
     }
 }
 

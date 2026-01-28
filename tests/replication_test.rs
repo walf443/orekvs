@@ -92,6 +92,7 @@ async fn get_key_optional(
     let response = client
         .get(GetRequest {
             key: key.to_string(),
+            include_expire_at: false,
         })
         .await;
     match response {
@@ -114,6 +115,7 @@ async fn get_key(addr: &str, key: &str) -> Result<String, Box<dyn std::error::Er
     let response = client
         .get(GetRequest {
             key: key.to_string(),
+            include_expire_at: false,
         })
         .await?;
     Ok(response.into_inner().value)

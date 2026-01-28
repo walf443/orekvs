@@ -18,8 +18,22 @@ pub fn current_timestamp() -> u64 {
 #[allow(clippy::result_large_err)]
 pub trait Engine: Send + Sync + 'static {
     fn set(&self, key: String, value: String) -> Result<(), Status>;
-    fn get(&self, key: String) -> Result<String, Status>;
     fn delete(&self, key: String) -> Result<(), Status>;
+
+    /// Get the value and expiration timestamp for a key.
+    /// Returns (value, expire_at) where:
+    /// - value: the value associated with the key
+    /// - expire_at: 0 = no expiration, >0 = Unix timestamp when key expires
+    ///
+    /// This is the primary get method. Engines must implement this.
+    fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status>;
+
+    /// Get the value of a key.
+    /// Default implementation calls get_with_expire_at() and discards expire_at.
+    fn get(&self, key: String) -> Result<String, Status> {
+        let (value, _) = self.get_with_expire_at(key)?;
+        Ok(value)
+    }
 
     /// Set a key-value pair with TTL (time-to-live) in seconds.
     /// The key will expire after `ttl_secs` seconds from now.
@@ -86,11 +100,10 @@ pub trait Engine: Send + Sync + 'static {
     /// - exists: true if key exists and is not expired
     /// - expire_at: 0 = no expiration, >0 = Unix timestamp when key expires
     ///
-    /// Default implementation returns (false, 0) indicating no TTL support.
+    /// Default implementation calls get_with_expire_at() and discards the value.
     fn get_expire_at(&self, key: String) -> Result<(bool, u64), Status> {
-        // Default: check if key exists, but no TTL info
-        match self.get(key) {
-            Ok(_) => Ok((true, 0)),
+        match self.get_with_expire_at(key) {
+            Ok((_, expire_at)) => Ok((true, expire_at)),
             Err(e) if e.code() == tonic::Code::NotFound => Ok((false, 0)),
             Err(e) => Err(e),
         }

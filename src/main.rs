@@ -166,7 +166,12 @@ enum TestCommands {
         ttl: u64,
     },
     /// Get the value of a key
-    Get { key: String },
+    Get {
+        key: String,
+        /// Include expiration timestamp in the response
+        #[arg(long)]
+        with_expire_at: bool,
+    },
     /// Get the expiration timestamp of a key
     GetExpireAt { key: String },
     /// Delete a key
@@ -313,12 +318,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("RESPONSE={:?}", response);
                 Ok(())
             }
-            TestCommands::Get { key } => {
+            TestCommands::Get {
+                key,
+                with_expire_at,
+            } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
-                let request = tonic::Request::new(GetRequest { key: key.clone() });
+                let request = tonic::Request::new(GetRequest {
+                    key: key.clone(),
+                    include_expire_at: *with_expire_at,
+                });
                 match client.get(request).await {
                     Ok(response) => {
-                        println!("{}", response.into_inner().value);
+                        let resp = response.into_inner();
+                        if *with_expire_at {
+                            println!("value={} expire_at={}", resp.value, resp.expire_at);
+                        } else {
+                            println!("{}", resp.value);
+                        }
                     }
                     Err(e) => {
                         println!("Error: {}", e);
@@ -478,7 +494,10 @@ async fn run_test_get(
                 rng.gen_range(1..=key_range).to_string()
             };
 
-            let request = tonic::Request::new(GetRequest { key: key.clone() });
+            let request = tonic::Request::new(GetRequest {
+                key: key.clone(),
+                include_expire_at: false,
+            });
 
             let req_start = Instant::now();
             let res = client_clone.get(request).await;

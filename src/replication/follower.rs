@@ -318,8 +318,16 @@ impl KeyValue for SwappableFollowerKeyValue {
             let guard = self.engine_holder.read().unwrap();
             Arc::clone(&*guard)
         };
-        let value = engine.get(req.key)?;
-        Ok(Response::new(GetResponse { value }))
+        if req.include_expire_at {
+            let (value, expire_at) = engine.get_with_expire_at(req.key)?;
+            Ok(Response::new(GetResponse { value, expire_at }))
+        } else {
+            let value = engine.get(req.key)?;
+            Ok(Response::new(GetResponse {
+                value,
+                expire_at: 0,
+            }))
+        }
     }
 
     async fn delete(

@@ -52,10 +52,12 @@ impl Engine for MemoryEngine {
         Ok(())
     }
 
-    fn get(&self, key: String) -> Result<String, Status> {
+    fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         let db = self.db.lock().unwrap();
         match db.get(&key) {
-            Some(entry) if !entry.is_expired(current_timestamp()) => Ok(entry.value.clone()),
+            Some(entry) if !entry.is_expired(current_timestamp()) => {
+                Ok((entry.value.clone(), entry.expire_at))
+            }
             _ => Err(Status::not_found("Key not found")),
         }
     }

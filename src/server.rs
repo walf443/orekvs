@@ -97,8 +97,16 @@ impl KeyValue for MyKeyValue {
 
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let req = request.into_inner();
-        let value = self.engine.get(req.key)?;
-        Ok(Response::new(GetResponse { value }))
+        if req.include_expire_at {
+            let (value, expire_at) = self.engine.get_with_expire_at(req.key)?;
+            Ok(Response::new(GetResponse { value, expire_at }))
+        } else {
+            let value = self.engine.get(req.key)?;
+            Ok(Response::new(GetResponse {
+                value,
+                expire_at: 0,
+            }))
+        }
     }
 
     async fn delete(

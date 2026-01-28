@@ -29,10 +29,15 @@ message SetResponse {
 
 message GetRequest {
   string key = 1;
+  // If true, include expire_at in the response
+  bool include_expire_at = 2;
 }
 
 message GetResponse {
   string value = 1;
+  // Unix timestamp when the key expires (0 = no expiration)
+  // Only populated when include_expire_at is true in the request
+  uint64 expire_at = 2;
 }
 
 message DeleteRequest {
