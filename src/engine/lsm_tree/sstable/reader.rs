@@ -25,27 +25,29 @@ use crate::engine::lsm_tree::composite_key;
 // (timestamp, expire_at, value)
 pub type TimestampedEntry = (u64, u64, Option<String>);
 
-/// Find the block offset for a key using binary search in the index.
+/// Find the block info (offset and max_expire_at) for a key using binary search in the index.
 ///
 /// The index contains (composite_key, block_offset, max_expire_at) entries sorted by key.
 /// Composite key format: logical_key + \x00 + expire_at
 /// This function finds the block that might contain the given logical key:
-/// - If the logical key matches an index entry's logical key, returns that block's offset
-/// - Otherwise, returns the offset of the previous block (which could contain the key)
-fn find_block_offset(index: &[IndexEntry], logical_key: &str) -> u64 {
+/// - If the logical key matches an index entry's logical key, returns that block's info
+/// - Otherwise, returns the info of the previous block (which could contain the key)
+///
+/// Returns (block_offset, max_expire_at)
+fn find_block_info(index: &[IndexEntry], logical_key: &str) -> (u64, u64) {
     // Compare by logical key extracted from composite key
     match index.binary_search_by(|(composite, _, _)| {
         let idx_logical = composite_key::logical_key(composite).unwrap_or(composite);
         idx_logical.cmp(logical_key)
     }) {
-        Ok(idx) => index[idx].1,
+        Ok(idx) => (index[idx].1, index[idx].2),
         Err(idx) => {
             if idx == 0 {
                 // Key is smaller than the first block's first key.
                 // If it exists, it must be in the first block.
-                index[0].1
+                (index[0].1, index[0].2)
             } else {
-                index[idx - 1].1
+                (index[idx - 1].1, index[idx - 1].2)
             }
         }
     }
@@ -410,8 +412,7 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
     let index = prefix_index::read_index(&mut file, index_offset)?;
 
     // Binary search in index to find the block that might contain the key
-    // Convert IndexEntry to (String, u64) for find_block_offset
-    let start_offset = find_block_offset(&index, key);
+    let (start_offset, _max_expire_at) = find_block_info(&index, key);
 
     file.seek(SeekFrom::Start(start_offset))
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -504,11 +505,16 @@ pub fn search_key(path: &Path, key: &str) -> Result<Option<String>, Status> {
 
 /// Search for a key using a memory-mapped SSTable with block cache support
 /// This is more efficient than search_key_cached as it avoids file open overhead
+///
+/// The `now` parameter is used for block-level expiration check optimization.
+/// If a block's max_expire_at indicates all entries are expired, the block
+/// decompression is skipped entirely.
 #[allow(clippy::result_large_err)]
 pub fn search_key_mmap(
     sst: &MappedSSTable,
     key: &str,
     cache: &BlockCache,
+    now: u64,
 ) -> Result<Option<String>, Status> {
     let canonical_path = sst.canonical_path();
 
@@ -516,7 +522,13 @@ pub fn search_key_mmap(
     let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
 
     // Binary search in index to find the block that might contain the key
-    let block_offset = find_block_offset(&index, key);
+    let (block_offset, max_expire_at) = find_block_info(&index, key);
+
+    // Block-level expiration optimization: if all entries in block are expired, skip decompression
+    // max_expire_at > 0 means all entries have TTL, max_expire_at <= now means all are expired
+    if max_expire_at > 0 && now > max_expire_at {
+        return Err(Status::not_found("Key not found (block expired)"));
+    }
 
     // Get or load parsed block from cache
     let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
@@ -527,11 +539,14 @@ pub fn search_key_mmap(
 
 /// Search for a key and return its expire_at timestamp
 /// Returns Ok(Some((value_opt, expire_at))) if found, Err(NotFound) if not found
+///
+/// The `now` parameter is used for block-level expiration check optimization.
 #[allow(clippy::result_large_err)]
 pub fn search_key_mmap_with_expire(
     sst: &MappedSSTable,
     key: &str,
     cache: &BlockCache,
+    now: u64,
 ) -> Result<Option<(Option<String>, u64)>, Status> {
     let canonical_path = sst.canonical_path();
 
@@ -539,7 +554,12 @@ pub fn search_key_mmap_with_expire(
     let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
 
     // Binary search in index to find the block that might contain the key
-    let block_offset = find_block_offset(&index, key);
+    let (block_offset, max_expire_at) = find_block_info(&index, key);
+
+    // Block-level expiration optimization: if all entries in block are expired, skip decompression
+    if max_expire_at > 0 && now > max_expire_at {
+        return Err(Status::not_found("Key not found (block expired)"));
+    }
 
     // Get or load parsed block from cache
     let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
@@ -1393,5 +1413,82 @@ mod tests {
         let sst = MappedSSTable::open(&sst_path).unwrap();
         assert_eq!(sst.min_key(), b"");
         assert_eq!(sst.max_key(), b"");
+    }
+
+    /// Test that GET operations skip decompression for fully expired blocks
+    #[test]
+    fn test_get_skips_expired_block() {
+        use crate::engine::lsm_tree::block_cache::BlockCache;
+        use crate::engine::lsm_tree::memtable::MemValue;
+
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_expired_block.data");
+
+        let now = 1000u64;
+
+        // Create memtable with all entries having TTL that will expire
+        let mut memtable = BTreeMap::new();
+        memtable.insert(
+            "key1".to_string(),
+            MemValue::new_with_ttl(Some("value1".to_string()), now - 100), // Expired
+        );
+        memtable.insert(
+            "key2".to_string(),
+            MemValue::new_with_ttl(Some("value2".to_string()), now - 50), // Expired
+        );
+
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Open with MappedSSTable
+        let sst = MappedSSTable::open(&sst_path).unwrap();
+        let cache = BlockCache::new(1024 * 1024);
+
+        // Search for a key - should return NotFound due to block-level expiration check
+        // The block won't be decompressed because max_expire_at < now
+        let result = search_key_mmap(&sst, "key1", &cache, now);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
+
+        // Cache should NOT have the block (decompression was skipped)
+        let stats = cache.stats();
+        // Only index should be cached, not the block
+        assert_eq!(
+            stats.entries, 1,
+            "Only index should be cached, block decompression was skipped"
+        );
+    }
+
+    /// Test that GET operations do NOT skip blocks containing no-TTL entries
+    #[test]
+    fn test_get_does_not_skip_no_ttl_block() {
+        use crate::engine::lsm_tree::block_cache::BlockCache;
+        use crate::engine::lsm_tree::memtable::MemValue;
+
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_no_ttl_block.data");
+
+        let now = 1000u64;
+
+        // Create memtable with no-TTL entries
+        let mut memtable = BTreeMap::new();
+        memtable.insert(
+            "key1".to_string(),
+            MemValue::new(Some("value1".to_string())), // No TTL
+        );
+
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Open with MappedSSTable
+        let sst = MappedSSTable::open(&sst_path).unwrap();
+        let cache = BlockCache::new(1024 * 1024);
+
+        // Search for a key - should find it (block has no TTL, so max_expire_at = 0)
+        let result = search_key_mmap(&sst, "key1", &cache, now);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("value1".to_string()));
+
+        // Cache should have both index and block
+        let stats = cache.stats();
+        assert_eq!(stats.entries, 2, "Both index and block should be cached");
     }
 }

@@ -134,10 +134,11 @@ async fn bench_block_cache_effectiveness() {
     );
 
     // Mmap-based reads (using search_key_mmap)
+    let now = crate::engine::current_timestamp();
     let start = Instant::now();
     for _ in 0..iterations {
         for handle in &sst_handles {
-            let _ = sstable::search_key_mmap(&handle.mmap, test_key, &engine.block_cache);
+            let _ = sstable::search_key_mmap(&handle.mmap, test_key, &engine.block_cache, now);
         }
     }
     let mmap_duration = start.elapsed();
@@ -445,4 +446,242 @@ async fn bench_compaction_expired_entries() {
     }
 
     println!("\n=====================================\n");
+}
+
+/// Benchmark test to measure GET optimization for expired blocks
+/// Compares GET on expired vs non-expired blocks
+/// Run with: cargo test bench_get_expired_block --release -- --nocapture --ignored
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_get_expired_block() {
+    use crate::engine::current_timestamp;
+    use crate::engine::lsm_tree::block_cache::BlockCache;
+    use crate::engine::lsm_tree::memtable::MemValue;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    println!("\n=== GET Expired Block Optimization Benchmark ===");
+
+    let dir = tempdir().unwrap();
+    let now = current_timestamp();
+
+    // Parameters
+    let num_entries = 1000;
+    let value_size = 1024;
+    let iterations = 10000;
+
+    println!("Parameters:");
+    println!("  - Entries per SSTable: {}", num_entries);
+    println!("  - Value size: {} bytes", value_size);
+    println!("  - GET iterations: {}", iterations);
+
+    let value = "x".repeat(value_size);
+
+    // Create SSTable with expired entries
+    let expired_sst_path = dir.path().join("expired.data");
+    {
+        let mut memtable: BTreeMap<String, MemValue> = BTreeMap::new();
+        for i in 0..num_entries {
+            memtable.insert(
+                format!("expired_key{:06}", i),
+                MemValue::new_with_ttl(Some(value.clone()), now - 100), // Expired
+            );
+        }
+        sstable::create_from_memtable(&expired_sst_path, &memtable).unwrap();
+    }
+
+    // Create SSTable with non-expired entries
+    let valid_sst_path = dir.path().join("valid.data");
+    {
+        let mut memtable: BTreeMap<String, MemValue> = BTreeMap::new();
+        for i in 0..num_entries {
+            memtable.insert(
+                format!("valid_key{:06}", i),
+                MemValue::new_with_ttl(Some(value.clone()), now + 3600), // Not expired
+            );
+        }
+        sstable::create_from_memtable(&valid_sst_path, &memtable).unwrap();
+    }
+
+    // Create SSTable with no-TTL entries
+    let no_ttl_sst_path = dir.path().join("no_ttl.data");
+    {
+        let mut memtable: BTreeMap<String, MemValue> = BTreeMap::new();
+        for i in 0..num_entries {
+            memtable.insert(
+                format!("no_ttl_key{:06}", i),
+                MemValue::new(Some(value.clone())), // No TTL
+            );
+        }
+        sstable::create_from_memtable(&no_ttl_sst_path, &memtable).unwrap();
+    }
+
+    // Open SSTables
+    let expired_sst = sstable::MappedSSTable::open(&expired_sst_path).unwrap();
+    let valid_sst = sstable::MappedSSTable::open(&valid_sst_path).unwrap();
+    let no_ttl_sst = sstable::MappedSSTable::open(&no_ttl_sst_path).unwrap();
+
+    let cache = BlockCache::new(64 * 1024 * 1024);
+
+    // Warm up caches (load index)
+    let _ = sstable::search_key_mmap(&expired_sst, "expired_key000000", &cache, now);
+    let _ = sstable::search_key_mmap(&valid_sst, "valid_key000000", &cache, now);
+    let _ = sstable::search_key_mmap(&no_ttl_sst, "no_ttl_key000000", &cache, now);
+    cache.reset_stats();
+
+    println!("\n| Scenario        | Time     | Ops/sec    | Block Decompressions |");
+    println!("|-----------------|----------|------------|----------------------|");
+
+    // Benchmark: GET on expired block (should skip decompression)
+    let start = Instant::now();
+    for i in 0..iterations {
+        let key = format!("expired_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&expired_sst, &key, &cache, now);
+    }
+    let expired_duration = start.elapsed();
+    let expired_stats = cache.stats();
+    let expired_block_loads = expired_stats.misses; // Block cache misses = decompressions
+    cache.reset_stats();
+
+    println!(
+        "| Expired block   | {:>6.2}ms | {:>10.0} | {:>20} |",
+        expired_duration.as_secs_f64() * 1000.0,
+        iterations as f64 / expired_duration.as_secs_f64(),
+        expired_block_loads
+    );
+
+    // Benchmark: GET on valid (non-expired) block
+    let start = Instant::now();
+    for i in 0..iterations {
+        let key = format!("valid_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&valid_sst, &key, &cache, now);
+    }
+    let valid_duration = start.elapsed();
+    let valid_stats = cache.stats();
+    let valid_block_loads = valid_stats.misses;
+    cache.reset_stats();
+
+    println!(
+        "| Valid block     | {:>6.2}ms | {:>10.0} | {:>20} |",
+        valid_duration.as_secs_f64() * 1000.0,
+        iterations as f64 / valid_duration.as_secs_f64(),
+        valid_block_loads
+    );
+
+    // Benchmark: GET on no-TTL block
+    let start = Instant::now();
+    for i in 0..iterations {
+        let key = format!("no_ttl_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&no_ttl_sst, &key, &cache, now);
+    }
+    let no_ttl_duration = start.elapsed();
+    let no_ttl_stats = cache.stats();
+    let no_ttl_block_loads = no_ttl_stats.misses;
+
+    println!(
+        "| No-TTL block    | {:>6.2}ms | {:>10.0} | {:>20} |",
+        no_ttl_duration.as_secs_f64() * 1000.0,
+        iterations as f64 / no_ttl_duration.as_secs_f64(),
+        no_ttl_block_loads
+    );
+
+    let speedup = valid_duration.as_secs_f64() / expired_duration.as_secs_f64();
+    println!("\n=== Results ===");
+    println!(
+        "Expired block GET is {:.2}x faster than valid block GET",
+        speedup
+    );
+    println!("(Block decompression is skipped for expired blocks)");
+
+    // Cold cache benchmark (no caching, each GET requires decompression)
+    println!("\n--- Cold Cache Benchmark (fresh cache each iteration) ---");
+
+    let cold_iterations = 100;
+
+    // Expired block - cold cache
+    let start = Instant::now();
+    for i in 0..cold_iterations {
+        let fresh_cache = BlockCache::new(64 * 1024 * 1024);
+        let key = format!("expired_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&expired_sst, &key, &fresh_cache, now);
+    }
+    let expired_cold_duration = start.elapsed();
+
+    // Valid block - cold cache
+    let start = Instant::now();
+    for i in 0..cold_iterations {
+        let fresh_cache = BlockCache::new(64 * 1024 * 1024);
+        let key = format!("valid_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&valid_sst, &key, &fresh_cache, now);
+    }
+    let valid_cold_duration = start.elapsed();
+
+    println!(
+        "Expired block (cold): {:.2}ms ({:.0} ops/sec)",
+        expired_cold_duration.as_secs_f64() * 1000.0,
+        cold_iterations as f64 / expired_cold_duration.as_secs_f64()
+    );
+    println!(
+        "Valid block (cold):   {:.2}ms ({:.0} ops/sec)",
+        valid_cold_duration.as_secs_f64() * 1000.0,
+        cold_iterations as f64 / valid_cold_duration.as_secs_f64()
+    );
+
+    let cold_speedup = valid_cold_duration.as_secs_f64() / expired_cold_duration.as_secs_f64();
+    println!(
+        "Cold cache speedup: {:.2}x faster for expired blocks",
+        cold_speedup
+    );
+
+    // Overhead measurement: compare no-TTL (max_expire_at=0) vs valid TTL (max_expire_at>0)
+    // Both require full processing, so difference shows the overhead of the expiration check
+    println!("\n--- Optimization Overhead (non-expired cases) ---");
+
+    let overhead_iterations = 50000;
+
+    // No-TTL block - baseline (max_expire_at = 0, check short-circuits immediately)
+    let shared_cache = BlockCache::new(64 * 1024 * 1024);
+    // Warm up
+    let _ = sstable::search_key_mmap(&no_ttl_sst, "no_ttl_key000000", &shared_cache, now);
+
+    let start = Instant::now();
+    for i in 0..overhead_iterations {
+        let key = format!("no_ttl_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&no_ttl_sst, &key, &shared_cache, now);
+    }
+    let no_ttl_time = start.elapsed();
+
+    // Valid TTL block (max_expire_at > now, full check but not skipped)
+    let shared_cache2 = BlockCache::new(64 * 1024 * 1024);
+    // Warm up
+    let _ = sstable::search_key_mmap(&valid_sst, "valid_key000000", &shared_cache2, now);
+
+    let start = Instant::now();
+    for i in 0..overhead_iterations {
+        let key = format!("valid_key{:06}", i % num_entries);
+        let _ = sstable::search_key_mmap(&valid_sst, &key, &shared_cache2, now);
+    }
+    let valid_time = start.elapsed();
+
+    let no_ttl_ns_per_op = no_ttl_time.as_nanos() as f64 / overhead_iterations as f64;
+    let valid_ns_per_op = valid_time.as_nanos() as f64 / overhead_iterations as f64;
+    let overhead_ns = valid_ns_per_op - no_ttl_ns_per_op;
+    let overhead_percent = (overhead_ns / no_ttl_ns_per_op) * 100.0;
+
+    println!(
+        "No-TTL (max_expire_at=0):     {:.0} ns/op ({:.0} ops/sec)",
+        no_ttl_ns_per_op,
+        overhead_iterations as f64 / no_ttl_time.as_secs_f64()
+    );
+    println!(
+        "Valid TTL (max_expire_at>0):  {:.0} ns/op ({:.0} ops/sec)",
+        valid_ns_per_op,
+        overhead_iterations as f64 / valid_time.as_secs_f64()
+    );
+    println!(
+        "Overhead: {:.0} ns/op ({:.2}%)",
+        overhead_ns.max(0.0),
+        overhead_percent.max(0.0)
+    );
+    println!("=====================================\n");
 }

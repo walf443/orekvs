@@ -932,7 +932,12 @@ impl Engine for LsmTreeEngine {
                     continue;
                 }
                 self.metrics.record_sstable_search();
-                match sstable::search_key_mmap_with_expire(&handle.mmap, &key, &self.block_cache) {
+                match sstable::search_key_mmap_with_expire(
+                    &handle.mmap,
+                    &key,
+                    &self.block_cache,
+                    now,
+                ) {
                     Ok(Some((value_opt, expire_at))) => {
                         // Check if it's a tombstone
                         if value_opt.is_none() {
@@ -1083,7 +1088,7 @@ impl Engine for LsmTreeEngine {
                             continue;
                         }
 
-                        match sstable::search_key_mmap(&handle.mmap, key, &self.block_cache) {
+                        match sstable::search_key_mmap(&handle.mmap, key, &self.block_cache, now) {
                             Ok(Some(v)) => {
                                 return Some((key.clone(), v));
                             }
@@ -1189,6 +1194,7 @@ impl Engine for LsmTreeEngine {
                             &handle.mmap,
                             &key,
                             &self.block_cache,
+                            now,
                         ) {
                             Ok(Some((value_opt, entry_expire_at))) => {
                                 if value_opt.is_none() {
