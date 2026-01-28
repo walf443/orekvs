@@ -544,6 +544,98 @@ impl Engine for LogEngine {
 
         Ok(())
     }
+
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status> {
+        let now = current_timestamp();
+
+        // Acquire writer lock first for atomicity (same order as other methods)
+        let mut writer = self.writer.lock().unwrap();
+        let mut index = self.index.lock().unwrap();
+
+        // Get current value if exists
+        let current_entry = index.get(&key).copied();
+        let current_value = if let Some((offset, length, entry_expire_at)) = current_entry {
+            // Check if expired
+            if entry_expire_at > 0 && now > entry_expire_at {
+                None
+            } else {
+                // Read current value from file
+                let mut file =
+                    File::open(&self.file_path).map_err(|e| Status::internal(e.to_string()))?;
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let mut buffer = vec![0u8; length];
+                file.read_exact(&mut buffer)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Some(
+                    String::from_utf8(buffer)
+                        .map_err(|e| Status::internal(format!("Invalid UTF-8: {}", e)))?,
+                )
+            }
+        } else {
+            None
+        };
+
+        // Check if CAS condition is met
+        let should_update = match (&expected_value, &current_value) {
+            (None, None) => true,     // Key should not exist, and it doesn't
+            (None, Some(_)) => false, // Key should not exist, but it does
+            (Some(expected), Some(current)) if expected == current => true, // Values match
+            (Some(_), _) => false,    // Values don't match or key doesn't exist
+        };
+
+        if !should_update {
+            return Ok((false, current_value));
+        }
+
+        // Perform the update
+        let key_bytes = key.as_bytes();
+        let val_bytes = new_value.as_bytes();
+        let key_len = key_bytes.len() as u64;
+        let val_len = val_bytes.len() as u64;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let start_offset = writer
+            .seek(SeekFrom::End(0))
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        writer
+            .write_all(&timestamp.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&expire_at.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&key_len.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(&val_len.to_le_bytes())
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(key_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .write_all(val_bytes)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        writer
+            .sync_data()
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let value_offset = start_offset + 8 + 8 + 8 + 8 + key_len;
+        index.insert(key, (value_offset, val_len as usize, expire_at));
+
+        Ok((true, current_value))
+    }
 }
 
 /// Wrapper to hold Log engine reference for graceful shutdown
@@ -587,6 +679,17 @@ impl Engine for LogEngineWrapper {
 
     fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         self.0.get_with_expire_at(key)
+    }
+
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status> {
+        self.0
+            .compare_and_set(key, expected_value, new_value, expire_at)
     }
 }
 

@@ -9,9 +9,9 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, DeleteRequest, DeleteResponse, GetExpireAtRequest, GetExpireAtResponse,
-    GetMetricsRequest, GetMetricsResponse, GetRequest, GetResponse, KeyValuePair, PromoteRequest,
-    PromoteResponse, SetRequest, SetResponse,
+    BatchSetResponse, CompareAndSetRequest, CompareAndSetResponse, DeleteRequest, DeleteResponse,
+    GetExpireAtRequest, GetExpireAtResponse, GetMetricsRequest, GetMetricsResponse, GetRequest,
+    GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest, SetResponse,
 };
 
 use crate::engine::{
@@ -218,6 +218,30 @@ impl KeyValue for MyKeyValue {
         let req = request.into_inner();
         let (exists, expire_at) = self.engine.get_expire_at(req.key)?;
         Ok(Response::new(GetExpireAtResponse { expire_at, exists }))
+    }
+
+    async fn compare_and_set(
+        &self,
+        request: Request<CompareAndSetRequest>,
+    ) -> Result<Response<CompareAndSetResponse>, Status> {
+        let req = request.into_inner();
+        let expected_value = if req.expect_exists {
+            Some(req.expected_value)
+        } else {
+            None
+        };
+        let expire_at = if req.ttl_seconds > 0 {
+            crate::engine::current_timestamp() + req.ttl_seconds
+        } else {
+            0
+        };
+        let (success, current_value) =
+            self.engine
+                .compare_and_set(req.key, expected_value, req.new_value, expire_at)?;
+        Ok(Response::new(CompareAndSetResponse {
+            success,
+            current_value: current_value.unwrap_or_default(),
+        }))
     }
 
     async fn promote_to_leader(

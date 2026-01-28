@@ -108,4 +108,24 @@ pub trait Engine: Send + Sync + 'static {
             Err(e) => Err(e),
         }
     }
+
+    /// Compare-and-set: atomically set value if current value matches expected.
+    /// Returns (success, current_value) where:
+    /// - success: true if the value was updated
+    /// - current_value: the actual current value (for debugging/retry)
+    ///
+    /// If expect_exists is false, the operation succeeds only if the key doesn't exist.
+    /// If expect_exists is true, the operation succeeds only if the key exists and
+    /// its value matches expected_value.
+    ///
+    /// expire_at: 0 = no expiration, >0 = Unix timestamp when key expires.
+    ///
+    /// Engines should override this for atomic implementation.
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status>;
 }

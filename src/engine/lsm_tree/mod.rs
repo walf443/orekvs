@@ -249,6 +249,9 @@ pub struct LsmTreeEngine {
     manifest: Arc<Mutex<Manifest>>,
     // Leveled compaction handler
     compaction_handler: LeveledCompaction,
+    // Lock for CAS (compare-and-set) atomicity
+    // Regular writes take read lock (shared), CAS takes write lock (exclusive)
+    write_lock: Arc<RwLock<()>>,
 }
 
 impl Clone for LsmTreeEngine {
@@ -273,6 +276,7 @@ impl Clone for LsmTreeEngine {
                     ..CompactionConfig::default()
                 },
             ),
+            write_lock: Arc::clone(&self.write_lock),
         }
     }
 }
@@ -368,6 +372,7 @@ impl LsmTreeEngine {
             snapshot_lock: Arc::new(RwLock::new(())),
             manifest: Arc::new(Mutex::new(recovery_result.manifest)),
             compaction_handler,
+            write_lock: Arc::new(RwLock::new(())),
         }
     }
 
@@ -1111,6 +1116,112 @@ impl Engine for LsmTreeEngine {
 
         Ok(count)
     }
+
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status> {
+        // Take exclusive write lock for CAS atomicity
+        let _write_guard = self.write_lock.write().unwrap();
+
+        let now = current_timestamp();
+
+        // Get current value (from memtable or SSTables)
+        let current_value = {
+            // Check memtable first
+            if let Some(mem_value) = self.mem_state.get(&key) {
+                if mem_value.is_tombstone() || mem_value.is_expired(now) {
+                    None
+                } else {
+                    mem_value.value
+                }
+            } else {
+                // Check SSTables
+                let leveled = self.leveled_sstables.lock().unwrap();
+                let key_bytes = key.as_bytes();
+
+                let mut found_value = None;
+                'level_loop: for level in 0..leveled.level_count() {
+                    for handle in leveled.candidates_for_key(level, key_bytes) {
+                        if !handle.bloom.contains(&key) {
+                            continue;
+                        }
+                        match sstable::search_key_mmap_with_expire(
+                            &handle.mmap,
+                            &key,
+                            &self.block_cache,
+                        ) {
+                            Ok(Some((value_opt, entry_expire_at))) => {
+                                if value_opt.is_none() {
+                                    // Tombstone
+                                    break 'level_loop;
+                                }
+                                if entry_expire_at > 0 && now > entry_expire_at {
+                                    // Expired
+                                    break 'level_loop;
+                                }
+                                found_value = value_opt;
+                                break 'level_loop;
+                            }
+                            Ok(None) => break 'level_loop, // Tombstone
+                            Err(e) if e.code() == tonic::Code::NotFound => continue,
+                            Err(_) => continue,
+                        }
+                    }
+                }
+                found_value
+            }
+        };
+
+        // Check if CAS condition is met
+        let should_update = match (&expected_value, &current_value) {
+            (None, None) => true,     // Key should not exist, and it doesn't
+            (None, Some(_)) => false, // Key should not exist, but it does
+            (Some(expected), Some(current)) if expected == current => true, // Values match
+            (Some(_), _) => false,    // Values don't match or key doesn't exist
+        };
+
+        if !should_update {
+            return Ok((false, current_value));
+        }
+
+        // Perform the update (still holding the write lock)
+        self.metrics.record_set();
+        self.mem_state.wait_if_stalled();
+
+        let value_opt = Some(new_value);
+
+        // Write to WAL
+        let wal = self.wal.clone();
+        let key_clone = key.clone();
+        let val_clone = value_opt.clone();
+        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(wal.append_pipelined_with_ttl(&key_clone, &val_clone, expire_at))
+        })?;
+
+        // Wait for WAL to be written to OS buffer
+        let _ =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
+
+        // Update MemTable
+        self.mem_state
+            .insert(key, MemValue::new_with_ttl(value_opt, expire_at));
+        self.trigger_flush_if_needed();
+
+        // Wait for disk sync
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(synced_rx)
+                .map_err(|_| Status::internal("WAL synced channel closed"))?
+                .map(|_seq| ())
+        })?;
+
+        Ok((true, current_value))
+    }
 }
 
 /// Wrapper to hold LSM engine reference for graceful shutdown
@@ -1174,6 +1285,17 @@ impl Engine for LsmTreeEngineWrapper {
 
     fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         self.0.get_with_expire_at(key)
+    }
+
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status> {
+        self.0
+            .compare_and_set(key, expected_value, new_value, expire_at)
     }
 }
 

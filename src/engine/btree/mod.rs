@@ -640,6 +640,93 @@ impl Engine for BTreeEngine {
             _ => Err(Status::not_found("Key not found")),
         }
     }
+
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status> {
+        let now = current_timestamp();
+
+        // Take write lock on meta for atomicity (held throughout the entire CAS operation)
+        let mut meta = self.meta.write().unwrap();
+
+        // Get current value if exists
+        let current_value = if meta.root_page_id == 0 {
+            None
+        } else {
+            let leaf_page_id = self.find_leaf(meta.root_page_id, &key, meta.tree_height)?;
+            let leaf = self.get_leaf(leaf_page_id)?;
+            match leaf.get(&key) {
+                Some(entry) if entry.is_valid(now) => entry.value.clone(),
+                _ => None,
+            }
+        };
+
+        // Check if CAS condition is met
+        let should_update = match (&expected_value, &current_value) {
+            (None, None) => true,     // Key should not exist, and it doesn't
+            (None, Some(_)) => false, // Key should not exist, but it does
+            (Some(expected), Some(current)) if expected == current => true, // Values match
+            (Some(_), _) => false,    // Values don't match or key doesn't exist
+        };
+
+        if !should_update {
+            return Ok((false, current_value));
+        }
+
+        // Perform the update while holding the meta lock
+        // Log to WAL first
+        if let Some(wal) = &self.wal {
+            let seq = wal
+                .log_insert_with_ttl(&key, &new_value, expire_at)
+                .map_err(|e| Status::internal(format!("Failed to write WAL: {}", e)))?;
+            self.current_wal_seq.fetch_max(seq, Ordering::SeqCst);
+        }
+
+        let entry = if expire_at > 0 {
+            LeafEntry::new_with_ttl(key, new_value, expire_at)
+        } else {
+            LeafEntry::new(key, new_value)
+        };
+
+        if meta.root_page_id == 0 {
+            // Empty tree - create root leaf
+            let (page_id, mut leaf) = self
+                .buffer_pool
+                .new_leaf()
+                .map_err(|e| Status::internal(format!("Failed to create leaf: {}", e)))?;
+            leaf.insert(entry);
+            self.buffer_pool
+                .put(page_id, CachedNode::Leaf(leaf))
+                .map_err(|e| Status::internal(format!("Failed to cache leaf: {}", e)))?;
+            meta.root_page_id = page_id;
+            meta.tree_height = 1;
+            meta.entry_count = 1;
+            meta.page_count = self.buffer_pool.page_count();
+            return Ok((true, current_value));
+        }
+
+        // Traverse to leaf and insert
+        let insert_result = self.insert_recursive(meta.root_page_id, entry, meta.tree_height)?;
+
+        if let Some((split_key, right_page_id)) = insert_result {
+            // Root split - create new root
+            let (new_root_id, _) = self
+                .buffer_pool
+                .new_internal(meta.root_page_id, split_key, right_page_id)
+                .map_err(|e| Status::internal(format!("Failed to create root: {}", e)))?;
+            meta.root_page_id = new_root_id;
+            meta.tree_height += 1;
+        }
+
+        meta.entry_count += 1;
+        meta.page_count = self.buffer_pool.page_count();
+
+        Ok((true, current_value))
+    }
 }
 
 impl Drop for BTreeEngine {
@@ -714,5 +801,16 @@ impl Engine for BTreeEngineWrapper {
 
     fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         self.0.get_with_expire_at(key)
+    }
+
+    fn compare_and_set(
+        &self,
+        key: String,
+        expected_value: Option<String>,
+        new_value: String,
+        expire_at: u64,
+    ) -> Result<(bool, Option<String>), Status> {
+        self.0
+            .compare_and_set(key, expected_value, new_value, expire_at)
     }
 }

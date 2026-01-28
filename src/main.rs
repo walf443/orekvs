@@ -7,8 +7,8 @@ use serde::Serialize;
 use server::EngineType;
 use server::kv::key_value_client::KeyValueClient;
 use server::kv::{
-    BatchDeleteRequest, BatchGetRequest, BatchSetRequest, DeleteRequest, GetExpireAtRequest,
-    GetMetricsRequest, GetRequest, KeyValuePair, SetRequest,
+    BatchDeleteRequest, BatchGetRequest, BatchSetRequest, CompareAndSetRequest, DeleteRequest,
+    GetExpireAtRequest, GetMetricsRequest, GetRequest, KeyValuePair, SetRequest,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -164,6 +164,12 @@ enum TestCommands {
         /// TTL in seconds (0 = no expiration)
         #[arg(long, default_value_t = 0)]
         ttl: u64,
+        /// Only set if key does not exist (like Redis NX)
+        #[arg(long, conflicts_with = "if_match")]
+        if_not_exists: bool,
+        /// Only set if current value matches this value (CAS)
+        #[arg(long, conflicts_with = "if_not_exists")]
+        if_match: Option<String>,
     },
     /// Get the value of a key
     Get {
@@ -307,15 +313,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 batch_size,
                 key_range,
             } => run_test_batch_delete(addr.clone(), *count, *batch_size, *key_range).await,
-            TestCommands::Set { key, value, ttl } => {
+            TestCommands::Set {
+                key,
+                value,
+                ttl,
+                if_not_exists,
+                if_match,
+            } => {
                 let mut client = KeyValueClient::connect(addr.clone()).await?;
-                let request = tonic::Request::new(SetRequest {
-                    key: key.clone(),
-                    value: value.clone(),
-                    ttl_seconds: *ttl,
-                });
-                let response = client.set(request).await?;
-                println!("RESPONSE={:?}", response);
+
+                // Use CAS if conditional options are specified
+                if *if_not_exists || if_match.is_some() {
+                    let (expected_value, expect_exists) = if *if_not_exists {
+                        (String::new(), false)
+                    } else {
+                        (if_match.clone().unwrap(), true)
+                    };
+
+                    let request = tonic::Request::new(CompareAndSetRequest {
+                        key: key.clone(),
+                        expected_value,
+                        new_value: value.clone(),
+                        expect_exists,
+                        ttl_seconds: *ttl,
+                    });
+
+                    match client.compare_and_set(request).await {
+                        Ok(response) => {
+                            let resp = response.into_inner();
+                            if resp.success {
+                                println!("OK");
+                            } else {
+                                println!(
+                                    "FAILED: current_value={}",
+                                    if resp.current_value.is_empty() {
+                                        "(key not found)".to_string()
+                                    } else {
+                                        format!("\"{}\"", resp.current_value)
+                                    }
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error: {}", e);
+                        }
+                    }
+                } else {
+                    // Normal set
+                    let request = tonic::Request::new(SetRequest {
+                        key: key.clone(),
+                        value: value.clone(),
+                        ttl_seconds: *ttl,
+                    });
+                    let response = client.set(request).await?;
+                    if response.into_inner().success {
+                        println!("OK");
+                    }
+                }
                 Ok(())
             }
             TestCommands::Get {

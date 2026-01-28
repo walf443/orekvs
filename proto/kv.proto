@@ -12,6 +12,8 @@ service KeyValue {
   rpc GetMetrics (GetMetricsRequest) returns (GetMetricsResponse);
   // Get the expiration timestamp for a key (0 = no expiration or key not found)
   rpc GetExpireAt (GetExpireAtRequest) returns (GetExpireAtResponse);
+  // Compare-and-set: atomically set value if current value matches expected
+  rpc CompareAndSet (CompareAndSetRequest) returns (CompareAndSetResponse);
   // Promote follower to leader (stops replication, enables writes)
   rpc PromoteToLeader (PromoteRequest) returns (PromoteResponse);
 }
@@ -91,6 +93,25 @@ message GetExpireAtResponse {
   uint64 expire_at = 1;
   // Whether the key exists
   bool exists = 2;
+}
+
+message CompareAndSetRequest {
+  string key = 1;
+  // Expected current value. If expect_exists is false, this is ignored.
+  string expected_value = 2;
+  // New value to set if the condition is met
+  string new_value = 3;
+  // If false, the key must not exist for CAS to succeed
+  bool expect_exists = 4;
+  // TTL in seconds (0 = no expiration)
+  uint64 ttl_seconds = 5;
+}
+
+message CompareAndSetResponse {
+  // true if the value was updated, false if the condition was not met
+  bool success = 1;
+  // The actual current value (for debugging/retry). Empty if key doesn't exist.
+  string current_value = 2;
 }
 
 message PromoteRequest {

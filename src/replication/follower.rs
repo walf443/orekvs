@@ -17,9 +17,9 @@ use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationServi
 use crate::server::kv::key_value_server::{KeyValue, KeyValueServer};
 use crate::server::kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, DeleteRequest, DeleteResponse, GetExpireAtRequest, GetExpireAtResponse,
-    GetMetricsRequest, GetMetricsResponse, GetRequest, GetResponse, KeyValuePair, PromoteRequest,
-    PromoteResponse, SetRequest, SetResponse,
+    BatchSetResponse, CompareAndSetRequest, CompareAndSetResponse, DeleteRequest, DeleteResponse,
+    GetExpireAtRequest, GetExpireAtResponse, GetMetricsRequest, GetMetricsResponse, GetRequest,
+    GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest, SetResponse,
 };
 
 /// Run as a follower, replicating from a leader
@@ -461,6 +461,38 @@ impl KeyValue for SwappableFollowerKeyValue {
         };
         let (exists, expire_at) = engine.get_expire_at(req.key)?;
         Ok(Response::new(GetExpireAtResponse { expire_at, exists }))
+    }
+
+    async fn compare_and_set(
+        &self,
+        request: Request<CompareAndSetRequest>,
+    ) -> Result<Response<CompareAndSetResponse>, Status> {
+        if !self.state.is_write_enabled() {
+            return Err(Status::failed_precondition(
+                "This is a read-only follower. Writes must go to the leader, or promote this node first.",
+            ));
+        }
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().unwrap();
+            Arc::clone(&*guard)
+        };
+        let expected_value = if req.expect_exists {
+            Some(req.expected_value)
+        } else {
+            None
+        };
+        let expire_at = if req.ttl_seconds > 0 {
+            crate::engine::current_timestamp() + req.ttl_seconds
+        } else {
+            0
+        };
+        let (success, current_value) =
+            engine.compare_and_set(req.key, expected_value, req.new_value, expire_at)?;
+        Ok(Response::new(CompareAndSetResponse {
+            success,
+            current_value: current_value.unwrap_or_default(),
+        }))
     }
 
     async fn promote_to_leader(
