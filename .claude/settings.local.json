@@ -16,7 +16,9 @@
       "Bash(for:*)",
       "Bash(do echo \"Run $i:\")",
       "Bash(done)",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(ls:*)",
+      "Bash(xxd:*)"
     ]
   }
 }
