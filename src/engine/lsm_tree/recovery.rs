@@ -130,10 +130,25 @@ fn load_manifest(data_dir: &Path) -> Manifest {
 }
 
 /// Build SSTable handles from scanned files
+/// Only loads SSTables that are tracked in the manifest.
+/// Orphaned SSTables (files not in manifest) are deleted.
 fn build_sstable_handles(sst_files: &[PathBuf], manifest: &Manifest) -> LeveledSstables {
     let mut leveled_sstables = LeveledSstables::new();
 
     for p in sst_files {
+        let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        // Check if this SSTable is tracked in manifest
+        let manifest_entry = manifest.get_entry(filename);
+        if manifest_entry.is_none() {
+            // Orphaned SSTable - delete it
+            println!("Deleting orphaned SSTable not in manifest: {:?}", p);
+            if let Err(e) = fs::remove_file(p) {
+                eprintln!("Warning: Failed to delete orphaned SSTable {:?}: {}", p, e);
+            }
+            continue;
+        }
+
         // Open mmap for the SSTable
         let mmap = match MappedSSTable::open(p) {
             Ok(m) => m,
@@ -149,9 +164,7 @@ fn build_sstable_handles(sst_files: &[PathBuf], manifest: &Manifest) -> LeveledS
             .expect("Failed to read Bloom filter from SSTable");
         let handle = Arc::new(SstableHandle { mmap, bloom });
 
-        // Get level from manifest, default to L0 if not found
-        let filename = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let level = manifest.get_entry(filename).map(|e| e.level).unwrap_or(0);
+        let level = manifest_entry.unwrap().level;
         leveled_sstables.add_to_level(level, handle);
     }
 

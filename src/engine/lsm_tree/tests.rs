@@ -1407,6 +1407,50 @@ async fn test_wal_recovery_filters_expired_keys() {
     }
 }
 
+/// Test that orphaned SSTables (files not in manifest) are deleted during recovery
+#[tokio::test(flavor = "multi_thread")]
+async fn test_orphaned_sstable_cleanup() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Phase 1: Create engine and write some data, flush to SSTable
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+
+        engine.set("k1".to_string(), "v1".to_string()).unwrap();
+        engine.set("k2".to_string(), "v2".to_string()).unwrap();
+
+        wait_for_flush(&engine, 2000).await;
+
+        engine.shutdown().await;
+    }
+
+    // Create an orphaned SSTable file (not in manifest)
+    let orphan_path = dir.path().join("sst_99999_99999.data");
+    std::fs::write(&orphan_path, b"fake sstable data").unwrap();
+    assert!(
+        orphan_path.exists(),
+        "Orphan file should exist before recovery"
+    );
+
+    // Phase 2: Reopen engine - orphaned SSTable should be deleted
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        // Verify data was recovered
+        assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+        assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+
+        engine.shutdown().await;
+    }
+
+    // Orphan file should be deleted
+    assert!(
+        !orphan_path.exists(),
+        "Orphaned SSTable should be deleted during recovery"
+    );
+}
+
 /// Test that WAL files are registered in manifest during recovery
 /// This ensures old WAL files can be properly cleaned up after their entries are flushed
 #[tokio::test(flavor = "multi_thread")]
