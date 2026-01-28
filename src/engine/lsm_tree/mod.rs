@@ -355,7 +355,28 @@ impl LsmTreeEngine {
         }
 
         // Recover state from disk (SSTables, WAL, manifest)
-        let recovery_result = recovery::recover(&data_dir);
+        let mut recovery_result = recovery::recover(&data_dir);
+
+        // Register recovered WAL files in manifest for proper cleanup
+        // This ensures old WAL files can be deleted after their entries are flushed
+        if !recovery_result.wal_file_max_seqs.is_empty() {
+            for (wal_id, max_seq) in &recovery_result.wal_file_max_seqs {
+                recovery_result
+                    .manifest
+                    .record_wal_file_max_seq(*wal_id, *max_seq);
+            }
+            if let Err(e) = recovery_result.manifest.save(&data_dir) {
+                eprintln!(
+                    "Warning: Failed to save manifest after registering WAL files: {}",
+                    e
+                );
+            } else {
+                println!(
+                    "Registered {} WAL files in manifest for cleanup tracking",
+                    recovery_result.wal_file_max_seqs.len()
+                );
+            }
+        }
 
         // Create new WAL file with group commit, starting from max recovered sequence number
         let wal_config = GroupCommitConfig::with_batch_interval(wal_batch_interval_micros);

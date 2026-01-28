@@ -1406,3 +1406,56 @@ async fn test_wal_recovery_filters_expired_keys() {
         engine.shutdown().await;
     }
 }
+
+/// Test that WAL files are registered in manifest during recovery
+/// This ensures old WAL files can be properly cleaned up after their entries are flushed
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wal_files_registered_on_recovery() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Phase 1: Create engine and write some data
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        engine.set("k1".to_string(), "v1".to_string()).unwrap();
+        engine.set("k2".to_string(), "v2".to_string()).unwrap();
+
+        // Wait for WAL group commit
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Check manifest - should have no WAL files registered yet (no rotation)
+        let wal_file_count = {
+            let manifest = engine.manifest.lock().unwrap();
+            manifest.wal_file_max_seq.len()
+        };
+        assert_eq!(
+            wal_file_count, 0,
+            "No WAL files should be registered before rotation"
+        );
+
+        engine.shutdown().await;
+    }
+
+    // Phase 2: Reopen engine - WAL files should be registered during recovery
+    {
+        let engine = LsmTreeEngine::new(data_dir.clone(), 1024 * 1024, 100);
+
+        // Verify data was recovered
+        assert_eq!(engine.get("k1".to_string()).unwrap(), "v1");
+        assert_eq!(engine.get("k2".to_string()).unwrap(), "v2");
+
+        // Check manifest - old WAL files should now be registered
+        let wal_file_count = {
+            let manifest = engine.manifest.lock().unwrap();
+            manifest.wal_file_max_seq.len()
+        };
+        assert!(
+            wal_file_count >= 1,
+            "WAL files should be registered after recovery, got {}",
+            wal_file_count
+        );
+
+        engine.shutdown().await;
+    }
+}

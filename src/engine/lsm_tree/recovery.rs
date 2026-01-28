@@ -34,6 +34,9 @@ pub struct RecoveryResult {
     pub next_wal_id: u64,
     /// Maximum WAL sequence number recovered
     pub max_wal_seq: u64,
+    /// WAL file max sequences: (wal_id, max_seq) for each WAL file
+    /// Used to register WAL files in manifest for proper cleanup
+    pub wal_file_max_seqs: Vec<(u64, u64)>,
 }
 
 /// Scanned file information from data directory
@@ -160,20 +163,36 @@ fn is_expired(expire_at: u64, now: u64) -> bool {
     expire_at > 0 && expire_at <= now
 }
 
+/// Result of memtable recovery
+struct MemtableRecoveryResult {
+    memtable: MemTable,
+    size: u64,
+    max_wal_seq: u64,
+    /// WAL file max sequences: (wal_id, max_seq)
+    wal_file_max_seqs: Vec<(u64, u64)>,
+}
+
 /// Recover MemTable from WAL files
 fn recover_memtable(
     wal_files: &[(u64, PathBuf)],
     max_wal_id_in_sst: u64,
     has_sstables_with_wal_id: bool,
     last_flushed_wal_seq: u64,
-) -> (MemTable, u64, u64) {
+) -> MemtableRecoveryResult {
     let mut recovered_memtable: MemTable = BTreeMap::new();
     let mut recovered_size: u64 = 0;
     let mut max_wal_seq = last_flushed_wal_seq;
+    let mut wal_file_max_seqs: Vec<(u64, u64)> = Vec::new();
     let now = current_timestamp();
     let mut skipped_expired = 0u64;
 
     for (wal_id, wal_path) in wal_files {
+        // Get max_seq for this WAL file (for manifest registration)
+        let wal_max_seq = GroupCommitWalWriter::get_max_seq(wal_path);
+        if wal_max_seq > 0 {
+            wal_file_max_seqs.push((*wal_id, wal_max_seq));
+        }
+
         // Recover WAL files that are newer than the latest flushed WAL ID
         // If no SSTables have WAL ID info, recover all WAL files
         let should_recover = !has_sstables_with_wal_id || *wal_id > max_wal_id_in_sst;
@@ -255,7 +274,12 @@ fn recover_memtable(
         );
     }
 
-    (recovered_memtable, recovered_size, max_wal_seq)
+    MemtableRecoveryResult {
+        memtable: recovered_memtable,
+        size: recovered_size,
+        max_wal_seq,
+        wal_file_max_seqs,
+    }
 }
 
 /// Perform full recovery of engine state from disk
@@ -276,7 +300,7 @@ pub fn recover(data_dir: &Path) -> RecoveryResult {
         .any(|p| sstable::extract_wal_id_from_sstable(p).is_some());
 
     // Recover MemTable from WAL
-    let (recovered_memtable, recovered_size, max_wal_seq) = recover_memtable(
+    let memtable_result = recover_memtable(
         &scanned.wal_files,
         scanned.max_wal_id_in_sst,
         has_sstables_with_wal_id,
@@ -293,10 +317,11 @@ pub fn recover(data_dir: &Path) -> RecoveryResult {
     RecoveryResult {
         leveled_sstables,
         manifest,
-        recovered_memtable,
-        recovered_size,
+        recovered_memtable: memtable_result.memtable,
+        recovered_size: memtable_result.size,
         next_sst_id: scanned.max_sst_id,
         next_wal_id,
-        max_wal_seq,
+        max_wal_seq: memtable_result.max_wal_seq,
+        wal_file_max_seqs: memtable_result.wal_file_max_seqs,
     }
 }

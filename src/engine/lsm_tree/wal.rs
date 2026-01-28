@@ -617,6 +617,26 @@ impl GroupCommitWalWriter {
             .collect())
     }
 
+    /// Get the maximum sequence number in a WAL file
+    /// Returns 0 if the file is empty or cannot be read
+    pub fn get_max_seq(path: &Path) -> u64 {
+        let mut file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return 0,
+        };
+
+        // Verify header
+        if read_wal_header(&mut file).is_err() {
+            return 0;
+        }
+
+        // Read all entries and find max seq
+        match Self::read_entries_v4(&mut file) {
+            Ok(entries) => entries.iter().map(|e| e.seq).max().unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
     /// Read entries from WAL v4 format (with sequence numbers)
     ///
     /// Uses the common block format from `crate::engine::wal::read_block`.
