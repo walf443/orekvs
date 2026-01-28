@@ -140,20 +140,38 @@ pub async fn run_follower(
         let replicator = FollowerReplicator::new(leader_addr.clone(), data_path_for_repl.clone());
         let engine_holder_clone = Arc::clone(&engine_holder_for_repl);
 
-        // Apply WAL entries to the engine
+        // Apply WAL entries to the engine in batches
         let result = replicator
-            .start(move |entry| {
+            .start(move |entries| {
                 // Get current engine reference (using std::sync::RwLock)
                 let engine = {
                     let guard = engine_holder_clone.read().unwrap();
                     Arc::clone(&*guard)
                 };
 
-                if let Some(value) = entry.value {
-                    engine.set_with_expire_at(entry.key, value, entry.expire_at)
-                } else {
-                    engine.delete(entry.key)
+                // Separate sets and deletes
+                let mut sets: Vec<(String, String, u64)> = Vec::new();
+                let mut deletes: Vec<String> = Vec::new();
+
+                for entry in entries {
+                    if let Some(value) = entry.value {
+                        sets.push((entry.key, value, entry.expire_at));
+                    } else {
+                        deletes.push(entry.key);
+                    }
                 }
+
+                // Apply batch set (optimized: single WAL write)
+                if !sets.is_empty() {
+                    engine.batch_set_with_expire_at(sets)?;
+                }
+
+                // Apply deletes
+                for key in deletes {
+                    engine.delete(key)?;
+                }
+
+                Ok(())
             })
             .await;
 

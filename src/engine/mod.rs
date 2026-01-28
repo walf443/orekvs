@@ -74,6 +74,20 @@ pub trait Engine: Send + Sync + 'static {
         Ok(count)
     }
 
+    /// Batch set multiple key-value pairs with absolute expiration timestamps.
+    /// Each item is (key, value, expire_at) where expire_at: 0 = no expiration.
+    /// This is primarily used for replication to preserve original TTLs.
+    /// Default implementation calls set_with_expire_at() for each item.
+    /// Engines can override this for optimized batch processing.
+    fn batch_set_with_expire_at(&self, items: Vec<(String, String, u64)>) -> Result<usize, Status> {
+        let mut count = 0;
+        for (key, value, expire_at) in items {
+            self.set_with_expire_at(key, value, expire_at)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Batch get multiple keys.
     /// Default implementation calls get() for each key.
     /// Engines can override this for optimized batch processing.

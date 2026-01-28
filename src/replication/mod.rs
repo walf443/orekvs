@@ -681,9 +681,10 @@ impl FollowerReplicator {
 
     /// Start replication from leader
     /// Returns SnapshotApplied if a snapshot was downloaded and the caller should reload the engine
+    /// The apply_fn receives a batch of WAL entries to apply atomically.
     pub async fn start<F>(&self, mut apply_fn: F) -> Result<(), Status>
     where
-        F: FnMut(WalEntry) -> Result<(), Status> + Send,
+        F: FnMut(Vec<WalEntry>) -> Result<(), Status> + Send,
     {
         let (mut wal_id, mut offset) = self.load_replication_state();
         println!("Starting replication from WAL {} offset {}", wal_id, offset);
@@ -815,7 +816,7 @@ impl FollowerReplicator {
         apply_fn: &mut F,
     ) -> Result<ReplicationResult, Status>
     where
-        F: FnMut(WalEntry) -> Result<(), Status>,
+        F: FnMut(Vec<WalEntry>) -> Result<(), Status>,
     {
         let mut client = ReplicationClient::connect(self.leader_addr.clone())
             .await
@@ -879,9 +880,9 @@ impl FollowerReplicator {
             // Parse entries
             let entries = deserialize_entries(&decompressed)?;
 
-            // Apply entries
-            for entry in entries {
-                apply_fn(entry)?;
+            // Apply entries as a batch
+            if !entries.is_empty() {
+                apply_fn(entries)?;
             }
 
             // Update position

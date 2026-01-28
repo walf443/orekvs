@@ -1187,6 +1187,51 @@ impl Engine for LsmTreeEngine {
         Ok(count)
     }
 
+    fn batch_set_with_expire_at(&self, items: Vec<(String, String, u64)>) -> Result<usize, Status> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+
+        // 0. Wait if too many immutable memtables are pending (write stall prevention)
+        self.mem_state.wait_if_stalled();
+
+        let count = items.len();
+        self.metrics.record_batch_set(count as u64);
+
+        // Convert to WAL format (key, Some(value), expire_at)
+        let entries: Vec<(String, Option<String>, u64)> = items
+            .iter()
+            .map(|(k, v, e)| (k.clone(), Some(v.clone()), *e))
+            .collect();
+
+        // 1. Start writing batch to WAL
+        let wal = self.wal.clone();
+        let (written_rx, synced_rx) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(wal.append_batch_pipelined_with_ttl(entries))
+        })?;
+
+        // 2. Wait for WAL to be written to OS buffer
+        let _ =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(written_rx));
+
+        // 3. Update MemTable with all entries (they become visible to Get)
+        for (key, value, expire_at) in items {
+            self.mem_state
+                .insert(key, MemValue::new_with_ttl(Some(value), expire_at));
+        }
+        self.trigger_flush_if_needed();
+
+        // 4. Wait for disk sync for durability
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(synced_rx)
+                .map_err(|_| Status::internal("WAL synced channel closed"))?
+                .map(|_seq| ()) // Discard the sequence number
+        })?;
+
+        Ok(count)
+    }
+
     fn batch_get(&self, mut keys: Vec<String>) -> Vec<(String, String)> {
         if keys.is_empty() {
             return Vec::new();
@@ -1437,6 +1482,10 @@ impl Engine for LsmTreeEngineWrapper {
 
     fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
         self.0.batch_set(items)
+    }
+
+    fn batch_set_with_expire_at(&self, items: Vec<(String, String, u64)>) -> Result<usize, Status> {
+        self.0.batch_set_with_expire_at(items)
     }
 
     fn batch_get(&self, keys: Vec<String>) -> Vec<(String, String)> {
