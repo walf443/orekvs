@@ -263,6 +263,9 @@ impl KeyValue for MyKeyValue {
         request: Request<CountRequest>,
     ) -> Result<Response<CountResponse>, Status> {
         let req = request.into_inner();
+        if req.prefix.is_empty() {
+            return Err(Status::not_found("Prefix cannot be empty"));
+        }
         let count = self.engine.count(&req.prefix)?;
         Ok(Response::new(CountResponse { count }))
     }
@@ -381,4 +384,68 @@ pub async fn run_server(
     btree_holder.shutdown();
 
     println!("Server stopped.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kv::CountRequest;
+
+    #[tokio::test]
+    async fn test_count_empty_prefix_returns_not_found() {
+        let mut lsm_holder = LsmEngineHolder::new();
+        let mut log_holder = LogEngineHolder::new();
+        let mut btree_holder = BTreeEngineHolder::new();
+
+        let key_value = MyKeyValue::new(
+            EngineType::Memory,
+            String::new(),
+            0,
+            0,
+            0,
+            0,
+            &mut lsm_holder,
+            &mut log_holder,
+            &mut btree_holder,
+            WalArchiveConfig::default(),
+        );
+
+        let request = Request::new(CountRequest {
+            prefix: "".to_string(),
+        });
+        let result = key_value.count(request).await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "Prefix cannot be empty");
+    }
+
+    #[tokio::test]
+    async fn test_count_non_empty_prefix_succeeds() {
+        let mut lsm_holder = LsmEngineHolder::new();
+        let mut log_holder = LogEngineHolder::new();
+        let mut btree_holder = BTreeEngineHolder::new();
+
+        let key_value = MyKeyValue::new(
+            EngineType::Memory,
+            String::new(),
+            0,
+            0,
+            0,
+            0,
+            &mut lsm_holder,
+            &mut log_holder,
+            &mut btree_holder,
+            WalArchiveConfig::default(),
+        );
+
+        let request = Request::new(CountRequest {
+            prefix: "test".to_string(),
+        });
+        let result = key_value.count(request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().into_inner().count, 0);
+    }
 }
