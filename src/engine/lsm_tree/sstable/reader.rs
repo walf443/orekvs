@@ -211,6 +211,29 @@ impl MappedSSTable {
         key >= self.min_key.as_slice() && key <= self.max_key.as_slice()
     }
 
+    /// Check if this SSTable might contain keys with the given prefix.
+    /// Returns false if we can definitively skip this SSTable.
+    ///
+    /// Skip conditions:
+    /// - max_key < prefix: all keys are before the prefix range
+    /// - min_key > prefix AND min_key doesn't start with prefix: all keys are after the prefix range
+    pub fn may_contain_prefix(&self, prefix: &str) -> bool {
+        let prefix_bytes = prefix.as_bytes();
+
+        // If max_key < prefix, all keys in this SSTable are before the prefix range
+        if self.max_key.as_slice() < prefix_bytes {
+            return false;
+        }
+
+        // If min_key > prefix AND min_key doesn't start with prefix,
+        // all keys in this SSTable are after the prefix range
+        if self.min_key.as_slice() > prefix_bytes && !self.min_key.starts_with(prefix_bytes) {
+            return false;
+        }
+
+        true
+    }
+
     /// Read index with caching (returns reference to cached data)
     ///
     /// The index is decompressed and parsed on first access, then cached
@@ -1481,6 +1504,51 @@ mod tests {
         let sst = MappedSSTable::open(&sst_path).unwrap();
         assert_eq!(sst.min_key(), b"");
         assert_eq!(sst.max_key(), b"");
+    }
+
+    #[test]
+    fn test_may_contain_prefix() {
+        use crate::engine::lsm_tree::memtable::MemValue;
+
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("sst_prefix.data");
+
+        // Create SSTable with keys: log:00001, log:00002, log:00003
+        let mut memtable: BTreeMap<String, MemValue> = BTreeMap::new();
+        memtable.insert(
+            "log:00001".to_string(),
+            MemValue::new(Some("v1".to_string())),
+        );
+        memtable.insert(
+            "log:00002".to_string(),
+            MemValue::new(Some("v2".to_string())),
+        );
+        memtable.insert(
+            "log:00003".to_string(),
+            MemValue::new(Some("v3".to_string())),
+        );
+        create_from_memtable(&sst_path, &memtable).unwrap();
+
+        let sst = MappedSSTable::open(&sst_path).unwrap();
+        assert_eq!(sst.min_key(), b"log:00001");
+        assert_eq!(sst.max_key(), b"log:00003");
+
+        // Should contain "log:" prefix
+        assert!(sst.may_contain_prefix("log:"));
+        assert!(sst.may_contain_prefix("log:0"));
+        assert!(sst.may_contain_prefix("log:00"));
+        assert!(sst.may_contain_prefix("log:0000"));
+
+        // Should NOT contain prefixes before the range
+        assert!(!sst.may_contain_prefix("aaa:")); // max_key (log:00003) > "aaa:", but all keys start with "log:"
+
+        // Should NOT contain prefixes after the range
+        assert!(!sst.may_contain_prefix("zzz:")); // min_key (log:00001) < "zzz:" but doesn't start with "zzz:"
+        assert!(!sst.may_contain_prefix("user:")); // min_key (log:00001) < "user:" but doesn't start with "user:"
+
+        // Edge case: prefix that overlaps partially
+        assert!(sst.may_contain_prefix("l")); // should match
+        assert!(!sst.may_contain_prefix("m")); // min_key > "m" and doesn't start with "m"
     }
 
     /// Test that GET operations skip decompression for fully expired blocks

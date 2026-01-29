@@ -764,6 +764,11 @@ impl Engine for LsmTreeEngine {
             let handles = leveled.to_flat_list();
 
             for handle in &handles {
+                // Skip SSTables that definitely don't contain keys with this prefix
+                if !handle.mmap.may_contain_prefix(prefix) {
+                    continue;
+                }
+
                 // Scan SSTable for keys with the prefix
                 if let Ok(entries) =
                     sstable::scan_prefix_mmap(&handle.mmap, prefix, &self.block_cache, now)
