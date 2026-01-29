@@ -707,7 +707,7 @@ fn search_in_parsed_block(
     entries: &[ParsedBlockEntry],
     key: &str,
 ) -> Result<Option<String>, Status> {
-    match entries.binary_search_by(|(k, _, _)| (**k).cmp(key)) {
+    match entries.binary_search_by(|(k, _, _)| k.as_ref().cmp(key)) {
         Ok(idx) => {
             // Found the key
             Ok(entries[idx].1.clone())
@@ -726,7 +726,7 @@ fn search_in_parsed_block_with_expire(
     entries: &[ParsedBlockEntry],
     key: &str,
 ) -> Result<Option<(Option<String>, u64)>, Status> {
-    match entries.binary_search_by(|(k, _, _)| (**k).cmp(key)) {
+    match entries.binary_search_by(|(k, _, _)| k.as_ref().cmp(key)) {
         Ok(idx) => {
             // Found the key - return value and expire_at
             let (_, value, expire_at) = &entries[idx];
@@ -789,7 +789,7 @@ pub fn scan_prefix_mmap(
             if key.starts_with(prefix) {
                 found_any_in_block = true;
                 results.push((key.to_string(), value.clone(), *expire_at));
-            } else if &**key > prefix && !key.starts_with(prefix) && found_any_in_block {
+            } else if key.as_ref() > prefix && !key.starts_with(prefix) && found_any_in_block {
                 // Passed the prefix range and we already found some keys, done
                 return Ok(results);
             }
@@ -799,7 +799,7 @@ pub fn scan_prefix_mmap(
         // we can stop scanning
         if !found_any_in_block && !parsed_entries.is_empty() {
             let first_key = &parsed_entries[0].0;
-            if &**first_key > prefix && !first_key.starts_with(prefix) {
+            if first_key.as_ref() > prefix && !first_key.starts_with(prefix) {
                 break;
             }
         }
@@ -852,7 +852,7 @@ pub fn scan_prefix_keys_mmap(
         let parsed_entries =
             get_or_load_parsed_block_mmap(sst, &canonical_path, *block_offset, cache)?;
 
-        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| &**k);
+        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| k.as_ref());
         let mut found_any_in_block = false;
 
         // Convert ParsedBlockEntry to key-only format
@@ -861,7 +861,7 @@ pub fn scan_prefix_keys_mmap(
                 found_any_in_block = true;
                 let is_tombstone = value_opt.is_none();
                 results.push((key.to_string(), is_tombstone, *expire_at));
-            } else if &**key > prefix && !key.starts_with(prefix) && found_any_in_block {
+            } else if key.as_ref() > prefix && !key.starts_with(prefix) && found_any_in_block {
                 // Passed the prefix range and we already found some keys, done
                 return Ok(results);
             }
@@ -932,7 +932,7 @@ pub fn count_prefix_keys_mmap(
         let parsed_entries =
             get_or_load_parsed_block_mmap(sst, &canonical_path, *block_offset, cache)?;
 
-        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| &**k);
+        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| k.as_ref());
         let mut found_any_in_block = false;
 
         for (key, value_opt, expire_at) in parsed_entries.iter() {
@@ -947,7 +947,7 @@ pub fn count_prefix_keys_mmap(
                         count += 1;
                     }
                 }
-            } else if &**key > prefix && !key.starts_with(prefix) && found_any_in_block {
+            } else if key.as_ref() > prefix && !key.starts_with(prefix) && found_any_in_block {
                 // Passed the prefix range and we already found some keys, done
                 return Ok(count);
             }
