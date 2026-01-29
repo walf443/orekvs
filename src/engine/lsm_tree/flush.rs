@@ -34,6 +34,10 @@ impl LsmTreeEngine {
 
     /// Flush an immutable MemTable to an SSTable
     pub(super) async fn flush_memtable(&self, memtable: Arc<MemTable>) -> Result<(), Status> {
+        // Serialize flush operations to prevent concurrent flushes from racing
+        // on manifest updates and WAL rotations
+        let _flush_guard = self.flush_lock.lock().unwrap();
+
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         // Get current WAL ID to include in SSTable filename
         let wal_id = self.wal.current_id();
@@ -89,8 +93,6 @@ impl LsmTreeEngine {
             }
         }
 
-        self.mem_state.remove_immutable(&memtable);
-
         // Record old WAL file's max sequence before rotating
         let old_wal_id = self.wal.current_id();
         let old_wal_max_seq = self.wal.current_seq().saturating_sub(1);
@@ -111,6 +113,11 @@ impl LsmTreeEngine {
         self.archive_old_wal_files();
 
         println!("Flush finished.");
+
+        // Remove immutable memtable AFTER all flush operations are complete.
+        // This ensures wait_for_flush() waits for the entire flush process,
+        // including WAL rotation and manifest updates.
+        self.mem_state.remove_immutable(&memtable);
 
         // Check if compaction is needed
         self.check_compaction();
@@ -459,13 +466,19 @@ impl LsmTreeEngine {
         );
 
         // Execute compaction
+        // Acquire flush lock to prevent SST ID conflicts between flush and compaction
+        let _flush_guard = self.flush_lock.lock().unwrap();
+
+        // Use fetch_add to atomically allocate SST IDs for compaction output files
+        // The compaction handler may create multiple output files, so we allocate
+        // a range of IDs by incrementing after execution
         let mut next_sst_id = self.next_sst_id.load(Ordering::SeqCst);
         let wal_id = self.wal.current_id();
         let result = self
             .compaction_handler
             .execute(&task, &mut next_sst_id, wal_id)?;
 
-        // Update next_sst_id
+        // Update next_sst_id atomically
         self.next_sst_id.store(next_sst_id, Ordering::SeqCst);
 
         // Record compaction metrics

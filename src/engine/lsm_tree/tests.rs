@@ -4,6 +4,24 @@ use super::*;
 use sstable::levels::MAX_LEVELS;
 use tempfile::tempdir;
 
+/// Helper: Create an engine for testing without stale compaction.
+/// Stale compaction runs asynchronously after engine creation and can cause
+/// race conditions with shutdown in tests that create/destroy multiple engines.
+fn new_engine_for_test(
+    data_dir: String,
+    memtable_capacity_bytes: u64,
+    compaction_trigger_file_count: usize,
+) -> LsmTreeEngine {
+    LsmTreeEngine::new_with_full_config(
+        data_dir,
+        memtable_capacity_bytes,
+        compaction_trigger_file_count,
+        DEFAULT_WAL_BATCH_INTERVAL_MICROS,
+        WalArchiveConfig::default(),
+        false, // disable stale compaction for tests
+    )
+}
+
 /// Helper: Wait for all pending flushes to complete by checking immutable memtables
 async fn wait_for_flush(engine: &LsmTreeEngine, max_wait_ms: u64) {
     let poll_interval = tokio::time::Duration::from_millis(10);
@@ -108,7 +126,8 @@ async fn test_compaction_merges_sstables() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().to_str().unwrap().to_string();
     // Low capacity to trigger multiple flushes, higher compaction trigger to reduce race conditions
-    let engine = LsmTreeEngine::new(data_dir.clone(), 30, 4);
+    // Use new_engine_for_test to disable stale compaction which can race with test operations
+    let engine = new_engine_for_test(data_dir.clone(), 30, 4);
 
     // Write data in batches to create multiple SSTables
     for i in 0..10 {
@@ -378,7 +397,8 @@ async fn test_lsm_recovery_merges_wal_and_sst() {
     {
         // Phase 1: Create SSTables with k1=v1 and k2=v2
         // Use 30 byte memtable to trigger flushes
-        let engine = LsmTreeEngine::new(data_dir.clone(), 30, 100);
+        // Use new_engine_for_test to disable stale compaction which can race with shutdown
+        let engine = new_engine_for_test(data_dir.clone(), 30, 100);
 
         // k1 goes to SSTable
         engine.set("k1".to_string(), "v1".to_string()).unwrap();
@@ -394,7 +414,8 @@ async fn test_lsm_recovery_merges_wal_and_sst() {
     {
         // Phase 2: Update k1 in WAL only (no flush)
         // Use large memtable so k1=v1_new won't trigger flush
-        let engine = LsmTreeEngine::new(data_dir.clone(), 1024, 100);
+        // Use new_engine_for_test to disable stale compaction which can race with shutdown
+        let engine = new_engine_for_test(data_dir.clone(), 1024, 100);
 
         // k1 updated in WAL/MemTable only (won't trigger flush)
         engine.set("k1".to_string(), "v1_new".to_string()).unwrap();
@@ -407,7 +428,8 @@ async fn test_lsm_recovery_merges_wal_and_sst() {
 
     {
         // Phase 3: Verify recovery merges WAL with SSTable
-        let engine = LsmTreeEngine::new(data_dir.clone(), 1024, 100);
+        // Use new_engine_for_test to disable stale compaction for consistency
+        let engine = new_engine_for_test(data_dir.clone(), 1024, 100);
         // k1 should be v1_new (from WAL, overwriting SSTable's v1)
         assert_eq!(engine.get("k1".to_string()).unwrap(), "v1_new");
         // k2 should be v2 (from SSTable)

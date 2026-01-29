@@ -64,6 +64,8 @@ pub struct LsmTreeEngine {
     compaction_trigger_file_count: usize,
     // Flag to prevent concurrent compaction
     compaction_in_progress: Arc<Mutex<bool>>,
+    // Lock to serialize flush operations
+    flush_lock: Arc<Mutex<()>>,
     // WAL writer with group commit support
     wal: GroupCommitWalWriter,
     // Block cache for SSTable reads
@@ -92,6 +94,7 @@ impl Clone for LsmTreeEngine {
             next_sst_id: Arc::clone(&self.next_sst_id),
             compaction_trigger_file_count: self.compaction_trigger_file_count,
             compaction_in_progress: Arc::clone(&self.compaction_in_progress),
+            flush_lock: Arc::clone(&self.flush_lock),
             wal: self.wal.clone(),
             block_cache: Arc::clone(&self.block_cache),
             metrics: Arc::clone(&self.metrics),
@@ -234,6 +237,7 @@ impl LsmTreeEngine {
             next_sst_id: Arc::new(AtomicU64::new(recovery_result.next_sst_id)),
             compaction_trigger_file_count,
             compaction_in_progress: Arc::new(Mutex::new(false)),
+            flush_lock: Arc::new(Mutex::new(())),
             wal,
             block_cache: Arc::new(BlockCache::new(DEFAULT_BLOCK_CACHE_SIZE_BYTES)),
             metrics: Arc::new(EngineMetrics::new()),
