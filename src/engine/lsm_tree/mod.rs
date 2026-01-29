@@ -732,7 +732,8 @@ impl Engine for LsmTreeEngine {
 
         // Lazy initialization: only allocate HashSet when we find the first matching key
         // This avoids allocation overhead for 0% match cases
-        let mut seen_keys: Option<HashSet<String>> = None;
+        // Uses Arc<str> for O(1) clone operations in SSTable count
+        let mut seen_keys: Option<HashSet<Arc<str>>> = None;
         let mut count: u64 = 0;
 
         // 1. Check active memtable (SkipMap - use range scan from prefix)
@@ -747,7 +748,8 @@ impl Engine for LsmTreeEngine {
                 let mem_value = entry.value();
                 let seen = seen_keys
                     .get_or_insert_with(|| HashSet::with_capacity(COUNT_HASHSET_INITIAL_CAPACITY));
-                if seen.insert(key.clone()) && mem_value.is_valid(now) {
+                // Convert String to Arc<str> for consistency with SSTable count
+                if seen.insert(Arc::from(key.as_str())) && mem_value.is_valid(now) {
                     count += 1;
                 }
             }
@@ -765,7 +767,8 @@ impl Engine for LsmTreeEngine {
                     let seen = seen_keys.get_or_insert_with(|| {
                         HashSet::with_capacity(COUNT_HASHSET_INITIAL_CAPACITY)
                     });
-                    if seen.insert(key.clone()) && mem_value.is_valid(now) {
+                    // Convert String to Arc<str> for consistency with SSTable count
+                    if seen.insert(Arc::from(key.as_str())) && mem_value.is_valid(now) {
                         count += 1;
                     }
                 }

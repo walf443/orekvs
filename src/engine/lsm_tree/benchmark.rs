@@ -794,3 +794,98 @@ async fn bench_scan_prefix_comparison() {
 
     println!("=====================================\n");
 }
+
+/// Benchmark to measure count performance when data is in SSTables (not MemTable)
+/// This tests the Arc<str> optimization effect on SSTable count operations
+/// Run with: cargo test bench_sstable_count --release -- --nocapture --ignored
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_sstable_count() {
+    use super::Engine;
+    use std::time::Instant;
+
+    println!("\n=== SSTable Count Benchmark (Arc<str> optimization) ===");
+
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Small memtable to force frequent SSTable flushes (16KB)
+    let engine = LsmTreeEngine::new(data_dir, 16 * 1024, 100);
+
+    let num_keys = 100_000;
+    let iterations = 50;
+
+    println!("Writing {} keys with small memtable to force SSTable flushes...", num_keys);
+
+    // Write data - small memtable will flush frequently to SSTables
+    for i in 0..num_keys {
+        let prefix = match i % 5 {
+            0 => "log:",
+            1 => "order:",
+            2 => "product:",
+            3 => "session:",
+            _ => "user:",
+        };
+        engine
+            .set(format!("{}{:06}", prefix, i / 5), format!("value{:06}", i))
+            .unwrap();
+    }
+
+    // Wait for flushes to complete
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+    // Check how many SSTables were created
+    let sst_count = engine.leveled_sstables.lock().unwrap().total_sstable_count();
+    println!("Created {} SSTables", sst_count);
+
+    // Force remaining memtable to flush by writing more data
+    for i in 0..500 {
+        engine
+            .set(format!("flush:{:06}", i), "x".repeat(100))
+            .unwrap();
+    }
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let final_sst_count = engine.leveled_sstables.lock().unwrap().total_sstable_count();
+    println!("Final SSTable count: {}", final_sst_count);
+
+    // Reset cache stats for clean measurement
+    engine.reset_metrics();
+
+    println!("\n| Prefix       | Expected | Actual | Time (ms) | ops/sec   |");
+    println!("|--------------|----------|--------|-----------|-----------|");
+
+    let prefixes = [
+        ("log:", 20000),       // 20% match (20000 keys)
+        ("log:001", 100),      // ~0.5% match
+        ("log:0001", 10),      // ~0.05% match
+        ("nonexistent:", 0),   // 0% match
+    ];
+
+    for (prefix, expected) in &prefixes {
+        let start = Instant::now();
+        let mut actual = 0u64;
+        for _ in 0..iterations {
+            actual = engine.count(prefix).unwrap();
+        }
+        let duration = start.elapsed();
+        let ops_per_sec = iterations as f64 / duration.as_secs_f64();
+        println!(
+            "| {:12} | {:>8} | {:>6} | {:>9.3} | {:>9.0} |",
+            prefix,
+            expected,
+            actual,
+            duration.as_secs_f64() * 1000.0,
+            ops_per_sec
+        );
+    }
+
+    let cache_stats = engine.cache_stats();
+    println!("\nCache stats after benchmark:");
+    println!("  Entries: {}", cache_stats.entries);
+    println!("  Hit ratio: {:.2}%", cache_stats.hit_ratio * 100.0);
+    println!("  Hits: {}, Misses: {}", cache_stats.hits, cache_stats.misses);
+
+    engine.shutdown().await;
+    println!("=====================================\n");
+}

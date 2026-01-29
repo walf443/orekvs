@@ -693,7 +693,7 @@ fn parse_block_entries(block_data: &[u8]) -> Result<Vec<ParsedBlockEntry>, Statu
             Some(String::from_utf8_lossy(&val_buf).to_string())
         };
 
-        entries.push((logical_key, value, expire_at));
+        entries.push((Arc::from(logical_key), value, expire_at));
     }
 
     // Entries are already sorted by key (written in BTreeMap order)
@@ -707,7 +707,7 @@ fn search_in_parsed_block(
     entries: &[ParsedBlockEntry],
     key: &str,
 ) -> Result<Option<String>, Status> {
-    match entries.binary_search_by(|(k, _, _)| k.as_str().cmp(key)) {
+    match entries.binary_search_by(|(k, _, _)| (**k).cmp(key)) {
         Ok(idx) => {
             // Found the key
             Ok(entries[idx].1.clone())
@@ -726,7 +726,7 @@ fn search_in_parsed_block_with_expire(
     entries: &[ParsedBlockEntry],
     key: &str,
 ) -> Result<Option<(Option<String>, u64)>, Status> {
-    match entries.binary_search_by(|(k, _, _)| k.as_str().cmp(key)) {
+    match entries.binary_search_by(|(k, _, _)| (**k).cmp(key)) {
         Ok(idx) => {
             // Found the key - return value and expire_at
             let (_, value, expire_at) = &entries[idx];
@@ -788,8 +788,8 @@ pub fn scan_prefix_mmap(
         for (key, value, expire_at) in parsed_entries.iter() {
             if key.starts_with(prefix) {
                 found_any_in_block = true;
-                results.push((key.clone(), value.clone(), *expire_at));
-            } else if key.as_str() > prefix && !key.starts_with(prefix) && found_any_in_block {
+                results.push((key.to_string(), value.clone(), *expire_at));
+            } else if &**key > prefix && !key.starts_with(prefix) && found_any_in_block {
                 // Passed the prefix range and we already found some keys, done
                 return Ok(results);
             }
@@ -799,7 +799,7 @@ pub fn scan_prefix_mmap(
         // we can stop scanning
         if !found_any_in_block && !parsed_entries.is_empty() {
             let first_key = &parsed_entries[0].0;
-            if first_key.as_str() > prefix && !first_key.starts_with(prefix) {
+            if &**first_key > prefix && !first_key.starts_with(prefix) {
                 break;
             }
         }
@@ -852,7 +852,7 @@ pub fn scan_prefix_keys_mmap(
         let parsed_entries =
             get_or_load_parsed_block_mmap(sst, &canonical_path, *block_offset, cache)?;
 
-        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| k.as_str());
+        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| &**k);
         let mut found_any_in_block = false;
 
         // Convert ParsedBlockEntry to key-only format
@@ -860,8 +860,8 @@ pub fn scan_prefix_keys_mmap(
             if key.starts_with(prefix) {
                 found_any_in_block = true;
                 let is_tombstone = value_opt.is_none();
-                results.push((key.clone(), is_tombstone, *expire_at));
-            } else if key.as_str() > prefix && !key.starts_with(prefix) && found_any_in_block {
+                results.push((key.to_string(), is_tombstone, *expire_at));
+            } else if &**key > prefix && !key.starts_with(prefix) && found_any_in_block {
                 // Passed the prefix range and we already found some keys, done
                 return Ok(results);
             }
@@ -890,13 +890,14 @@ pub fn scan_prefix_keys_mmap(
 ///
 /// The `seen_keys` HashSet is used to track keys already seen in newer data
 /// (MemTable or newer SSTables) to avoid double-counting.
+/// Uses `Arc<str>` for O(1) clone operations instead of String clones.
 #[allow(clippy::result_large_err)]
 pub fn count_prefix_keys_mmap(
     sst: &MappedSSTable,
     prefix: &str,
     cache: &BlockCache,
     now: u64,
-    seen_keys: &mut std::collections::HashSet<String>,
+    seen_keys: &mut std::collections::HashSet<Arc<str>>,
 ) -> Result<u64, Status> {
     let canonical_path = sst.canonical_path();
 
@@ -931,21 +932,22 @@ pub fn count_prefix_keys_mmap(
         let parsed_entries =
             get_or_load_parsed_block_mmap(sst, &canonical_path, *block_offset, cache)?;
 
-        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| k.as_str());
+        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| &**k);
         let mut found_any_in_block = false;
 
         for (key, value_opt, expire_at) in parsed_entries.iter() {
             if key.starts_with(prefix) {
                 found_any_in_block = true;
                 // Only process if we haven't seen this key in newer data
-                if seen_keys.insert(key.clone()) {
+                // Arc::clone is O(1) - just increments reference count
+                if seen_keys.insert(Arc::clone(key)) {
                     let is_tombstone = value_opt.is_none();
                     let is_expired = *expire_at > 0 && now > *expire_at;
                     if !is_tombstone && !is_expired {
                         count += 1;
                     }
                 }
-            } else if key.as_str() > prefix && !key.starts_with(prefix) && found_any_in_block {
+            } else if &**key > prefix && !key.starts_with(prefix) && found_any_in_block {
                 // Passed the prefix range and we already found some keys, done
                 return Ok(count);
             }

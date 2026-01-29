@@ -36,7 +36,8 @@ impl BlockCacheKey {
 /// Parsed block entry: (key, value_option, expire_at)
 /// Entries are sorted by key for binary search
 /// expire_at: 0 = no expiration, >0 = Unix timestamp when key expires
-pub type ParsedBlockEntry = (String, Option<String>, u64);
+/// Key is Arc<str> to allow O(1) clone operations during count/scan operations
+pub type ParsedBlockEntry = (Arc<str>, Option<String>, u64);
 
 /// Cached entry types
 #[derive(Clone)]
@@ -214,8 +215,8 @@ mod tests {
 
         let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), 0);
         let entries = Arc::new(vec![
-            ("key1".to_string(), Some("value1".to_string()), 0),
-            ("key2".to_string(), Some("value2".to_string()), 0),
+            (Arc::from("key1"), Some("value1".to_string()), 0),
+            (Arc::from("key2"), Some("value2".to_string()), 0),
         ]);
 
         // Insert
@@ -243,7 +244,11 @@ mod tests {
         for i in 0..5 {
             let key = BlockCacheKey::for_block(PathBuf::from("/test/file.data"), i * 100);
             // Create entries with predictable sizes: 50 + 50 + 8 = 108 bytes per entry
-            let entries = Arc::new(vec![("x".repeat(50), Some("y".repeat(50)), 0)]);
+            let entries = Arc::new(vec![(
+                Arc::from("x".repeat(50).as_str()),
+                Some("y".repeat(50)),
+                0,
+            )]);
             cache.insert(key, CacheEntry::ParsedBlock(entries));
         }
 
@@ -262,27 +267,15 @@ mod tests {
 
         cache.insert(
             BlockCacheKey::for_block(file1.clone(), 0),
-            CacheEntry::ParsedBlock(Arc::new(vec![(
-                "k1".to_string(),
-                Some("v1".to_string()),
-                0,
-            )])),
+            CacheEntry::ParsedBlock(Arc::new(vec![(Arc::from("k1"), Some("v1".to_string()), 0)])),
         );
         cache.insert(
             BlockCacheKey::for_block(file1.clone(), 100),
-            CacheEntry::ParsedBlock(Arc::new(vec![(
-                "k2".to_string(),
-                Some("v2".to_string()),
-                0,
-            )])),
+            CacheEntry::ParsedBlock(Arc::new(vec![(Arc::from("k2"), Some("v2".to_string()), 0)])),
         );
         cache.insert(
             BlockCacheKey::for_block(file2.clone(), 0),
-            CacheEntry::ParsedBlock(Arc::new(vec![(
-                "k3".to_string(),
-                Some("v3".to_string()),
-                0,
-            )])),
+            CacheEntry::ParsedBlock(Arc::new(vec![(Arc::from("k3"), Some("v3".to_string()), 0)])),
         );
 
         assert_eq!(cache.stats().entries, 3);
