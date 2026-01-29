@@ -727,7 +727,8 @@ impl Engine for LsmTreeEngine {
         let now = current_timestamp();
 
         // Track seen keys to avoid double-counting across MemTable and SSTables
-        let mut seen_keys: HashSet<String> = HashSet::new();
+        // Pre-allocate capacity to reduce rehashing overhead
+        let mut seen_keys: HashSet<String> = HashSet::with_capacity(1024);
         let mut count: u64 = 0;
 
         // 1. Check active memtable (SkipMap - use range scan from prefix)
