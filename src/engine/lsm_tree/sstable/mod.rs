@@ -12,8 +12,7 @@ mod writer;
 #[allow(unused_imports)] // read_entries is used in tests
 pub use reader::{
     MappedSSTable, TimestampedEntry, count_prefix_keys_mmap, extract_wal_id_from_sstable,
-    read_entries, read_entries_for_compaction, scan_prefix_keys_mmap, scan_prefix_mmap,
-    search_key_mmap, search_key_mmap_with_expire,
+    read_entries, read_entries_for_compaction, search_key_mmap, search_key_mmap_with_expire,
 };
 pub use writer::{create_from_memtable, write_timestamped_entries};
 
@@ -21,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 // Re-export for tests
 #[cfg(test)]
-pub use reader::{read_bloom_filter, read_keys, search_key};
+pub use reader::{
+    read_bloom_filter, read_keys, scan_prefix_keys_mmap, scan_prefix_mmap, search_key,
+};
 
 pub const MAGIC_BYTES: &[u8; 6] = b"OREKVS";
 pub const DATA_VERSION: u32 = 11; // v11: block-level max_expire_at in index

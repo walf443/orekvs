@@ -741,7 +741,7 @@ fn search_in_parsed_block_with_expire(
 
 /// Scan all entries matching a prefix from an SSTable
 /// Returns a vector of (key, value_opt, expire_at) tuples
-#[allow(dead_code)] // Exported for external use (scan operations needing values)
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
 pub fn scan_prefix_mmap(
     sst: &MappedSSTable,
@@ -811,8 +811,8 @@ pub fn scan_prefix_mmap(
 /// Scan keys matching a prefix from an SSTable for count operations
 /// Uses block cache for efficiency on repeated scans
 /// Returns a vector of (key, is_tombstone, expire_at) tuples
+#[cfg(test)]
 #[allow(clippy::result_large_err)]
-#[allow(dead_code)] // May be used for key listing feature in the future
 pub fn scan_prefix_keys_mmap(
     sst: &MappedSSTable,
     prefix: &str,

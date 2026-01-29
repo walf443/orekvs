@@ -789,15 +789,14 @@ impl Engine for LsmTreeEngine {
                     .get_or_insert_with(|| HashSet::with_capacity(COUNT_HASHSET_INITIAL_CAPACITY));
 
                 // Count keys with the prefix directly (uses block cache and seen_keys for dedup)
-                if let Ok(sst_count) = sstable::count_prefix_keys_mmap(
+                let sst_count = sstable::count_prefix_keys_mmap(
                     &handle.mmap,
                     prefix,
                     &self.block_cache,
                     now,
                     seen,
-                ) {
-                    count += sst_count;
-                }
+                )?;
+                count += sst_count;
             }
         }
 
