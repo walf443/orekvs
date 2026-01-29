@@ -730,26 +730,32 @@ impl Engine for LsmTreeEngine {
         // HashMap<key, (is_valid, is_tombstone)>
         let mut key_states: HashMap<String, (bool, bool)> = HashMap::new();
 
-        // 1. Check active memtable
+        // 1. Check active memtable (SkipMap - use range scan from prefix)
         {
             let active = self.mem_state.active_memtable.load();
-            for entry in active.iter() {
+            // Range scan starting from prefix - O(log n + k) instead of O(n)
+            for entry in active.range(prefix.to_string()..) {
                 let key = entry.key();
-                if key.starts_with(prefix) {
-                    let mem_value = entry.value();
-                    let is_valid = mem_value.is_valid(now);
-                    let is_tombstone = mem_value.is_tombstone();
-                    key_states.insert(key.clone(), (is_valid, is_tombstone));
+                if !key.starts_with(prefix) {
+                    break; // Past the prefix range, stop scanning
                 }
+                let mem_value = entry.value();
+                let is_valid = mem_value.is_valid(now);
+                let is_tombstone = mem_value.is_tombstone();
+                key_states.insert(key.clone(), (is_valid, is_tombstone));
             }
         }
 
-        // 2. Check immutable memtables (older data, don't overwrite newer)
+        // 2. Check immutable memtables (BTreeMap - use range scan from prefix)
         {
             let immutables = self.mem_state.immutable_memtables.lock().unwrap();
             for memtable in immutables.iter().rev() {
-                for (key, mem_value) in memtable.iter() {
-                    if key.starts_with(prefix) && !key_states.contains_key(key) {
+                // Range scan starting from prefix - O(log n + k) instead of O(n)
+                for (key, mem_value) in memtable.range(prefix.to_string()..) {
+                    if !key.starts_with(prefix) {
+                        break; // Past the prefix range, stop scanning
+                    }
+                    if !key_states.contains_key(key) {
                         let is_valid = mem_value.is_valid(now);
                         let is_tombstone = mem_value.is_tombstone();
                         key_states.insert(key.clone(), (is_valid, is_tombstone));

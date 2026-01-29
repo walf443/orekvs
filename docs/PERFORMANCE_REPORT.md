@@ -276,14 +276,14 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 | **Log** | log:001 (1%) | 100 | 6.0 | 16,711 |
 | **Log** | log:0010 (0.1%) | 10 | 3.3 | 30,651 |
 | **Log** | nonexistent: | 0 | 4.2 | 23,853 |
-| **BTree** | log: (20%) | 2,000 | 16.2 | 6,176 |
-| **BTree** | log:001 (1%) | 100 | 2.1 | 46,608 |
-| **BTree** | log:0010 (0.1%) | 10 | 1.1 | 89,837 |
-| **BTree** | nonexistent: | 0 | 1.1 | 91,526 |
-| **LSM-tree** | log: (20%) | 2,000 | 24.2 | 4,134 |
-| **LSM-tree** | log:001 (1%) | 100 | 11.8 | 8,496 |
-| **LSM-tree** | log:0010 (0.1%) | 10 | 9.8 | 10,236 |
-| **LSM-tree** | nonexistent: | 0 | 9.5 | 10,494 |
+| **BTree** | log: (20%) | 2,000 | 16.4 | 6,099 |
+| **BTree** | log:001 (1%) | 100 | 2.2 | 44,763 |
+| **BTree** | log:0010 (0.1%) | 10 | 1.2 | 86,356 |
+| **BTree** | nonexistent: | 0 | 1.1 | 90,181 |
+| **LSM-tree** | log: (20%) | 2,000 | 21.1 | 4,747 |
+| **LSM-tree** | log:001 (1%) | 100 | 0.77 | **130,662** |
+| **LSM-tree** | log:0010 (0.1%) | 10 | 0.09 | **1,166,181** |
+| **LSM-tree** | nonexistent: | 0 | 0.02 | **6,106,870** |
 
 ### Count 実装の特徴
 
@@ -292,26 +292,29 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 | **Memory** | HashMap全走査 | O(n) | シンプル、小規模データで高速 |
 | **Log** | Index全走査 | O(n) | ディスクI/Oなし（インメモリインデックス） |
 | **BTree** | リーフノード走査 | O(log n + k) | ソート済みデータで効率的な範囲スキャン |
-| **LSM-tree** | MemTable + SSTable走査 | O(n) | Key Range Filter + Block Cache で最適化 |
+| **LSM-tree** | MemTable範囲スキャン + SSTable走査 | O(log n + k) | 範囲スキャン + Key Range Filter + Block Cache |
 
 ### LSM-tree Count 最適化
 
-1. **Key Range Filter**: SSTableのmin_key/max_keyを使用して、プレフィックスに絶対にマッチしないSSTableをスキップ
+1. **MemTable 範囲スキャン**: SkipMap/BTreeMapの`range()`を使用してプレフィックス起点から走査
    ```rust
-   // Skip SSTables that definitely don't contain keys with this prefix
-   if !handle.mmap.may_contain_prefix(prefix) {
-       continue;
+   // Range scan starting from prefix - O(log n + k) instead of O(n)
+   for entry in active.range(prefix.to_string()..) {
+       if !key.starts_with(prefix) {
+           break; // Past the prefix range, stop scanning
+       }
+       // ...
    }
    ```
 
-2. **Block Cache**: パース済みブロックをキャッシュし、繰り返しcount操作を高速化
-   - 同じSSTableへの繰り返しスキャンでキャッシュヒット
-   - count操作はキャッシュから値の有無（tombstone判定）のみを確認
+2. **Key Range Filter**: SSTableのmin_key/max_keyを使用して、プレフィックスに絶対にマッチしないSSTableをスキップ
+
+3. **Block Cache**: パース済みブロックをキャッシュし、繰り返しcount操作を高速化
 
 **注釈**:
-- **BTree** が最も効率的: プレフィックスにマッチするリーフノードを直接見つけて走査するため、マッチ数が少ないほど高速 (0.1%マッチで 89,837 ops/sec)
+- **LSM-tree** がマッチ率が低い場合に最も高速: 範囲スキャンにより O(log n + k) で検索（0%マッチで **6,106,870 ops/sec**）
+- **BTree** も効率的: リーフノード走査で O(log n + k)
 - **Memory/Log** は全キーを走査するため、マッチ率に関わらずほぼ一定のオーバーヘッド
-- **LSM-tree** は複数の MemTable と SSTable を走査するが、Block Cacheにより繰り返し操作が高速化
 
 ## 考察
 
