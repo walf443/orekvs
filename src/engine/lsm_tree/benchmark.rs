@@ -815,7 +815,10 @@ async fn bench_sstable_count() {
     let num_keys = 100_000;
     let iterations = 50;
 
-    println!("Writing {} keys with small memtable to force SSTable flushes...", num_keys);
+    println!(
+        "Writing {} keys with small memtable to force SSTable flushes...",
+        num_keys
+    );
 
     // Write data - small memtable will flush frequently to SSTables
     for i in 0..num_keys {
@@ -835,7 +838,11 @@ async fn bench_sstable_count() {
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     // Check how many SSTables were created
-    let sst_count = engine.leveled_sstables.lock().unwrap().total_sstable_count();
+    let sst_count = engine
+        .leveled_sstables
+        .lock()
+        .unwrap()
+        .total_sstable_count();
     println!("Created {} SSTables", sst_count);
 
     // Force remaining memtable to flush by writing more data
@@ -846,7 +853,11 @@ async fn bench_sstable_count() {
     }
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-    let final_sst_count = engine.leveled_sstables.lock().unwrap().total_sstable_count();
+    let final_sst_count = engine
+        .leveled_sstables
+        .lock()
+        .unwrap()
+        .total_sstable_count();
     println!("Final SSTable count: {}", final_sst_count);
 
     // Reset cache stats for clean measurement
@@ -856,10 +867,10 @@ async fn bench_sstable_count() {
     println!("|--------------|----------|--------|-----------|-----------|");
 
     let prefixes = [
-        ("log:", 20000),       // 20% match (20000 keys)
-        ("log:001", 100),      // ~0.5% match
-        ("log:0001", 10),      // ~0.05% match
-        ("nonexistent:", 0),   // 0% match
+        ("log:", 20000),     // 20% match (20000 keys)
+        ("log:001", 100),    // ~0.5% match
+        ("log:0001", 10),    // ~0.05% match
+        ("nonexistent:", 0), // 0% match
     ];
 
     for (prefix, expected) in &prefixes {
@@ -884,7 +895,10 @@ async fn bench_sstable_count() {
     println!("\nCache stats after benchmark:");
     println!("  Entries: {}", cache_stats.entries);
     println!("  Hit ratio: {:.2}%", cache_stats.hit_ratio * 100.0);
-    println!("  Hits: {}, Misses: {}", cache_stats.hits, cache_stats.misses);
+    println!(
+        "  Hits: {}, Misses: {}",
+        cache_stats.hits, cache_stats.misses
+    );
 
     engine.shutdown().await;
     println!("=====================================\n");
