@@ -361,12 +361,15 @@ impl BTreeEngine {
             let _is_new = leaf.insert(entry.clone());
 
             // Try cleanup before split - this may avoid the split entirely
+            // Save the old next_leaf BEFORE split (split() resets it to 0)
+            let old_next = leaf.next_leaf;
             if let Some((right, split_key)) = leaf.split_with_cleanup(current_timestamp()) {
                 // Split still needed after cleanup
                 let right_page_id = self.allocate_page()?;
 
                 // Update next/prev pointers
-                let old_next = leaf.next_leaf;
+                // Note: split() already set right.next_leaf to old_next, but we need to
+                // ensure it's correct since we saved old_next before the split
                 leaf.next_leaf = right_page_id;
                 let mut right = right;
                 right.prev_leaf = page_id;
@@ -710,6 +713,44 @@ impl Engine for BTreeEngine {
 
         Ok((true, current_value))
     }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        let meta = self.meta.read().unwrap();
+
+        if meta.root_page_id == 0 {
+            return Ok(0);
+        }
+
+        let now = current_timestamp();
+        let mut count = 0u64;
+
+        // Find the leaf that would contain the prefix (or first key >= prefix)
+        let mut leaf_page_id = self.find_leaf(meta.root_page_id, prefix, meta.tree_height)?;
+
+        // Scan through leaves until we pass the prefix range
+        loop {
+            let leaf = self.get_leaf(leaf_page_id)?;
+
+            for entry in &leaf.entries {
+                if entry.key.starts_with(prefix) {
+                    if entry.is_valid(now) {
+                        count += 1;
+                    }
+                } else if entry.key.as_str() > prefix && !entry.key.starts_with(prefix) {
+                    // Passed the prefix range, done
+                    return Ok(count);
+                }
+            }
+
+            // Move to next leaf
+            if leaf.next_leaf == 0 {
+                break;
+            }
+            leaf_page_id = leaf.next_leaf;
+        }
+
+        Ok(count)
+    }
 }
 
 impl Drop for BTreeEngine {
@@ -795,5 +836,9 @@ impl Engine for BTreeEngineWrapper {
     ) -> Result<(bool, Option<String>), Status> {
         self.0
             .compare_and_set(key, expected_value, new_value, expire_at)
+    }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        self.0.count(prefix)
     }
 }

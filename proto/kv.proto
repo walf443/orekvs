@@ -16,6 +16,8 @@ service KeyValue {
   rpc CompareAndSet (CompareAndSetRequest) returns (CompareAndSetResponse);
   // Promote follower to leader (stops replication, enables writes)
   rpc PromoteToLeader (PromoteRequest) returns (PromoteResponse);
+  // Count keys matching a prefix
+  rpc Count (CountRequest) returns (CountResponse);
 }
 
 message SetRequest {
@@ -122,6 +124,14 @@ message PromoteRequest {
 message PromoteResponse {
   bool success = 1;
   string message = 2;
+}
+
+message CountRequest {
+  string prefix = 1;
+}
+
+message CountResponse {
+  uint64 count = 1;
 }
 
 message GetMetricsResponse {

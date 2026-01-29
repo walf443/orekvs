@@ -104,4 +104,14 @@ impl Engine for MemoryEngine {
             (Some(_), _) => Ok((false, None)),
         }
     }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        let db = self.db.lock().unwrap();
+        let now = current_timestamp();
+        let count = db
+            .iter()
+            .filter(|(key, entry)| key.starts_with(prefix) && !entry.is_expired(now))
+            .count() as u64;
+        Ok(count)
+    }
 }

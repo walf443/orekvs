@@ -17,9 +17,10 @@ use crate::replication::{FollowerReplicator, ReplicationServer, ReplicationServi
 use crate::server::kv::key_value_server::{KeyValue, KeyValueServer};
 use crate::server::kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, CompareAndSetRequest, CompareAndSetResponse, DeleteRequest, DeleteResponse,
-    GetExpireAtRequest, GetExpireAtResponse, GetMetricsRequest, GetMetricsResponse, GetRequest,
-    GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest, SetResponse,
+    BatchSetResponse, CompareAndSetRequest, CompareAndSetResponse, CountRequest, CountResponse,
+    DeleteRequest, DeleteResponse, GetExpireAtRequest, GetExpireAtResponse, GetMetricsRequest,
+    GetMetricsResponse, GetRequest, GetResponse, KeyValuePair, PromoteRequest, PromoteResponse,
+    SetRequest, SetResponse,
 };
 
 /// Run as a follower, replicating from a leader
@@ -569,5 +570,18 @@ impl KeyValue for SwappableFollowerKeyValue {
             success: true,
             message: "Successfully promoted to leader".to_string(),
         }))
+    }
+
+    async fn count(
+        &self,
+        request: Request<CountRequest>,
+    ) -> Result<Response<CountResponse>, Status> {
+        let req = request.into_inner();
+        let engine = {
+            let guard = self.engine_holder.read().unwrap();
+            Arc::clone(&*guard)
+        };
+        let count = engine.count(&req.prefix)?;
+        Ok(Response::new(CountResponse { count }))
     }
 }

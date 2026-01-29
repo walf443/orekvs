@@ -122,6 +122,11 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Count keys matching a prefix
+    Count {
+        /// Key prefix to count
+        prefix: String,
+    },
 }
 
 pub async fn run(addr: String, command: &Commands) -> Result<(), Box<dyn std::error::Error>> {
@@ -174,5 +179,16 @@ pub async fn run(addr: String, command: &Commands) -> Result<(), Box<dyn std::er
         Commands::GetExpireAt { key } => single::run_get_expire_at(addr, key).await,
         Commands::Delete { key } => single::run_delete(addr, key).await,
         Commands::Metrics { json } => metrics::run(addr, *json).await,
+        Commands::Count { prefix } => run_count(addr, prefix).await,
     }
+}
+
+async fn run_count(addr: String, prefix: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = KeyValueClient::connect(addr).await?;
+    let request = tonic::Request::new(crate::server::kv::CountRequest {
+        prefix: prefix.to_string(),
+    });
+    let response = client.count(request).await?;
+    println!("{}", response.into_inner().count);
+    Ok(())
 }

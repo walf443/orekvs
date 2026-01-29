@@ -1685,3 +1685,79 @@ async fn test_wal_files_registered_on_recovery() {
         engine.shutdown().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_prefix() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+    // Insert keys with different prefixes
+    engine
+        .set("user:1".to_string(), "alice".to_string())
+        .unwrap();
+    engine.set("user:2".to_string(), "bob".to_string()).unwrap();
+    engine
+        .set("user:3".to_string(), "charlie".to_string())
+        .unwrap();
+    engine
+        .set("product:1".to_string(), "laptop".to_string())
+        .unwrap();
+    engine
+        .set("product:2".to_string(), "phone".to_string())
+        .unwrap();
+
+    // Count by prefix
+    assert_eq!(engine.count("user:").unwrap(), 3);
+    assert_eq!(engine.count("product:").unwrap(), 2);
+    assert_eq!(engine.count("").unwrap(), 5); // All keys
+    assert_eq!(engine.count("nonexistent:").unwrap(), 0);
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_with_tombstones() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+    // Insert and delete some keys
+    engine
+        .set("user:1".to_string(), "alice".to_string())
+        .unwrap();
+    engine.set("user:2".to_string(), "bob".to_string()).unwrap();
+    engine
+        .set("user:3".to_string(), "charlie".to_string())
+        .unwrap();
+    engine.delete("user:2".to_string()).unwrap();
+
+    // Count should exclude deleted key
+    assert_eq!(engine.count("user:").unwrap(), 2);
+
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_count_with_expired_keys() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+    let engine = LsmTreeEngine::new(data_dir, 1024 * 1024, 4);
+
+    // Insert keys with TTL
+    engine
+        .set_with_ttl("user:1".to_string(), "alice".to_string(), 1)
+        .unwrap();
+    engine.set("user:2".to_string(), "bob".to_string()).unwrap();
+    engine
+        .set("user:3".to_string(), "charlie".to_string())
+        .unwrap();
+
+    // Wait for TTL to expire
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Count should exclude expired key
+    assert_eq!(engine.count("user:").unwrap(), 2);
+
+    engine.shutdown().await;
+}

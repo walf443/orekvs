@@ -11,9 +11,10 @@ pub mod kv {
 use kv::key_value_server::{KeyValue, KeyValueServer};
 use kv::{
     BatchDeleteRequest, BatchDeleteResponse, BatchGetRequest, BatchGetResponse, BatchSetRequest,
-    BatchSetResponse, CompareAndSetRequest, CompareAndSetResponse, DeleteRequest, DeleteResponse,
-    GetExpireAtRequest, GetExpireAtResponse, GetMetricsRequest, GetMetricsResponse, GetRequest,
-    GetResponse, KeyValuePair, PromoteRequest, PromoteResponse, SetRequest, SetResponse,
+    BatchSetResponse, CompareAndSetRequest, CompareAndSetResponse, CountRequest, CountResponse,
+    DeleteRequest, DeleteResponse, GetExpireAtRequest, GetExpireAtResponse, GetMetricsRequest,
+    GetMetricsResponse, GetRequest, GetResponse, KeyValuePair, PromoteRequest, PromoteResponse,
+    SetRequest, SetResponse,
 };
 
 use crate::engine::{
@@ -255,6 +256,15 @@ impl KeyValue for MyKeyValue {
             success: false,
             message: "This server is already running as a leader".to_string(),
         }))
+    }
+
+    async fn count(
+        &self,
+        request: Request<CountRequest>,
+    ) -> Result<Response<CountResponse>, Status> {
+        let req = request.into_inner();
+        let count = self.engine.count(&req.prefix)?;
+        Ok(Response::new(CountResponse { count }))
     }
 }
 

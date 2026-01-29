@@ -616,6 +616,18 @@ impl Engine for LogEngine {
 
         Ok((true, current_value))
     }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        let index = self.index.lock().unwrap();
+        let now = current_timestamp();
+        let count = index
+            .iter()
+            .filter(|(key, (_, _, expire_at))| {
+                key.starts_with(prefix) && (*expire_at == 0 || now <= *expire_at)
+            })
+            .count() as u64;
+        Ok(count)
+    }
 }
 
 /// Wrapper to hold Log engine reference for graceful shutdown
@@ -670,6 +682,10 @@ impl Engine for LogEngineWrapper {
     ) -> Result<(bool, Option<String>), Status> {
         self.0
             .compare_and_set(key, expected_value, new_value, expire_at)
+    }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        self.0.count(prefix)
     }
 }
 

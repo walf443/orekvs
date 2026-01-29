@@ -90,4 +90,8 @@ impl Engine for LsmTreeEngineWrapper {
         self.0
             .compare_and_set(key, expected_value, new_value, expire_at)
     }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        self.0.count(prefix)
+    }
 }

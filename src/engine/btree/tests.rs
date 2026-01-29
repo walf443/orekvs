@@ -647,3 +647,116 @@ fn test_btree_split_cleanup_reduces_tree_height() {
         assert!(engine.get(format!("new_{:04}", i)).is_ok());
     }
 }
+
+/// Test count with multiple prefixes - debugging count bug
+#[test]
+fn test_btree_count_multiple_prefixes() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Insert keys with different prefixes in sorted order
+    let prefixes = ["log:", "order:", "product:", "session:", "user:"];
+    let keys_per_prefix = 100;
+
+    for prefix in &prefixes {
+        for i in 0..keys_per_prefix {
+            let key = format!("{}{:05}", prefix, i);
+            engine.set(key, format!("value{}", i)).unwrap();
+        }
+    }
+
+    // Verify counts for each prefix
+    for prefix in &prefixes {
+        let count = engine.count(prefix).unwrap();
+        assert_eq!(
+            count, keys_per_prefix as u64,
+            "Count for prefix '{}' should be {}, got {}",
+            prefix, keys_per_prefix, count
+        );
+    }
+
+    // Test partial prefix
+    // log:00000 to log:00099 all start with "log:000" (100 keys)
+    let count = engine.count("log:000").unwrap();
+    assert_eq!(
+        count, 100,
+        "Count for 'log:000' should be 100 (log:00000-log:00099)"
+    );
+
+    // Test more specific prefix
+    // log:0000 matches log:00000-log:00009 (10 keys)
+    let count = engine.count("log:0000").unwrap();
+    assert_eq!(
+        count, 10,
+        "Count for 'log:0000' should be 10 (log:00000-log:00009)"
+    );
+
+    // Test non-existent prefix
+    let count = engine.count("nonexistent:").unwrap();
+    assert_eq!(count, 0, "Count for 'nonexistent:' should be 0");
+}
+
+/// Test count with larger dataset - reproduces benchmark bug
+#[test]
+fn test_btree_count_large_dataset() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Insert keys with different prefixes (same as benchmark)
+    let prefixes = ["log:", "order:", "product:", "session:", "user:"];
+    let keys_per_prefix = 2000;
+
+    for prefix in &prefixes {
+        for i in 0..keys_per_prefix {
+            let key = format!("{}{:05}", prefix, i);
+            engine.set(key, format!("value{}", i)).unwrap();
+        }
+    }
+
+    // Verify counts for each prefix
+    for prefix in &prefixes {
+        let count = engine.count(prefix).unwrap();
+        assert_eq!(
+            count, keys_per_prefix as u64,
+            "Count for prefix '{}' should be {}, got {}",
+            prefix, keys_per_prefix, count
+        );
+    }
+}
+
+/// Test count with interleaved insertion order (reproduces the benchmark bug)
+#[test]
+fn test_btree_count_interleaved_insertion() {
+    use crate::engine::Engine;
+
+    let dir = tempdir().unwrap();
+    let engine = BTreeEngine::open(dir.path()).unwrap();
+
+    // Insert keys in INTERLEAVED order (like the original benchmark)
+    // user:00000, product:00000, order:00000, log:00000, session:00000,
+    // user:00001, product:00001, ...
+    let prefix_groups = ["user:", "product:", "order:", "log:", "session:"];
+    let num_keys = 10000;
+
+    for i in 0..num_keys {
+        let prefix = prefix_groups[i % prefix_groups.len()];
+        let key = format!("{}{:05}", prefix, i / prefix_groups.len());
+        engine.set(key, format!("value{}", i)).unwrap();
+    }
+
+    // Each prefix should have 2000 keys
+    let expected_per_prefix = num_keys / prefix_groups.len();
+
+    for prefix in &prefix_groups {
+        let count = engine.count(prefix).unwrap();
+        assert_eq!(
+            count, expected_per_prefix as u64,
+            "Count for prefix '{}' should be {}, got {}",
+            prefix, expected_per_prefix, count
+        );
+    }
+}

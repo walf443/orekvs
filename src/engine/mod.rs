@@ -1,6 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
+#[cfg(test)]
+mod benchmark;
 pub mod btree;
 mod cas;
 pub mod log;
@@ -143,4 +145,8 @@ pub trait Engine: Send + Sync + 'static {
         new_value: String,
         expire_at: u64,
     ) -> Result<(bool, Option<String>), Status>;
+
+    /// Count the number of keys matching a prefix.
+    /// Only counts valid (non-tombstone, non-expired) keys.
+    fn count(&self, prefix: &str) -> Result<u64, Status>;
 }

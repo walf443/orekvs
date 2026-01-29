@@ -720,6 +720,74 @@ impl Engine for LsmTreeEngine {
 
         Ok((true, current_value))
     }
+
+    fn count(&self, prefix: &str) -> Result<u64, Status> {
+        use std::collections::HashMap;
+
+        let now = current_timestamp();
+
+        // Collect all keys with their latest state
+        // HashMap<key, (is_valid, is_tombstone)>
+        let mut key_states: HashMap<String, (bool, bool)> = HashMap::new();
+
+        // 1. Check active memtable
+        {
+            let active = self.mem_state.active_memtable.load();
+            for entry in active.iter() {
+                let key = entry.key();
+                if key.starts_with(prefix) {
+                    let mem_value = entry.value();
+                    let is_valid = mem_value.is_valid(now);
+                    let is_tombstone = mem_value.is_tombstone();
+                    key_states.insert(key.clone(), (is_valid, is_tombstone));
+                }
+            }
+        }
+
+        // 2. Check immutable memtables (older data, don't overwrite newer)
+        {
+            let immutables = self.mem_state.immutable_memtables.lock().unwrap();
+            for memtable in immutables.iter().rev() {
+                for (key, mem_value) in memtable.iter() {
+                    if key.starts_with(prefix) && !key_states.contains_key(key) {
+                        let is_valid = mem_value.is_valid(now);
+                        let is_tombstone = mem_value.is_tombstone();
+                        key_states.insert(key.clone(), (is_valid, is_tombstone));
+                    }
+                }
+            }
+        }
+
+        // 3. Check SSTables (older data, don't overwrite newer)
+        {
+            let leveled = self.leveled_sstables.lock().unwrap();
+            let handles = leveled.to_flat_list();
+
+            for handle in &handles {
+                // Scan SSTable for keys with the prefix
+                if let Ok(entries) =
+                    sstable::scan_prefix_mmap(&handle.mmap, prefix, &self.block_cache, now)
+                {
+                    for (key, value_opt, expire_at) in entries {
+                        key_states.entry(key).or_insert_with(|| {
+                            let is_tombstone = value_opt.is_none();
+                            let is_expired = expire_at > 0 && now > expire_at;
+                            let is_valid = !is_tombstone && !is_expired;
+                            (is_valid, is_tombstone)
+                        });
+                    }
+                }
+            }
+        }
+
+        // Count valid (non-tombstone, non-expired) keys
+        let count = key_states
+            .values()
+            .filter(|(is_valid, _)| *is_valid)
+            .count() as u64;
+
+        Ok(count)
+    }
 }
 
 #[cfg(test)]
