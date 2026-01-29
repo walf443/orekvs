@@ -3,9 +3,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-use orelsm::engine::lsm_tree::WalArchiveConfig;
-use orelsm::server::kv::key_value_client::KeyValueClient;
-use orelsm::server::kv::{GetRequest, PromoteRequest, SetRequest};
+use orekvs::engine::lsm_tree::WalArchiveConfig;
+use orekvs::server::kv::key_value_client::KeyValueClient;
+use orekvs::server::kv::{GetRequest, PromoteRequest, SetRequest};
 
 /// Get an available port by binding to port 0 and letting the OS assign one
 fn get_available_port() -> u16 {
@@ -159,9 +159,9 @@ async fn test_leader_follower_replication() {
     let leader_socket = leader.addr;
     let leader_repl_port = leader.replication_port.unwrap();
     let leader_handle = tokio::spawn(async move {
-        orelsm::server::run_server(
+        orekvs::server::run_server(
             leader_socket,
-            orelsm::server::EngineType::LsmTree,
+            orekvs::server::EngineType::LsmTree,
             leader_data,
             1024 * 1024, // log capacity
             64 * 1024,   // memtable capacity (small for testing)
@@ -203,7 +203,7 @@ async fn test_leader_follower_replication() {
     let follower1_socket = follower1.addr;
     let leader_repl_clone = leader_repl_addr.clone();
     let follower1_handle = tokio::spawn(async move {
-        orelsm::server::run_follower(
+        orekvs::server::run_follower(
             leader_repl_clone,
             follower1_data,
             64 * 1024, // memtable capacity
@@ -220,7 +220,7 @@ async fn test_leader_follower_replication() {
     let follower2_socket = follower2.addr;
     let leader_repl_clone2 = leader_repl_addr.clone();
     let follower2_handle = tokio::spawn(async move {
-        orelsm::server::run_follower(
+        orekvs::server::run_follower(
             leader_repl_clone2,
             follower2_data,
             64 * 1024, // memtable capacity
@@ -362,9 +362,9 @@ async fn test_follower_failover() {
     let leader_socket = leader.addr;
     let leader_repl_port = leader.replication_port.unwrap();
     let leader_handle = tokio::spawn(async move {
-        orelsm::server::run_server(
+        orekvs::server::run_server(
             leader_socket,
-            orelsm::server::EngineType::LsmTree,
+            orekvs::server::EngineType::LsmTree,
             leader_data,
             1024 * 1024, // log capacity
             64 * 1024,   // memtable capacity
@@ -402,7 +402,7 @@ async fn test_follower_failover() {
     let follower_data = follower.data_path();
     let follower_socket = follower.addr;
     let follower_handle = tokio::spawn(async move {
-        orelsm::server::run_follower(
+        orekvs::server::run_follower(
             leader_repl_addr,
             follower_data,
             64 * 1024, // memtable capacity
@@ -511,9 +511,9 @@ async fn test_ttl_replication() {
     let leader_socket = leader.addr;
     let leader_repl_port = leader.replication_port.unwrap();
     let leader_handle = tokio::spawn(async move {
-        orelsm::server::run_server(
+        orekvs::server::run_server(
             leader_socket,
-            orelsm::server::EngineType::LsmTree,
+            orekvs::server::EngineType::LsmTree,
             leader_data,
             1024 * 1024, // log capacity
             64 * 1024,   // memtable capacity
@@ -535,7 +535,7 @@ async fn test_ttl_replication() {
     let follower_data = follower.data_path();
     let follower_socket = follower.addr;
     let follower_handle = tokio::spawn(async move {
-        orelsm::server::run_follower(
+        orekvs::server::run_follower(
             leader_repl_addr,
             follower_data,
             64 * 1024, // memtable capacity

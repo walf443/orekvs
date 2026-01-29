@@ -26,7 +26,7 @@ LSMTreeEngineは、Log-Structured Merge Tree (LSM-Tree) を実装したストレ
 
 **フォーマット:**
 ```
-Header: [magic: "ORELSMWAL"][version: u32]
+Header: [magic: "OREKVSWAL"][version: u32]
 Block:  [flags: u8][uncompressed_size: u32][data_size: u32][compressed_data][crc32: u32]
 ```
 

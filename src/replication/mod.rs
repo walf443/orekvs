@@ -179,7 +179,7 @@ impl ReplicationService {
         let mut magic = [0u8; 9];
         file.read_exact(&mut magic)
             .map_err(|e| Status::internal(e.to_string()))?;
-        if &magic != b"ORELSMWAL" {
+        if &magic != b"OREKVSWAL" {
             return Err(Status::internal("Invalid WAL magic bytes"));
         }
         let mut version_bytes = [0u8; 4];

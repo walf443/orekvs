@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::Status;
 
-const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
+const MAGIC_BYTES: &[u8; 6] = b"OREKVS";
 const DATA_VERSION: u32 = 2; // v2: added expire_at support
 const HEADER_SIZE: u64 = 10; // 6 (magic) + 4 (version)
 

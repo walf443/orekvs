@@ -13,7 +13,7 @@ LogEngineは、シンプルなログ構造化ストレージエンジンです�
 
 **ファイルフォーマット:**
 ```
-Header: [magic: "ORELSM" (6B)][version: u32 (4B)]
+Header: [magic: "OREKVS" (6B)][version: u32 (4B)]
 Entry:  [timestamp: u64][key_len: u64][val_len: u64][key][value]
 ```
 

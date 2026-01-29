@@ -79,7 +79,7 @@ impl WalArchiveConfig {
 // ============================================================================
 
 /// Common WAL magic bytes (same as LSM-Tree)
-pub const WAL_MAGIC: &[u8; 9] = b"ORELSMWAL";
+pub const WAL_MAGIC: &[u8; 9] = b"OREKVSWAL";
 
 /// WAL header size in bytes
 pub const WAL_HEADER_SIZE: usize = 13; // 9 (magic) + 4 (version)

@@ -1,4 +1,4 @@
-# Orelsm 性能レポート
+# Orekvs 性能レポート
 
 ## 実行環境
 - **CPU**: Apple M2 Pro (10コア)

@@ -22,8 +22,9 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub use reader::{read_bloom_filter, read_keys, search_key};
 
-pub const MAGIC_BYTES: &[u8; 6] = b"ORELSM";
+pub const MAGIC_BYTES: &[u8; 6] = b"OREKVS";
 pub const DATA_VERSION: u32 = 11; // v11: block-level max_expire_at in index
+pub const FOOTER_MAGIC: u64 = 0x4F52454B56534654; // "OREKVSFT" in hex
 
 /// Compute CRC32C checksum
 pub(crate) fn crc32(data: &[u8]) -> u32 {
@@ -37,8 +38,7 @@ pub const HEADER_SIZE: u64 = 10;
 // Footer size: index_offset(8) + bloom_offset(8) + keyrange_offset(8) + footer_magic(8)
 pub const FOOTER_SIZE: u64 = 32;
 
-// Footer magic bytes
-pub const FOOTER_MAGIC: u64 = 0x4F52454C534D4654; // "ORELSMFT" in hex
+// Footer magic bytes - defined above
 // Target block size for compression (bytes)
 pub const BLOCK_SIZE: usize = 4096;
 
