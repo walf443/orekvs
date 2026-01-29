@@ -763,7 +763,7 @@ impl Engine for LsmTreeEngine {
         }
 
         // 3. Check SSTables (older data, don't overwrite newer)
-        // Use scan_prefix_keys_mmap which skips reading value bytes for efficiency
+        // Use count_prefix_keys_mmap which counts directly without allocating a Vec
         {
             let leveled = self.leveled_sstables.lock().unwrap();
             let handles = leveled.to_flat_list();
@@ -774,18 +774,15 @@ impl Engine for LsmTreeEngine {
                     continue;
                 }
 
-                // Scan SSTable for keys with the prefix (uses block cache)
-                if let Ok(entries) =
-                    sstable::scan_prefix_keys_mmap(&handle.mmap, prefix, &self.block_cache, now)
-                {
-                    for (key, is_tombstone, expire_at) in entries {
-                        if seen_keys.insert(key) {
-                            let is_expired = expire_at > 0 && now > expire_at;
-                            if !is_tombstone && !is_expired {
-                                count += 1;
-                            }
-                        }
-                    }
+                // Count keys with the prefix directly (uses block cache and seen_keys for dedup)
+                if let Ok(sst_count) = sstable::count_prefix_keys_mmap(
+                    &handle.mmap,
+                    prefix,
+                    &self.block_cache,
+                    now,
+                    &mut seen_keys,
+                ) {
+                    count += sst_count;
                 }
             }
         }
