@@ -321,6 +321,15 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 6. **HashSet遅延初期化**: `Option<HashSet>`で0件マッチ時のアロケーション回避
    - 0%マッチで3.6倍の性能向上
 
+7. **Arc\<str\>によるキーclone最適化**: ParsedBlockEntryのキー型をStringからArc\<str\>に変更
+   - SSTable count時の`key.clone()`がO(n)のString clone → O(1)のArc::clone（参照カウント増加のみ）
+   - 100Kキー、42 SSTables環境でのベンチマーク結果:
+     | マッチ率 | String (main) | Arc\<str\> | 改善 |
+     |----------|---------------|------------|------|
+     | 20% | 115.8ms | 96.6ms | **1.20x** |
+     | 5% | 3.07ms | 2.24ms | **1.37x** |
+   - MemTableからの変換コスト（`Arc::from(key.as_str())`）はMemTable件数が少ないため影響軽微
+
 **注釈**:
 - **LSM-tree** がマッチ率が低い場合に最も高速: 範囲スキャンにより O(log n + k) で検索（0%マッチで **4,554,149 ops/sec**）
 - **LSM-tree** は高マッチ率でもMemory/Logに近い性能（20%マッチで **8,160 ops/sec**）
