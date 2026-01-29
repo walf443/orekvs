@@ -18,7 +18,9 @@
       "Bash(done)",
       "Bash(cargo check:*)",
       "Bash(ls:*)",
-      "Bash(xxd:*)"
+      "Bash(xxd:*)",
+      "Bash(cargo bench:*)",
+      "Bash(cargo clean:*)"
     ]
   }
 }
