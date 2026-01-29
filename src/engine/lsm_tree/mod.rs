@@ -34,6 +34,10 @@ use tonic::Status;
 use wal::GroupCommitWalWriter;
 pub use wrapper::{LsmEngineHolder, LsmTreeEngineWrapper};
 
+/// Default initial capacity for HashSet used in count operations.
+/// Pre-allocating reduces rehashing overhead for moderate match counts.
+const COUNT_HASHSET_INITIAL_CAPACITY: usize = 1024;
+
 /// Lock to prevent SSTable deletion during snapshot transfer.
 /// Snapshot transfer holds a read lock; compaction deletion requires a write lock.
 pub type SnapshotLock = Arc<RwLock<()>>;
@@ -726,9 +730,9 @@ impl Engine for LsmTreeEngine {
 
         let now = current_timestamp();
 
-        // Track seen keys to avoid double-counting across MemTable and SSTables
-        // Pre-allocate capacity to reduce rehashing overhead
-        let mut seen_keys: HashSet<String> = HashSet::with_capacity(1024);
+        // Lazy initialization: only allocate HashSet when we find the first matching key
+        // This avoids allocation overhead for 0% match cases
+        let mut seen_keys: Option<HashSet<String>> = None;
         let mut count: u64 = 0;
 
         // 1. Check active memtable (SkipMap - use range scan from prefix)
@@ -741,7 +745,9 @@ impl Engine for LsmTreeEngine {
                     break; // Past the prefix range, stop scanning
                 }
                 let mem_value = entry.value();
-                if seen_keys.insert(key.clone()) && mem_value.is_valid(now) {
+                let seen = seen_keys
+                    .get_or_insert_with(|| HashSet::with_capacity(COUNT_HASHSET_INITIAL_CAPACITY));
+                if seen.insert(key.clone()) && mem_value.is_valid(now) {
                     count += 1;
                 }
             }
@@ -756,7 +762,10 @@ impl Engine for LsmTreeEngine {
                     if !key.starts_with(prefix) {
                         break; // Past the prefix range, stop scanning
                     }
-                    if seen_keys.insert(key.clone()) && mem_value.is_valid(now) {
+                    let seen = seen_keys.get_or_insert_with(|| {
+                        HashSet::with_capacity(COUNT_HASHSET_INITIAL_CAPACITY)
+                    });
+                    if seen.insert(key.clone()) && mem_value.is_valid(now) {
                         count += 1;
                     }
                 }
@@ -775,13 +784,17 @@ impl Engine for LsmTreeEngine {
                     continue;
                 }
 
+                // Ensure HashSet exists before processing SSTables (needed for dedup)
+                let seen = seen_keys
+                    .get_or_insert_with(|| HashSet::with_capacity(COUNT_HASHSET_INITIAL_CAPACITY));
+
                 // Count keys with the prefix directly (uses block cache and seen_keys for dedup)
                 if let Ok(sst_count) = sstable::count_prefix_keys_mmap(
                     &handle.mmap,
                     prefix,
                     &self.block_cache,
                     now,
-                    &mut seen_keys,
+                    seen,
                 ) {
                     count += sst_count;
                 }
