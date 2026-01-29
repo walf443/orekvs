@@ -125,10 +125,11 @@ Buffer Poolの統計情報を取得できます:
 
 ```rust
 BufferPoolStats {
-    hits: u64,        // キャッシュヒット数
-    misses: u64,      // キャッシュミス数
-    evictions: u64,   // ページ追い出し数
-    dirty_pages: u64, // ダーティページ数
+    hits: u64,              // キャッシュヒット数
+    misses: u64,            // キャッシュミス数
+    evictions: u64,         // ページ追い出し数
+    flushes: u64,           // フラッシュ回数
+    background_flushes: u64, // バックグラウンドフラッシュ回数
 }
 ```
 

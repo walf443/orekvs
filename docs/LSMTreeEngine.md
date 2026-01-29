@@ -39,13 +39,13 @@ Block:  [flags: u8][uncompressed_size: u32][data_size: u32][compressed_data][crc
 - `writer.rs` - SSTable作成、ブロック圧縮
 - `levels.rs` - レベル管理、SstableLevel trait
 
-**ファイルフォーマット (V8):**
+**ファイルフォーマット (V11):**
 ```
 [Header: magic + version]
 [Data Blocks: zstd compressed]
-[Index: prefix-compressed with checksum]
-[Bloom Filter]
-[Key Range: min_key + max_key + entry_count]
+[Index: prefix-compressed with checksum, block-level max_expire_at]
+[Bloom Filter: [len: u64][data]]
+[Key Range: [min_key_len: u32][min_key][max_key_len: u32][max_key][entry_count: u64]]
 [Footer: index_offset + bloom_offset + keyrange_offset + magic]
 ```
 
@@ -98,17 +98,27 @@ Block:  [flags: u8][uncompressed_size: u32][data_size: u32][compressed_data][crc
 
 ## Configuration
 
+LSMTreeEngineはコンストラクタ関数で設定を渡します:
+
 ```rust
-LSMTreeConfig {
-    memtable_size_bytes: 4 * 1024 * 1024,  // 4MB
-    enable_wal: true,
-    wal_batch_interval_micros: 100,         // 100us
-    compaction_interval_secs: 10,
-    wal_archive: WalArchiveConfig {
-        retention_secs: Some(86400),         // 24時間
-        max_size_bytes: Some(1073741824),    // 1GB
+// 基本的な使用法
+LsmTreeEngine::new(
+    data_dir: String,                    // データディレクトリ
+    memtable_capacity_bytes: u64,        // MemTableサイズ (例: 4 * 1024 * 1024 = 4MB)
+    compaction_trigger_file_count: usize, // Compactionトリガーファイル数
+)
+
+// WAL設定付き
+LsmTreeEngine::new_with_config(
+    data_dir: String,
+    memtable_capacity_bytes: u64,
+    compaction_trigger_file_count: usize,
+    wal_batch_interval_micros: u64,      // WALバッチ間隔 (例: 100 = 100us)
+    wal_archive_config: WalArchiveConfig {
+        retention_secs: Option<u64>,      // 保持期間 (例: Some(86400) = 24時間)
+        max_size_bytes: Option<u64>,      // 最大サイズ (例: Some(1073741824) = 1GB)
     },
-}
+)
 ```
 
 ## Replication

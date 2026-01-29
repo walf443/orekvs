@@ -11,11 +11,13 @@ LogEngineは、シンプルなログ構造化ストレージエンジンです�
 
 単一のログファイル (`log_engine.data`) にすべてのデータを格納します。
 
-**ファイルフォーマット:**
+**ファイルフォーマット (v2):**
 ```
 Header: [magic: "OREKVS" (6B)][version: u32 (4B)]
-Entry:  [timestamp: u64][key_len: u64][val_len: u64][key][value]
+Entry:  [timestamp: u64][expire_at: u64][key_len: u64][val_len: u64][key][value]
 ```
+
+※ v1形式（expire_atなし）との後方互換性あり
 
 **Tombstone:**
 削除はval_len = u64::MAXで表現されます。
@@ -111,3 +113,4 @@ engine.shutdown().await;
 - `writer`: `Arc<Mutex<File>>` で保護
 - `index`: `Arc<Mutex<HashMap>>` で保護
 - `is_compacting`: `AtomicBool` でCompactionの排他制御
+- `compaction_handle`: `Arc<Mutex<Option<JoinHandle>>>` でCompactionタスク管理
