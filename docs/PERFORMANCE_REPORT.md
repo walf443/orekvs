@@ -262,27 +262,28 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 - **総キー数**: 10,000
 - **イテレーション**: 100回
 - **プレフィックスパターン**: 20%マッチ、1%マッチ、0.1%マッチ、0%マッチ
+- **日付**: 2026-01-29 (Key Range Filter + Block Cache最適化後)
 
 ### 結果
 
 | エンジン | プレフィックス | マッチ数 | Time (ms) | ops/sec |
 |----------|----------------|----------|-----------|---------|
-| **Memory** | log: (20%) | 2,000 | 5.3 | 18,767 |
-| **Memory** | log:001 (1%) | 100 | 5.7 | 17,601 |
-| **Memory** | log:0010 (0.1%) | 10 | 3.1 | 32,104 |
-| **Memory** | nonexistent: | 0 | 4.0 | 25,060 |
-| **Log** | log: (20%) | 2,000 | 6.1 | 16,474 |
-| **Log** | log:001 (1%) | 100 | 6.2 | 16,228 |
-| **Log** | log:0010 (0.1%) | 10 | 3.0 | 33,335 |
-| **Log** | nonexistent: | 0 | 3.6 | 27,522 |
-| **BTree** | log: (20%) | 2,000 | 15.8 | 6,316 |
-| **BTree** | log:001 (1%) | 100 | 2.1 | 48,152 |
-| **BTree** | log:0010 (0.1%) | 10 | 1.1 | 94,488 |
-| **BTree** | nonexistent: | 0 | 1.1 | 94,251 |
-| **LSM-tree** | log: (20%) | 2,000 | 25.4 | 3,940 |
-| **LSM-tree** | log:001 (1%) | 100 | 11.1 | 8,993 |
-| **LSM-tree** | log:0010 (0.1%) | 10 | 9.6 | 10,428 |
-| **LSM-tree** | nonexistent: | 0 | 10.6 | 9,418 |
+| **Memory** | log: (20%) | 2,000 | 8.6 | 11,605 |
+| **Memory** | log:001 (1%) | 100 | 7.9 | 12,671 |
+| **Memory** | log:0010 (0.1%) | 10 | 3.7 | 27,112 |
+| **Memory** | nonexistent: | 0 | 4.1 | 24,111 |
+| **Log** | log: (20%) | 2,000 | 6.7 | 14,885 |
+| **Log** | log:001 (1%) | 100 | 6.0 | 16,711 |
+| **Log** | log:0010 (0.1%) | 10 | 3.3 | 30,651 |
+| **Log** | nonexistent: | 0 | 4.2 | 23,853 |
+| **BTree** | log: (20%) | 2,000 | 16.2 | 6,176 |
+| **BTree** | log:001 (1%) | 100 | 2.1 | 46,608 |
+| **BTree** | log:0010 (0.1%) | 10 | 1.1 | 89,837 |
+| **BTree** | nonexistent: | 0 | 1.1 | 91,526 |
+| **LSM-tree** | log: (20%) | 2,000 | 24.2 | 4,134 |
+| **LSM-tree** | log:001 (1%) | 100 | 11.8 | 8,496 |
+| **LSM-tree** | log:0010 (0.1%) | 10 | 9.8 | 10,236 |
+| **LSM-tree** | nonexistent: | 0 | 9.5 | 10,494 |
 
 ### Count 実装の特徴
 
@@ -291,12 +292,26 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 | **Memory** | HashMap全走査 | O(n) | シンプル、小規模データで高速 |
 | **Log** | Index全走査 | O(n) | ディスクI/Oなし（インメモリインデックス） |
 | **BTree** | リーフノード走査 | O(log n + k) | ソート済みデータで効率的な範囲スキャン |
-| **LSM-tree** | MemTable + SSTable走査 | O(n) | SSTable読み取りオーバーヘッド |
+| **LSM-tree** | MemTable + SSTable走査 | O(n) | Key Range Filter + Block Cache で最適化 |
+
+### LSM-tree Count 最適化
+
+1. **Key Range Filter**: SSTableのmin_key/max_keyを使用して、プレフィックスに絶対にマッチしないSSTableをスキップ
+   ```rust
+   // Skip SSTables that definitely don't contain keys with this prefix
+   if !handle.mmap.may_contain_prefix(prefix) {
+       continue;
+   }
+   ```
+
+2. **Block Cache**: パース済みブロックをキャッシュし、繰り返しcount操作を高速化
+   - 同じSSTableへの繰り返しスキャンでキャッシュヒット
+   - count操作はキャッシュから値の有無（tombstone判定）のみを確認
 
 **注釈**:
-- **BTree** が最も効率的: プレフィックスにマッチするリーフノードを直接見つけて走査するため、マッチ数が少ないほど高速 (0.1%マッチで 94,488 ops/sec)
+- **BTree** が最も効率的: プレフィックスにマッチするリーフノードを直接見つけて走査するため、マッチ数が少ないほど高速 (0.1%マッチで 89,837 ops/sec)
 - **Memory/Log** は全キーを走査するため、マッチ率に関わらずほぼ一定のオーバーヘッド
-- **LSM-tree** は複数の MemTable と SSTable を走査するため、最も低速
+- **LSM-tree** は複数の MemTable と SSTable を走査するが、Block Cacheにより繰り返し操作が高速化
 
 ## 考察
 

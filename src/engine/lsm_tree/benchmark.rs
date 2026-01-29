@@ -685,3 +685,112 @@ async fn bench_get_expired_block() {
     );
     println!("=====================================\n");
 }
+
+/// Benchmark to compare scan_prefix_mmap vs scan_prefix_keys_mmap
+/// Run with: cargo test bench_scan_prefix --release -- --nocapture --ignored
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scan_prefix_comparison() {
+    use super::block_cache::BlockCache;
+    use super::memtable::MemValue;
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    println!("\n=== SSTable Scan Prefix Comparison ===");
+    println!(
+        "Comparing scan_prefix_mmap (returns values) vs scan_prefix_keys_mmap (returns keys only)"
+    );
+    println!("Both use block cache now\n");
+
+    let value_sizes = [100, 1000, 10000];
+    let num_keys = 1000;
+    let iterations = 100;
+    let now = 0u64; // No expiration
+
+    for value_size in value_sizes {
+        println!("--- Value size: {} bytes ---", value_size);
+
+        let dir = tempdir().unwrap();
+        let sst_path = dir.path().join("test.data");
+
+        // Create SSTable with test data
+        let mut memtable: BTreeMap<String, MemValue> = BTreeMap::new();
+        let value = "x".repeat(value_size);
+
+        for i in 0..num_keys {
+            let key = format!("log:{:05}", i);
+            memtable.insert(key, MemValue::new(Some(value.clone())));
+        }
+
+        sstable::create_from_memtable(&sst_path, &memtable).unwrap();
+
+        // Open SSTable
+        let sst = sstable::MappedSSTable::open(&sst_path).unwrap();
+
+        // === Cold Cache Comparison ===
+        println!("  Cold cache (fresh cache each iteration):");
+
+        // scan_prefix_mmap cold
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let cache = BlockCache::new(64 * 1024 * 1024);
+            let _ = sstable::scan_prefix_mmap(&sst, "log:", &cache, now).unwrap();
+        }
+        let cold_with_values = start.elapsed();
+
+        // scan_prefix_keys_mmap cold
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let cache = BlockCache::new(64 * 1024 * 1024);
+            let _ = sstable::scan_prefix_keys_mmap(&sst, "log:", &cache, now).unwrap();
+        }
+        let cold_keys_only = start.elapsed();
+
+        println!(
+            "    with values: {:.3}ms ({:.0} ops/sec)",
+            cold_with_values.as_secs_f64() * 1000.0,
+            iterations as f64 / cold_with_values.as_secs_f64()
+        );
+        println!(
+            "    keys only:   {:.3}ms ({:.0} ops/sec)",
+            cold_keys_only.as_secs_f64() * 1000.0,
+            iterations as f64 / cold_keys_only.as_secs_f64()
+        );
+
+        // === Warm Cache Comparison ===
+        println!("  Warm cache (shared cache across iterations):");
+
+        let cache = BlockCache::new(64 * 1024 * 1024);
+
+        // Warm up
+        let _ = sstable::scan_prefix_mmap(&sst, "log:", &cache, now).unwrap();
+
+        // scan_prefix_mmap warm
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = sstable::scan_prefix_mmap(&sst, "log:", &cache, now).unwrap();
+        }
+        let warm_with_values = start.elapsed();
+
+        // scan_prefix_keys_mmap warm (same cache, already warm)
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = sstable::scan_prefix_keys_mmap(&sst, "log:", &cache, now).unwrap();
+        }
+        let warm_keys_only = start.elapsed();
+
+        println!(
+            "    with values: {:.3}ms ({:.0} ops/sec)",
+            warm_with_values.as_secs_f64() * 1000.0,
+            iterations as f64 / warm_with_values.as_secs_f64()
+        );
+        println!(
+            "    keys only:   {:.3}ms ({:.0} ops/sec)",
+            warm_keys_only.as_secs_f64() * 1000.0,
+            iterations as f64 / warm_keys_only.as_secs_f64()
+        );
+        println!();
+    }
+
+    println!("=====================================\n");
+}

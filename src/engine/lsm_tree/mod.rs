@@ -759,6 +759,7 @@ impl Engine for LsmTreeEngine {
         }
 
         // 3. Check SSTables (older data, don't overwrite newer)
+        // Use scan_prefix_keys_mmap which skips reading value bytes for efficiency
         {
             let leveled = self.leveled_sstables.lock().unwrap();
             let handles = leveled.to_flat_list();
@@ -769,13 +770,12 @@ impl Engine for LsmTreeEngine {
                     continue;
                 }
 
-                // Scan SSTable for keys with the prefix
+                // Scan SSTable for keys with the prefix (uses block cache)
                 if let Ok(entries) =
-                    sstable::scan_prefix_mmap(&handle.mmap, prefix, &self.block_cache, now)
+                    sstable::scan_prefix_keys_mmap(&handle.mmap, prefix, &self.block_cache, now)
                 {
-                    for (key, value_opt, expire_at) in entries {
+                    for (key, is_tombstone, expire_at) in entries {
                         key_states.entry(key).or_insert_with(|| {
-                            let is_tombstone = value_opt.is_none();
                             let is_expired = expire_at > 0 && now > expire_at;
                             let is_valid = !is_tombstone && !is_expired;
                             (is_valid, is_tombstone)

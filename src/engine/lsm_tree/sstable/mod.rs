@@ -12,7 +12,8 @@ mod writer;
 #[allow(unused_imports)] // read_entries is used in tests
 pub use reader::{
     MappedSSTable, TimestampedEntry, extract_wal_id_from_sstable, read_entries,
-    read_entries_for_compaction, scan_prefix_mmap, search_key_mmap, search_key_mmap_with_expire,
+    read_entries_for_compaction, scan_prefix_keys_mmap, scan_prefix_mmap, search_key_mmap,
+    search_key_mmap_with_expire,
 };
 pub use writer::{create_from_memtable, write_timestamped_entries};
 

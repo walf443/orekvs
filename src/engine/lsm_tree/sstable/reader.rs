@@ -741,6 +741,7 @@ fn search_in_parsed_block_with_expire(
 
 /// Scan all entries matching a prefix from an SSTable
 /// Returns a vector of (key, value_opt, expire_at) tuples
+#[allow(dead_code)] // Exported for external use (scan operations needing values)
 #[allow(clippy::result_large_err)]
 pub fn scan_prefix_mmap(
     sst: &MappedSSTable,
@@ -801,6 +802,78 @@ pub fn scan_prefix_mmap(
             if first_key.as_str() > prefix && !first_key.starts_with(prefix) {
                 break;
             }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Scan keys matching a prefix from an SSTable for count operations
+/// Uses block cache for efficiency on repeated scans
+/// Returns a vector of (key, is_tombstone, expire_at) tuples
+#[allow(clippy::result_large_err)]
+pub fn scan_prefix_keys_mmap(
+    sst: &MappedSSTable,
+    prefix: &str,
+    cache: &BlockCache,
+    now: u64,
+) -> Result<Vec<(String, bool, u64)>, Status> {
+    let canonical_path = sst.canonical_path();
+
+    // Get or load index from cache
+    let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
+
+    let mut results = Vec::new();
+
+    // Find the first block that might contain keys with this prefix
+    let start_block_idx = match index.binary_search_by(|(composite, _, _)| {
+        let idx_logical = composite_key::logical_key(composite).unwrap_or(composite);
+        idx_logical.cmp(prefix)
+    }) {
+        Ok(idx) => idx,
+        Err(idx) => {
+            if idx == 0 {
+                0
+            } else {
+                idx - 1
+            }
+        }
+    };
+
+    // Scan blocks starting from the found block
+    for (_, block_offset, max_expire_at) in index.iter().skip(start_block_idx) {
+        // Skip fully expired blocks
+        if *max_expire_at > 0 && now > *max_expire_at {
+            continue;
+        }
+
+        // Get or load parsed block from cache (reuses existing cache infrastructure)
+        let parsed_entries =
+            get_or_load_parsed_block_mmap(sst, &canonical_path, *block_offset, cache)?;
+
+        let first_key_in_block = parsed_entries.first().map(|(k, _, _)| k.as_str());
+        let mut found_any_in_block = false;
+
+        // Convert ParsedBlockEntry to key-only format
+        for (key, value_opt, expire_at) in parsed_entries.iter() {
+            if key.starts_with(prefix) {
+                found_any_in_block = true;
+                let is_tombstone = value_opt.is_none();
+                results.push((key.clone(), is_tombstone, *expire_at));
+            } else if key.as_str() > prefix && !key.starts_with(prefix) && found_any_in_block {
+                // Passed the prefix range and we already found some keys, done
+                return Ok(results);
+            }
+        }
+
+        // If we didn't find any keys in this block and the first key is past the prefix,
+        // we can stop scanning
+        if !found_any_in_block
+            && let Some(first_key) = first_key_in_block
+            && first_key > prefix
+            && !first_key.starts_with(prefix)
+        {
+            break;
         }
     }
 
