@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
+use tracing::{info_span, instrument};
 
 /// B-tree storage engine configuration
 #[derive(Debug, Clone)]
@@ -714,6 +715,7 @@ impl Engine for BTreeEngine {
         Ok((true, current_value))
     }
 
+    #[instrument(skip(self), fields(prefix_len = prefix.len()))]
     fn count(&self, prefix: &str) -> Result<u64, Status> {
         let meta = self.meta.read().unwrap();
 
@@ -725,28 +727,34 @@ impl Engine for BTreeEngine {
         let mut count = 0u64;
 
         // Find the leaf that would contain the prefix (or first key >= prefix)
-        let mut leaf_page_id = self.find_leaf(meta.root_page_id, prefix, meta.tree_height)?;
+        let mut leaf_page_id = {
+            let _span = info_span!("find_leaf").entered();
+            self.find_leaf(meta.root_page_id, prefix, meta.tree_height)?
+        };
 
         // Scan through leaves until we pass the prefix range
-        loop {
-            let leaf = self.get_leaf(leaf_page_id)?;
+        {
+            let _span = info_span!("scan_leaves").entered();
+            loop {
+                let leaf = self.get_leaf(leaf_page_id)?;
 
-            for entry in &leaf.entries {
-                if entry.key.starts_with(prefix) {
-                    if entry.is_valid(now) {
-                        count += 1;
+                for entry in &leaf.entries {
+                    if entry.key.starts_with(prefix) {
+                        if entry.is_valid(now) {
+                            count += 1;
+                        }
+                    } else if entry.key.as_str() > prefix && !entry.key.starts_with(prefix) {
+                        // Passed the prefix range, done
+                        return Ok(count);
                     }
-                } else if entry.key.as_str() > prefix && !entry.key.starts_with(prefix) {
-                    // Passed the prefix range, done
-                    return Ok(count);
                 }
-            }
 
-            // Move to next leaf
-            if leaf.next_leaf == 0 {
-                break;
+                // Move to next leaf
+                if leaf.next_leaf == 0 {
+                    break;
+                }
+                leaf_page_id = leaf.next_leaf;
             }
-            leaf_page_id = leaf.next_leaf;
         }
 
         Ok(count)
