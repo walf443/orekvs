@@ -355,30 +355,42 @@ impl Engine for LsmTreeEngine {
         let now = current_timestamp();
 
         // 1. Check memtable (active and immutable)
-        if let Some(mem_value) = self.mem_state.get(&key) {
-            if mem_value.is_tombstone() {
-                return Err(Status::not_found("Key deleted"));
+        {
+            let _span = tracing::info_span!("check_memtable").entered();
+            if let Some(mem_value) = self.mem_state.get(&key) {
+                if mem_value.is_tombstone() {
+                    return Err(Status::not_found("Key deleted"));
+                }
+                if mem_value.is_expired(now) {
+                    return Err(Status::not_found("Key expired"));
+                }
+                return mem_value
+                    .value
+                    .map(|v| (v, mem_value.expire_at))
+                    .ok_or_else(|| Status::not_found("Key deleted"));
             }
-            if mem_value.is_expired(now) {
-                return Err(Status::not_found("Key expired"));
-            }
-            return mem_value
-                .value
-                .map(|v| (v, mem_value.expire_at))
-                .ok_or_else(|| Status::not_found("Key deleted"));
         }
 
-        let leveled = self.leveled_sstables.lock().unwrap();
+        let leveled = {
+            let _span = tracing::info_span!("acquire_sstable_lock").entered();
+            self.leveled_sstables.lock().unwrap()
+        };
         let key_bytes = key.as_bytes();
 
         // 2. Check all levels (L0 scans all, L1+ uses binary search)
         for level in 0..leveled.level_count() {
+            let _level_span = tracing::info_span!("scan_level", level = level).entered();
             for handle in leveled.candidates_for_key(level, key_bytes) {
-                if !handle.bloom.contains(&key) {
-                    self.metrics.record_bloom_filter_hit();
-                    continue;
+                {
+                    let _bloom_span = tracing::info_span!("bloom_filter_check").entered();
+                    if !handle.bloom.contains(&key) {
+                        self.metrics.record_bloom_filter_hit();
+                        continue;
+                    }
                 }
                 self.metrics.record_sstable_search();
+                let _search_span =
+                    tracing::info_span!("search_sstable", sstable = %handle.mmap.canonical_path().display()).entered();
                 match sstable::search_key_mmap_with_expire(
                     &handle.mmap,
                     &key,

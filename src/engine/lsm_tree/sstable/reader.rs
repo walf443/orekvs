@@ -61,6 +61,8 @@ fn find_block_info(index: &[IndexEntry], logical_key: &str) -> (u64, u64) {
 pub struct MappedSSTable {
     mmap: MappedFile,
     path: PathBuf,
+    /// Cached canonical path (computed once at open time to avoid repeated filesystem calls)
+    canonical_path: PathBuf,
     #[allow(dead_code)]
     version: u32,
     index_offset: u64,
@@ -160,9 +162,13 @@ impl MappedSSTable {
             .ok_or_else(|| Status::internal("Failed to read entry_count"))?;
         let entry_count = u64::from_le_bytes(entry_count_bytes.try_into().unwrap());
 
+        // Compute canonical path once at open time to avoid repeated filesystem calls
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
         Ok(Self {
             mmap,
             path: path.to_path_buf(),
+            canonical_path,
             version,
             index_offset,
             bloom_offset,
@@ -184,11 +190,9 @@ impl MappedSSTable {
         self.version
     }
 
-    /// Get canonical path for cache keys
-    pub fn canonical_path(&self) -> PathBuf {
-        self.path
-            .canonicalize()
-            .unwrap_or_else(|_| self.path.clone())
+    /// Get canonical path for cache keys (pre-computed at open time)
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
     }
 
     /// Get the minimum key in this SSTable (used for leveled compaction)
@@ -543,7 +547,7 @@ pub fn search_key_mmap(
     let canonical_path = sst.canonical_path();
 
     // Get or load index from cache
-    let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
+    let index = get_or_load_index_mmap(sst, canonical_path, cache)?;
 
     // Binary search in index to find the block that might contain the key
     let (block_offset, max_expire_at) = find_block_info(&index, key);
@@ -555,7 +559,7 @@ pub fn search_key_mmap(
     }
 
     // Get or load parsed block from cache
-    let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
+    let parsed_entries = get_or_load_parsed_block_mmap(sst, canonical_path, block_offset, cache)?;
 
     // Binary search within parsed block entries
     search_in_parsed_block(&parsed_entries, key)
@@ -572,13 +576,22 @@ pub fn search_key_mmap_with_expire(
     cache: &BlockCache,
     now: u64,
 ) -> Result<Option<(Option<String>, u64)>, Status> {
-    let canonical_path = sst.canonical_path();
+    let canonical_path = {
+        let _span = tracing::info_span!("get_canonical_path").entered();
+        sst.canonical_path()
+    };
 
     // Get or load index from cache
-    let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
+    let index = {
+        let _span = tracing::info_span!("get_or_load_index").entered();
+        get_or_load_index_mmap(sst, canonical_path, cache)?
+    };
 
     // Binary search in index to find the block that might contain the key
-    let (block_offset, max_expire_at) = find_block_info(&index, key);
+    let (block_offset, max_expire_at) = {
+        let _span = tracing::info_span!("find_block_info", index_len = index.len()).entered();
+        find_block_info(&index, key)
+    };
 
     // Block-level expiration optimization: if all entries in block are expired, skip decompression
     if max_expire_at > 0 && now > max_expire_at {
@@ -586,9 +599,15 @@ pub fn search_key_mmap_with_expire(
     }
 
     // Get or load parsed block from cache
-    let parsed_entries = get_or_load_parsed_block_mmap(sst, &canonical_path, block_offset, cache)?;
+    let parsed_entries = {
+        let _span =
+            tracing::info_span!("get_or_load_parsed_block", block_offset = block_offset).entered();
+        get_or_load_parsed_block_mmap(sst, canonical_path, block_offset, cache)?
+    };
 
     // Binary search within parsed block entries
+    let _span =
+        tracing::info_span!("search_in_block", entries_len = parsed_entries.len()).entered();
     search_in_parsed_block_with_expire(&parsed_entries, key)
 }
 
@@ -603,15 +622,20 @@ fn get_or_load_index_mmap(
 
     // Check cache first
     if let Some(CacheEntry::Index(index)) = cache.get(&cache_key) {
+        tracing::trace!("index_cache_hit");
         return Ok(index);
     }
 
     // Load from mmap (use owned version for Arc wrapping)
-    let index = sst.read_index_owned()?;
+    let index = {
+        let _span = tracing::info_span!("load_index_from_mmap").entered();
+        sst.read_index_owned()?
+    };
     let arc_index = Arc::new(index);
 
     // Cache it
     cache.insert(cache_key, CacheEntry::Index(Arc::clone(&arc_index)));
+    tracing::trace!("index_cache_miss");
 
     Ok(arc_index)
 }
@@ -628,18 +652,28 @@ fn get_or_load_parsed_block_mmap(
 
     // Check cache first
     if let Some(CacheEntry::ParsedBlock(entries)) = cache.get(&cache_key) {
+        tracing::trace!("block_cache_hit");
         return Ok(entries);
     }
 
     // Load and decompress block from mmap
-    let decompressed = sst.read_block(block_offset)?;
+    let decompressed = {
+        let _span = tracing::info_span!("decompress_block").entered();
+        sst.read_block(block_offset)?
+    };
 
     // Parse entries
-    let entries = parse_block_entries(&decompressed)?;
+    let entries = {
+        let _span =
+            tracing::info_span!("parse_block_entries", decompressed_len = decompressed.len())
+                .entered();
+        parse_block_entries(&decompressed)?
+    };
     let arc_entries = Arc::new(entries);
 
     // Cache parsed entries
     cache.insert(cache_key, CacheEntry::ParsedBlock(Arc::clone(&arc_entries)));
+    tracing::trace!("block_cache_miss");
 
     Ok(arc_entries)
 }
@@ -904,7 +938,7 @@ pub fn count_prefix_keys_mmap(
     let canonical_path = sst.canonical_path();
 
     // Get or load index from cache
-    let index = get_or_load_index_mmap(sst, &canonical_path, cache)?;
+    let index = get_or_load_index_mmap(sst, canonical_path, cache)?;
 
     let mut count: u64 = 0;
 
@@ -932,7 +966,7 @@ pub fn count_prefix_keys_mmap(
 
         // Get or load parsed block from cache (reuses existing cache infrastructure)
         let parsed_entries =
-            get_or_load_parsed_block_mmap(sst, &canonical_path, *block_offset, cache)?;
+            get_or_load_parsed_block_mmap(sst, canonical_path, *block_offset, cache)?;
 
         let first_key_in_block = parsed_entries.first().map(|(k, _, _)| k.as_ref());
         let mut found_any_in_block = false;

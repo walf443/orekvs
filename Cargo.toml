@@ -36,3 +36,7 @@ tempfile = "3.10"
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[[example]]
+name = "profile_get"
+required-features = ["chrome"]
