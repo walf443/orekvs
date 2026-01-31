@@ -392,15 +392,19 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kv::CountRequest;
+    use kv::{
+        BatchDeleteRequest, BatchGetRequest, BatchSetRequest, CompareAndSetRequest, CountRequest,
+        DeleteRequest, GetExpireAtRequest, GetMetricsRequest, GetRequest, PromoteRequest,
+        SetRequest,
+    };
 
-    #[tokio::test]
-    async fn test_count_empty_prefix_returns_not_found() {
+    /// Helper to create a MyKeyValue with MemoryEngine for testing
+    fn create_test_key_value() -> MyKeyValue {
         let mut lsm_holder = LsmEngineHolder::new();
         let mut log_holder = LogEngineHolder::new();
         let mut btree_holder = BTreeEngineHolder::new();
 
-        let key_value = MyKeyValue::new(
+        MyKeyValue::new(
             EngineType::Memory,
             String::new(),
             0,
@@ -411,7 +415,673 @@ mod tests {
             &mut log_holder,
             &mut btree_holder,
             WalArchiveConfig::default(),
-        );
+        )
+    }
+
+    // ==================== Set Tests ====================
+
+    #[tokio::test]
+    async fn test_set_basic() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(SetRequest {
+            key: "key1".to_string(),
+            value: "value1".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.set(request).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn test_set_with_ttl() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(SetRequest {
+            key: "key_ttl".to_string(),
+            value: "value_ttl".to_string(),
+            ttl_seconds: 3600, // 1 hour TTL
+        });
+        let result = key_value.set(request).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().into_inner().success);
+    }
+
+    #[tokio::test]
+    async fn test_set_overwrites_existing() {
+        let key_value = create_test_key_value();
+
+        // Set initial value
+        let request1 = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "value1".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(request1).await.unwrap();
+
+        // Overwrite with new value
+        let request2 = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "value2".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.set(request2).await;
+        assert!(result.is_ok());
+
+        // Verify the new value
+        let get_request = Request::new(GetRequest {
+            key: "key".to_string(),
+            include_expire_at: false,
+        });
+        let get_result = key_value.get(get_request).await.unwrap();
+        assert_eq!(get_result.into_inner().value, "value2");
+    }
+
+    #[tokio::test]
+    async fn test_set_empty_key() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(SetRequest {
+            key: "".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.set(request).await;
+
+        // Empty key should still succeed (engine allows it)
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_set_empty_value() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.set(request).await;
+
+        assert!(result.is_ok());
+
+        // Verify empty value can be retrieved
+        let get_request = Request::new(GetRequest {
+            key: "key".to_string(),
+            include_expire_at: false,
+        });
+        let get_result = key_value.get(get_request).await.unwrap();
+        assert_eq!(get_result.into_inner().value, "");
+    }
+
+    // ==================== Get Tests ====================
+
+    #[tokio::test]
+    async fn test_get_existing_key() {
+        let key_value = create_test_key_value();
+
+        // Set a value first
+        let set_request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        // Get the value
+        let get_request = Request::new(GetRequest {
+            key: "key".to_string(),
+            include_expire_at: false,
+        });
+        let result = key_value.get(get_request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert_eq!(response.value, "value");
+        assert_eq!(response.expire_at, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_non_existing_key() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(GetRequest {
+            key: "nonexistent".to_string(),
+            include_expire_at: false,
+        });
+        let result = key_value.get(request).await;
+
+        // MemoryEngine returns NotFound error for non-existing keys
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_expire_at() {
+        let key_value = create_test_key_value();
+
+        // Set a value with TTL
+        let set_request = Request::new(SetRequest {
+            key: "key_ttl".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 3600,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        // Get with include_expire_at = true
+        let get_request = Request::new(GetRequest {
+            key: "key_ttl".to_string(),
+            include_expire_at: true,
+        });
+        let result = key_value.get(get_request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert_eq!(response.value, "value");
+        assert!(response.expire_at > 0); // Should have an expiration timestamp
+    }
+
+    #[tokio::test]
+    async fn test_get_unicode_key_value() {
+        let key_value = create_test_key_value();
+
+        let set_request = Request::new(SetRequest {
+            key: "日本語キー".to_string(),
+            value: "値🎉".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        let get_request = Request::new(GetRequest {
+            key: "日本語キー".to_string(),
+            include_expire_at: false,
+        });
+        let result = key_value.get(get_request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().into_inner().value, "値🎉");
+    }
+
+    // ==================== Delete Tests ====================
+
+    #[tokio::test]
+    async fn test_delete_existing_key() {
+        let key_value = create_test_key_value();
+
+        // Set a value first
+        let set_request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        // Delete the key
+        let delete_request = Request::new(DeleteRequest {
+            key: "key".to_string(),
+        });
+        let result = key_value.delete(delete_request).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().into_inner().success);
+
+        // Verify it's deleted (should return NotFound)
+        let get_request = Request::new(GetRequest {
+            key: "key".to_string(),
+            include_expire_at: false,
+        });
+        let get_result = key_value.get(get_request).await;
+        assert!(get_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_delete_non_existing_key() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(DeleteRequest {
+            key: "nonexistent".to_string(),
+        });
+        let result = key_value.delete(request).await;
+
+        // MemoryEngine returns NotFound error for non-existing keys
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    // ==================== Batch Set Tests ====================
+
+    #[tokio::test]
+    async fn test_batch_set_basic() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(BatchSetRequest {
+            items: vec![
+                KeyValuePair {
+                    key: "key1".to_string(),
+                    value: "value1".to_string(),
+                },
+                KeyValuePair {
+                    key: "key2".to_string(),
+                    value: "value2".to_string(),
+                },
+                KeyValuePair {
+                    key: "key3".to_string(),
+                    value: "value3".to_string(),
+                },
+            ],
+        });
+        let result = key_value.batch_set(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.success);
+        assert_eq!(response.count, 3);
+
+        // Verify all values were set
+        for i in 1..=3 {
+            let get_request = Request::new(GetRequest {
+                key: format!("key{}", i),
+                include_expire_at: false,
+            });
+            let get_result = key_value.get(get_request).await.unwrap();
+            assert_eq!(get_result.into_inner().value, format!("value{}", i));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_set_empty() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(BatchSetRequest { items: vec![] });
+        let result = key_value.batch_set(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.success);
+        assert_eq!(response.count, 0);
+    }
+
+    // ==================== Batch Get Tests ====================
+
+    #[tokio::test]
+    async fn test_batch_get_basic() {
+        let key_value = create_test_key_value();
+
+        // Set some values first
+        for i in 1..=3 {
+            let set_request = Request::new(SetRequest {
+                key: format!("key{}", i),
+                value: format!("value{}", i),
+                ttl_seconds: 0,
+            });
+            key_value.set(set_request).await.unwrap();
+        }
+
+        let request = Request::new(BatchGetRequest {
+            keys: vec!["key1".to_string(), "key2".to_string(), "key3".to_string()],
+        });
+        let result = key_value.batch_get(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert_eq!(response.items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_batch_get_mixed_existing_nonexisting() {
+        let key_value = create_test_key_value();
+
+        // Set only key1
+        let set_request = Request::new(SetRequest {
+            key: "key1".to_string(),
+            value: "value1".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        let request = Request::new(BatchGetRequest {
+            keys: vec![
+                "key1".to_string(),
+                "nonexistent".to_string(),
+                "key2".to_string(),
+            ],
+        });
+        let result = key_value.batch_get(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        // Should return items for existing keys only
+        assert!(!response.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_get_empty() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(BatchGetRequest { keys: vec![] });
+        let result = key_value.batch_get(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.items.is_empty());
+    }
+
+    // ==================== Batch Delete Tests ====================
+
+    #[tokio::test]
+    async fn test_batch_delete_basic() {
+        let key_value = create_test_key_value();
+
+        // Set some values first
+        for i in 1..=3 {
+            let set_request = Request::new(SetRequest {
+                key: format!("key{}", i),
+                value: format!("value{}", i),
+                ttl_seconds: 0,
+            });
+            key_value.set(set_request).await.unwrap();
+        }
+
+        let request = Request::new(BatchDeleteRequest {
+            keys: vec!["key1".to_string(), "key2".to_string()],
+        });
+        let result = key_value.batch_delete(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.success);
+        assert_eq!(response.count, 2);
+
+        // Verify key1 and key2 are deleted (NotFound error)
+        let get1 = key_value
+            .get(Request::new(GetRequest {
+                key: "key1".to_string(),
+                include_expire_at: false,
+            }))
+            .await;
+        assert!(get1.is_err());
+
+        // key3 should still exist
+        let get3 = key_value
+            .get(Request::new(GetRequest {
+                key: "key3".to_string(),
+                include_expire_at: false,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(get3.into_inner().value, "value3");
+    }
+
+    #[tokio::test]
+    async fn test_batch_delete_empty() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(BatchDeleteRequest { keys: vec![] });
+        let result = key_value.batch_delete(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.success);
+        assert_eq!(response.count, 0);
+    }
+
+    // ==================== Get Metrics Tests ====================
+
+    #[tokio::test]
+    async fn test_get_metrics_memory_engine() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(GetMetricsRequest {});
+        let result = key_value.get_metrics(request).await;
+
+        assert!(result.is_ok());
+        // Memory engine returns default/empty metrics
+        let response = result.unwrap().into_inner();
+        assert_eq!(response.get_count, 0);
+        assert_eq!(response.set_count, 0);
+    }
+
+    // ==================== Get Expire At Tests ====================
+
+    #[tokio::test]
+    async fn test_get_expire_at_no_ttl() {
+        let key_value = create_test_key_value();
+
+        // Set a value without TTL
+        let set_request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        let request = Request::new(GetExpireAtRequest {
+            key: "key".to_string(),
+        });
+        let result = key_value.get_expire_at(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.exists);
+        assert_eq!(response.expire_at, 0); // No expiration
+    }
+
+    #[tokio::test]
+    async fn test_get_expire_at_with_ttl() {
+        let key_value = create_test_key_value();
+
+        // Set a value with TTL
+        let set_request = Request::new(SetRequest {
+            key: "key_ttl".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 3600,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        let request = Request::new(GetExpireAtRequest {
+            key: "key_ttl".to_string(),
+        });
+        let result = key_value.get_expire_at(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.exists);
+        assert!(response.expire_at > 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_expire_at_nonexistent() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(GetExpireAtRequest {
+            key: "nonexistent".to_string(),
+        });
+        let result = key_value.get_expire_at(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(!response.exists);
+    }
+
+    // ==================== Compare And Set Tests ====================
+
+    #[tokio::test]
+    async fn test_compare_and_set_create_new() {
+        let key_value = create_test_key_value();
+
+        // CAS on non-existing key (expect_exists = false)
+        let request = Request::new(CompareAndSetRequest {
+            key: "new_key".to_string(),
+            expect_exists: false,
+            expected_value: "".to_string(),
+            new_value: "new_value".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.compare_and_set(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.success);
+
+        // Verify the value was set
+        let get_request = Request::new(GetRequest {
+            key: "new_key".to_string(),
+            include_expire_at: false,
+        });
+        let get_result = key_value.get(get_request).await.unwrap();
+        assert_eq!(get_result.into_inner().value, "new_value");
+    }
+
+    #[tokio::test]
+    async fn test_compare_and_set_update_existing() {
+        let key_value = create_test_key_value();
+
+        // Set initial value
+        let set_request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "old_value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        // CAS to update with correct expected value
+        let request = Request::new(CompareAndSetRequest {
+            key: "key".to_string(),
+            expect_exists: true,
+            expected_value: "old_value".to_string(),
+            new_value: "new_value".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.compare_and_set(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(response.success);
+
+        // Verify the value was updated
+        let get_request = Request::new(GetRequest {
+            key: "key".to_string(),
+            include_expire_at: false,
+        });
+        let get_result = key_value.get(get_request).await.unwrap();
+        assert_eq!(get_result.into_inner().value, "new_value");
+    }
+
+    #[tokio::test]
+    async fn test_compare_and_set_fails_wrong_expected() {
+        let key_value = create_test_key_value();
+
+        // Set initial value
+        let set_request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "actual_value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        // CAS with wrong expected value
+        let request = Request::new(CompareAndSetRequest {
+            key: "key".to_string(),
+            expect_exists: true,
+            expected_value: "wrong_value".to_string(),
+            new_value: "new_value".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.compare_and_set(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(!response.success);
+        assert_eq!(response.current_value, "actual_value");
+
+        // Verify the value was not changed
+        let get_request = Request::new(GetRequest {
+            key: "key".to_string(),
+            include_expire_at: false,
+        });
+        let get_result = key_value.get(get_request).await.unwrap();
+        assert_eq!(get_result.into_inner().value, "actual_value");
+    }
+
+    #[tokio::test]
+    async fn test_compare_and_set_fails_key_exists_unexpectedly() {
+        let key_value = create_test_key_value();
+
+        // Set a value
+        let set_request = Request::new(SetRequest {
+            key: "key".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        // CAS expecting key not to exist
+        let request = Request::new(CompareAndSetRequest {
+            key: "key".to_string(),
+            expect_exists: false,
+            expected_value: "".to_string(),
+            new_value: "new_value".to_string(),
+            ttl_seconds: 0,
+        });
+        let result = key_value.compare_and_set(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(!response.success);
+    }
+
+    #[tokio::test]
+    async fn test_compare_and_set_with_ttl() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(CompareAndSetRequest {
+            key: "key_ttl".to_string(),
+            expect_exists: false,
+            expected_value: "".to_string(),
+            new_value: "value".to_string(),
+            ttl_seconds: 3600,
+        });
+        let result = key_value.compare_and_set(request).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().into_inner().success);
+
+        // Verify TTL was set
+        let expire_request = Request::new(GetExpireAtRequest {
+            key: "key_ttl".to_string(),
+        });
+        let expire_result = key_value.get_expire_at(expire_request).await.unwrap();
+        assert!(expire_result.into_inner().expire_at > 0);
+    }
+
+    // ==================== Promote To Leader Tests ====================
+
+    #[tokio::test]
+    async fn test_promote_to_leader_already_leader() {
+        let key_value = create_test_key_value();
+
+        let request = Request::new(PromoteRequest {
+            enable_replication_service: false,
+            replication_port: 0,
+        });
+        let result = key_value.promote_to_leader(request).await;
+
+        assert!(result.is_ok());
+        let response = result.unwrap().into_inner();
+        assert!(!response.success);
+        assert!(response.message.contains("already running as a leader"));
+    }
+
+    // ==================== Count Tests ====================
+
+    #[tokio::test]
+    async fn test_count_empty_prefix_returns_not_found() {
+        let key_value = create_test_key_value();
 
         let request = Request::new(CountRequest {
             prefix: "".to_string(),
@@ -426,22 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_non_empty_prefix_succeeds() {
-        let mut lsm_holder = LsmEngineHolder::new();
-        let mut log_holder = LogEngineHolder::new();
-        let mut btree_holder = BTreeEngineHolder::new();
-
-        let key_value = MyKeyValue::new(
-            EngineType::Memory,
-            String::new(),
-            0,
-            0,
-            0,
-            0,
-            &mut lsm_holder,
-            &mut log_holder,
-            &mut btree_holder,
-            WalArchiveConfig::default(),
-        );
+        let key_value = create_test_key_value();
 
         let request = Request::new(CountRequest {
             prefix: "test".to_string(),
@@ -450,5 +1105,53 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().into_inner().count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_with_matching_keys() {
+        let key_value = create_test_key_value();
+
+        // Set keys with common prefix
+        for i in 1..=5 {
+            let set_request = Request::new(SetRequest {
+                key: format!("prefix:{}", i),
+                value: format!("value{}", i),
+                ttl_seconds: 0,
+            });
+            key_value.set(set_request).await.unwrap();
+        }
+
+        // Set keys with different prefix
+        let set_request = Request::new(SetRequest {
+            key: "other:key".to_string(),
+            value: "value".to_string(),
+            ttl_seconds: 0,
+        });
+        key_value.set(set_request).await.unwrap();
+
+        let request = Request::new(CountRequest {
+            prefix: "prefix:".to_string(),
+        });
+        let result = key_value.count(request).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().into_inner().count, 5);
+    }
+
+    // ==================== Engine Type Tests ====================
+
+    #[test]
+    fn test_engine_type_debug() {
+        assert_eq!(format!("{:?}", EngineType::Memory), "Memory");
+        assert_eq!(format!("{:?}", EngineType::Log), "Log");
+        assert_eq!(format!("{:?}", EngineType::LsmTree), "LsmTree");
+        assert_eq!(format!("{:?}", EngineType::BTree), "BTree");
+    }
+
+    #[test]
+    fn test_engine_type_clone() {
+        let engine_type = EngineType::Memory;
+        let cloned = engine_type.clone();
+        assert!(matches!(cloned, EngineType::Memory));
     }
 }
