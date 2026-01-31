@@ -338,3 +338,401 @@ pub fn recover(data_dir: &Path) -> RecoveryResult {
         wal_file_max_seqs: memtable_result.wal_file_max_seqs,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::lsm_tree::manifest::ManifestEntry;
+    use tempfile::TempDir;
+
+    // ==================== is_expired Tests ====================
+
+    #[test]
+    fn test_is_expired_no_ttl() {
+        // expire_at = 0 means no TTL, should never be expired
+        let now = current_timestamp();
+        assert!(!is_expired(0, now));
+        assert!(!is_expired(0, now + 1000));
+    }
+
+    #[test]
+    fn test_is_expired_future() {
+        let now = current_timestamp();
+        // Expire time is in the future
+        assert!(!is_expired(now + 3600, now));
+    }
+
+    #[test]
+    fn test_is_expired_past() {
+        let now = current_timestamp();
+        // Expire time is in the past
+        assert!(is_expired(now - 1, now));
+        assert!(is_expired(now - 3600, now));
+    }
+
+    #[test]
+    fn test_is_expired_exactly_now() {
+        let now = current_timestamp();
+        // Expire time equals now - should be expired (expire_at <= now)
+        assert!(is_expired(now, now));
+    }
+
+    // ==================== scan_files Tests ====================
+
+    #[test]
+    fn test_scan_files_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let scanned = scan_files(temp_dir.path());
+
+        assert!(scanned.sst_files.is_empty());
+        assert!(scanned.wal_files.is_empty());
+        assert_eq!(scanned.max_sst_id, 0);
+        assert_eq!(scanned.max_wal_id, 0);
+        assert_eq!(scanned.max_wal_id_in_sst, 0);
+    }
+
+    #[test]
+    fn test_scan_files_with_wal_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create WAL files
+        fs::write(temp_dir.path().join("wal_00001.log"), b"data1").unwrap();
+        fs::write(temp_dir.path().join("wal_00003.log"), b"data3").unwrap();
+        fs::write(temp_dir.path().join("wal_00002.log"), b"data2").unwrap();
+
+        let scanned = scan_files(temp_dir.path());
+
+        assert!(scanned.sst_files.is_empty());
+        assert_eq!(scanned.wal_files.len(), 3);
+        // WAL files should be sorted by ID
+        assert_eq!(scanned.wal_files[0].0, 1);
+        assert_eq!(scanned.wal_files[1].0, 2);
+        assert_eq!(scanned.wal_files[2].0, 3);
+        assert_eq!(scanned.max_wal_id, 4); // max_wal_id = 3 + 1
+    }
+
+    #[test]
+    fn test_scan_files_with_sst_files_old_format() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create old format SSTable files
+        fs::write(temp_dir.path().join("sst_00001.data"), b"data1").unwrap();
+        fs::write(temp_dir.path().join("sst_00005.data"), b"data5").unwrap();
+
+        let scanned = scan_files(temp_dir.path());
+
+        assert_eq!(scanned.sst_files.len(), 2);
+        assert!(scanned.wal_files.is_empty());
+        assert_eq!(scanned.max_sst_id, 6); // max_sst_id = 5 + 1
+        assert_eq!(scanned.max_wal_id_in_sst, 0); // Old format has no WAL ID
+    }
+
+    #[test]
+    fn test_scan_files_with_sst_files_new_format() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create new format SSTable files (sst_{sst_id}_{wal_id}.data)
+        fs::write(temp_dir.path().join("sst_00001_00010.data"), b"data1").unwrap();
+        fs::write(temp_dir.path().join("sst_00002_00015.data"), b"data2").unwrap();
+
+        let scanned = scan_files(temp_dir.path());
+
+        assert_eq!(scanned.sst_files.len(), 2);
+        assert_eq!(scanned.max_sst_id, 3); // max_sst_id = 2 + 1
+        assert_eq!(scanned.max_wal_id_in_sst, 15); // max WAL ID from SSTable filenames
+    }
+
+    #[test]
+    fn test_scan_files_removes_tmp_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a .tmp file (should be removed)
+        let tmp_path = temp_dir.path().join("sst_00001.data.tmp");
+        fs::write(&tmp_path, b"orphaned").unwrap();
+        assert!(tmp_path.exists());
+
+        let scanned = scan_files(temp_dir.path());
+
+        // .tmp file should be removed
+        assert!(!tmp_path.exists());
+        assert!(scanned.sst_files.is_empty());
+    }
+
+    #[test]
+    fn test_scan_files_ignores_other_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create various files that should be ignored
+        fs::write(temp_dir.path().join("manifest.json"), b"{}").unwrap();
+        fs::write(temp_dir.path().join("other.txt"), b"text").unwrap();
+        fs::write(temp_dir.path().join("readme.md"), b"readme").unwrap();
+
+        let scanned = scan_files(temp_dir.path());
+
+        assert!(scanned.sst_files.is_empty());
+        assert!(scanned.wal_files.is_empty());
+    }
+
+    #[test]
+    fn test_scan_files_mixed_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a mix of files
+        fs::write(temp_dir.path().join("wal_00001.log"), b"wal").unwrap();
+        fs::write(temp_dir.path().join("sst_00001.data"), b"sst").unwrap();
+        fs::write(temp_dir.path().join("manifest.json"), b"{}").unwrap();
+
+        let scanned = scan_files(temp_dir.path());
+
+        assert_eq!(scanned.sst_files.len(), 1);
+        assert_eq!(scanned.wal_files.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_files_sst_sorted_reverse() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create SSTable files
+        fs::write(temp_dir.path().join("sst_00001.data"), b"data1").unwrap();
+        fs::write(temp_dir.path().join("sst_00003.data"), b"data3").unwrap();
+        fs::write(temp_dir.path().join("sst_00002.data"), b"data2").unwrap();
+
+        let scanned = scan_files(temp_dir.path());
+
+        // SSTable files should be sorted in reverse order (newest first)
+        assert_eq!(scanned.sst_files.len(), 3);
+        assert!(
+            scanned.sst_files[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("00003")
+        );
+        assert!(
+            scanned.sst_files[2]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("00001")
+        );
+    }
+
+    // ==================== load_manifest Tests ====================
+
+    #[test]
+    fn test_load_manifest_no_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let manifest = load_manifest(temp_dir.path());
+
+        // Should return empty manifest
+        assert!(manifest.entries.is_empty());
+    }
+
+    #[test]
+    fn test_load_manifest_with_file() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create and save a manifest
+        let mut manifest = Manifest::new();
+        let entry = ManifestEntry {
+            filename: "sst_00001.data".to_string(),
+            level: 0,
+            min_key_hex: "00".to_string(),
+            max_key_hex: "ff".to_string(),
+            size_bytes: 100,
+            entry_count: None,
+        };
+        manifest.add_entry(entry);
+        manifest.save(temp_dir.path()).unwrap();
+
+        // Load it back
+        let loaded = load_manifest(temp_dir.path());
+        assert_eq!(loaded.entries.len(), 1);
+        assert!(loaded.get_entry("sst_00001.data").is_some());
+    }
+
+    // ==================== build_sstable_handles Tests ====================
+
+    #[test]
+    fn test_build_sstable_handles_empty() {
+        let manifest = Manifest::new();
+        let sst_files: Vec<PathBuf> = vec![];
+
+        let handles = build_sstable_handles(&sst_files, &manifest);
+
+        // New LeveledSstables should have no files at any level
+        assert_eq!(handles.total_sstable_count(), 0);
+    }
+
+    #[test]
+    fn test_build_sstable_handles_orphan_deleted() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create an SSTable file that is NOT in manifest
+        let orphan_path = temp_dir.path().join("sst_00001.data");
+        fs::write(&orphan_path, b"orphan data").unwrap();
+        assert!(orphan_path.exists());
+
+        // Empty manifest (SSTable is not tracked)
+        let manifest = Manifest::new();
+        let sst_files = vec![orphan_path.clone()];
+
+        let _handles = build_sstable_handles(&sst_files, &manifest);
+
+        // Orphan SSTable should be deleted
+        assert!(!orphan_path.exists());
+    }
+
+    // ==================== recover Tests ====================
+
+    #[test]
+    fn test_recover_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let result = recover(temp_dir.path());
+
+        assert!(result.recovered_memtable.is_empty());
+        assert_eq!(result.recovered_size, 0);
+        assert_eq!(result.next_sst_id, 0);
+        assert_eq!(result.next_wal_id, 0);
+    }
+
+    #[test]
+    fn test_recover_updates_next_wal_id() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create WAL files with specific IDs
+        fs::write(temp_dir.path().join("wal_00010.log"), b"").unwrap();
+        fs::write(temp_dir.path().join("wal_00005.log"), b"").unwrap();
+
+        let result = recover(temp_dir.path());
+
+        // next_wal_id should be max + 1
+        assert_eq!(result.next_wal_id, 11);
+    }
+
+    #[test]
+    fn test_recover_updates_next_sst_id() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create SSTable files with specific IDs (will be orphaned but ID tracking still works)
+        fs::write(temp_dir.path().join("sst_00007.data"), b"data").unwrap();
+        fs::write(temp_dir.path().join("sst_00003.data"), b"data").unwrap();
+
+        let result = recover(temp_dir.path());
+
+        // next_sst_id should be max + 1
+        assert_eq!(result.next_sst_id, 8);
+    }
+
+    #[test]
+    fn test_recover_empty_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let result = recover(temp_dir.path());
+
+        assert!(result.manifest.entries.is_empty());
+    }
+
+    #[test]
+    fn test_recover_with_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create and save a manifest
+        let mut manifest = Manifest::new();
+        let entry = ManifestEntry {
+            filename: "sst_00001.data".to_string(),
+            level: 0,
+            min_key_hex: "00".to_string(),
+            max_key_hex: "ff".to_string(),
+            size_bytes: 100,
+            entry_count: None,
+        };
+        manifest.add_entry(entry);
+        manifest.save(temp_dir.path()).unwrap();
+
+        // Recover
+        let result = recover(temp_dir.path());
+
+        // Manifest should be loaded
+        assert_eq!(result.manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_recover_deletes_orphan_sstables() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create an SSTable file that is NOT in manifest
+        let orphan_path = temp_dir.path().join("sst_00001.data");
+        fs::write(&orphan_path, b"orphan data").unwrap();
+        assert!(orphan_path.exists());
+
+        // Recover with empty manifest
+        let _result = recover(temp_dir.path());
+
+        // Orphan SSTable should be deleted
+        assert!(!orphan_path.exists());
+    }
+
+    #[test]
+    fn test_recover_cleans_tmp_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a .tmp file
+        let tmp_path = temp_dir.path().join("sst_00001.data.tmp");
+        fs::write(&tmp_path, b"incomplete").unwrap();
+        assert!(tmp_path.exists());
+
+        // Recover
+        let _result = recover(temp_dir.path());
+
+        // .tmp file should be deleted
+        assert!(!tmp_path.exists());
+    }
+
+    // ==================== RecoveryResult Tests ====================
+
+    #[test]
+    fn test_recovery_result_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let result = recover(temp_dir.path());
+
+        // Verify all fields are accessible and have expected defaults
+        assert_eq!(result.leveled_sstables.total_sstable_count(), 0);
+        assert!(result.manifest.entries.is_empty());
+        assert!(result.recovered_memtable.is_empty());
+        assert_eq!(result.recovered_size, 0);
+        assert_eq!(result.next_sst_id, 0);
+        assert_eq!(result.next_wal_id, 0);
+        assert_eq!(result.max_wal_seq, 0);
+        assert!(result.wal_file_max_seqs.is_empty());
+    }
+
+    // ==================== recover_memtable Tests ====================
+
+    #[test]
+    fn test_recover_memtable_empty() {
+        // Test with no WAL files
+        let wal_files: Vec<(u64, PathBuf)> = vec![];
+        let result = recover_memtable(&wal_files, 0, false, 0);
+
+        assert!(result.memtable.is_empty());
+        assert_eq!(result.size, 0);
+        assert_eq!(result.max_wal_seq, 0);
+        assert!(result.wal_file_max_seqs.is_empty());
+    }
+
+    // ==================== ScannedFiles struct Tests ====================
+
+    #[test]
+    fn test_scanned_files_nonexistent_dir() {
+        // Scanning a non-existent directory should return empty results
+        let scanned = scan_files(Path::new("/nonexistent/path/that/does/not/exist"));
+
+        assert!(scanned.sst_files.is_empty());
+        assert!(scanned.wal_files.is_empty());
+        assert_eq!(scanned.max_sst_id, 0);
+        assert_eq!(scanned.max_wal_id, 0);
+    }
+}
