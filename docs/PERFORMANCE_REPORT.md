@@ -5,7 +5,7 @@
 - **メモリ**: 32 GB
 - **OS**: Darwin (macOS)
 - **ビルド**: Release (`cargo build --release`)
-- **日付**: 2026-01-28 (CAS + リファクタリング後)
+- **日付**: 2026-01-31 (canonical_path キャッシュ最適化後)
 
 ## ベンチマーク
 - **ワークロード**: 10,000 Random Set / 10,000 Random Get
@@ -46,14 +46,54 @@
 
 ## 今回の最適化内容
 
+### 0. canonical_path キャッシュ (2026-01-31)
+
+**問題**: `MappedSSTable::canonical_path()` が毎回 `path.canonicalize()` を呼び出しており、ファイルシステムアクセスが発生していた。
+
+**プロファイリング結果** (tracing-chrome):
+| 指標 | 修正前 | 修正後 | 改善 |
+|------|--------|--------|------|
+| SSTable GET 平均時間 | 37.7us | 9.0us | **4.2x** |
+| canonical_path 占有率 | 32.3% (12.2us) | 1.4% (0.1us) | **122x** |
+
+**修正内容**: SSTable オープン時に canonical_path を一度だけ計算してキャッシュ
+
+```rust
+pub struct MappedSSTable {
+    path: PathBuf,
+    canonical_path: PathBuf,  // 追加: キャッシュ済みパス
+    // ...
+}
+
+impl MappedSSTable {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Status> {
+        // オープン時に一度だけ計算
+        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // ...
+    }
+
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path  // O(1) で参照を返す
+    }
+}
+```
+
+**プロファイリングツール**: `examples/profile_get.rs` と `examples/analyze_trace.rs` を追加
+```bash
+# プロファイリング実行
+cargo run --release --features chrome --example profile_get
+# 結果分析
+cargo run --example analyze_trace -- ./profile_get_trace.json
+```
+
 ### 1. Index Block Cache (OnceLock)
 
 SSTable のインデックスを初回アクセス時にキャッシュし、2回目以降の解凍をスキップします。
 
 | 指標 | Cold (初回) | Warm (キャッシュ後) | 高速化 |
 |------|-------------|---------------------|--------|
-| スループット | 56,000/sec | 2,000,000,000/sec | **36,000x** |
-| レイテンシ | 0.018 ms | ~0 ms | 実質ゼロ |
+| スループット | 32,481/sec | 2,027,712,065/sec | **62,428x** |
+| レイテンシ | 0.031 ms | ~0 ms | 実質ゼロ |
 
 **実装**:
 ```rust
@@ -138,8 +178,8 @@ SSTable の読み取りをメモリマップと LRU キャッシュで高速化�
 
 | 方式 | 検索速度 | 高速化 |
 |------|----------|--------|
-| ファイルI/O直接 | 39,677/sec | 1.0x |
-| mmap + Block Cache | 105,060/sec | **2.65x** |
+| ファイルI/O直接 | 36,657/sec | 1.0x |
+| mmap + Block Cache | 2,734,003/sec | **74.6x** |
 
 ### 6. BTree Engine (新規)
 
@@ -262,28 +302,28 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
 - **総キー数**: 10,000
 - **イテレーション**: 100回
 - **プレフィックスパターン**: 20%マッチ、1%マッチ、0.1%マッチ、0%マッチ
-- **日付**: 2026-01-29 (HashSet遅延初期化 + 事前容量確保 最適化後)
+- **日付**: 2026-01-31 (canonical_path キャッシュ最適化後)
 
 ### 結果
 
 | エンジン | プレフィックス | マッチ数 | Time (ms) | ops/sec |
 |----------|----------------|----------|-----------|---------|
-| **Memory** | log: (20%) | 2,000 | 9.3 | 10,734 |
-| **Memory** | log:001 (1%) | 100 | 11.3 | 8,875 |
-| **Memory** | log:0010 (0.1%) | 10 | 5.0 | 19,908 |
-| **Memory** | nonexistent: | 0 | 5.6 | 17,815 |
-| **Log** | log: (20%) | 2,000 | 7.8 | 12,826 |
-| **Log** | log:001 (1%) | 100 | 8.6 | 11,617 |
-| **Log** | log:0010 (0.1%) | 10 | 4.1 | 24,534 |
-| **Log** | nonexistent: | 0 | 5.2 | 19,234 |
-| **BTree** | log: (20%) | 2,000 | 15.9 | 6,293 |
-| **BTree** | log:001 (1%) | 100 | 2.2 | 46,485 |
-| **BTree** | log:0010 (0.1%) | 10 | 1.1 | 90,556 |
-| **BTree** | nonexistent: | 0 | 1.1 | 92,265 |
-| **LSM-tree** | log: (20%) | 2,000 | 12.3 | **8,160** |
-| **LSM-tree** | log:001 (1%) | 100 | 0.56 | **177,397** |
-| **LSM-tree** | log:0010 (0.1%) | 10 | 0.14 | **727,490** |
-| **LSM-tree** | nonexistent: | 0 | 0.02 | **4,554,149** |
+| **Memory** | log: (20%) | 2,000 | 5.6 | 17,896 |
+| **Memory** | log:001 (1%) | 100 | 6.4 | 15,666 |
+| **Memory** | log:0010 (0.1%) | 10 | 3.1 | 32,212 |
+| **Memory** | nonexistent: | 0 | 3.8 | 26,373 |
+| **Log** | log: (20%) | 2,000 | 5.4 | 18,454 |
+| **Log** | log:001 (1%) | 100 | 5.9 | 17,040 |
+| **Log** | log:0010 (0.1%) | 10 | 3.0 | 33,369 |
+| **Log** | nonexistent: | 0 | 3.6 | 27,471 |
+| **BTree** | log: (20%) | 2,000 | 16.3 | 6,134 |
+| **BTree** | log:001 (1%) | 100 | 2.1 | 47,332 |
+| **BTree** | log:0010 (0.1%) | 10 | 1.1 | 87,719 |
+| **BTree** | nonexistent: | 0 | 1.1 | 88,771 |
+| **LSM-tree** | log: (20%) | 2,000 | 13.8 | **7,269** |
+| **LSM-tree** | log:001 (1%) | 100 | 0.60 | **166,021** |
+| **LSM-tree** | log:0010 (0.1%) | 10 | 0.14 | **725,079** |
+| **LSM-tree** | nonexistent: | 0 | 0.015 | **6,876,633** |
 
 ### Count 実装の特徴
 
@@ -331,14 +371,14 @@ WAL v2 では、512バイト以上のブロックに対してzstd圧縮を適用
    - MemTableからの変換コスト（`Arc::from(key.as_str())`）はMemTable件数が少ないため影響軽微
 
 **注釈**:
-- **LSM-tree** がマッチ率が低い場合に最も高速: 範囲スキャンにより O(log n + k) で検索（0%マッチで **4,554,149 ops/sec**）
-- **LSM-tree** は高マッチ率でもMemory/Logに近い性能（20%マッチで **8,160 ops/sec**）
+- **LSM-tree** がマッチ率が低い場合に最も高速: 範囲スキャンにより O(log n + k) で検索（0%マッチで **6,876,633 ops/sec**）
+- **LSM-tree** は高マッチ率でもMemory/Logに近い性能（20%マッチで **7,269 ops/sec**）
 - **BTree** も効率的: リーフノード走査で O(log n + k)
 - **Memory/Log** は全キーを走査するため、マッチ率に関わらずほぼ一定のオーバーヘッド
 
 ## 考察
 
-1. **読み取り性能**: LSM-tree が Memory エンジンとほぼ同等の性能を維持。Index Block Cache により同じ SSTable への繰り返しアクセスが 36,000x 高速化されています。
+1. **読み取り性能**: LSM-tree が Memory エンジンとほぼ同等の性能を維持。Index Block Cache により同じ SSTable への繰り返しアクセスが 62,428x 高速化されています。
 
 2. **書き込み性能**: 小規模ベンチマークでは従来とほぼ同じスループット。Leveled Compaction の書き込み増幅は大規模データで顕在化しますが、読み取り性能の向上とのトレードオフです。
 
