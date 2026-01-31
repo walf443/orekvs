@@ -338,15 +338,18 @@ impl LsmTreeEngine {
 }
 
 impl Engine for LsmTreeEngine {
+    #[instrument(skip(self, value), fields(key_len = key.len()))]
     fn set(&self, key: String, value: String) -> Result<(), Status> {
         self.set_internal(key, value, 0)
     }
 
+    #[instrument(skip(self, value), fields(key_len = key.len()))]
     fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
         let expire_at = current_timestamp() + ttl_secs;
         self.set_internal(key, value, expire_at)
     }
 
+    #[instrument(skip(self), fields(key_len = key.len()))]
     fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         self.metrics.record_get();
         let now = current_timestamp();
@@ -406,6 +409,7 @@ impl Engine for LsmTreeEngine {
         Err(Status::not_found("Key not found"))
     }
 
+    #[instrument(skip(self), fields(key_len = key.len()))]
     fn delete(&self, key: String) -> Result<(), Status> {
         self.metrics.record_delete();
 
@@ -437,6 +441,7 @@ impl Engine for LsmTreeEngine {
         })
     }
 
+    #[instrument(skip(self, items), fields(count = items.len()))]
     fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
         if items.is_empty() {
             return Ok(0);
@@ -481,6 +486,7 @@ impl Engine for LsmTreeEngine {
         Ok(count)
     }
 
+    #[instrument(skip(self, items), fields(count = items.len()))]
     fn batch_set_with_expire_at(&self, items: Vec<(String, String, u64)>) -> Result<usize, Status> {
         if items.is_empty() {
             return Ok(0);
@@ -526,6 +532,7 @@ impl Engine for LsmTreeEngine {
         Ok(count)
     }
 
+    #[instrument(skip(self, keys), fields(count = keys.len()))]
     fn batch_get(&self, mut keys: Vec<String>) -> Vec<(String, String)> {
         if keys.is_empty() {
             return Vec::new();
@@ -605,6 +612,7 @@ impl Engine for LsmTreeEngine {
         results
     }
 
+    #[instrument(skip(self, keys), fields(count = keys.len()))]
     fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
         if keys.is_empty() {
             return Ok(0);
@@ -647,6 +655,7 @@ impl Engine for LsmTreeEngine {
         Ok(count)
     }
 
+    #[instrument(skip(self, expected_value, new_value), fields(key_len = key.len()))]
     fn compare_and_set(
         &self,
         key: String,
