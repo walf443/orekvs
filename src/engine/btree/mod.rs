@@ -579,19 +579,23 @@ impl BTreeEngine {
 }
 
 impl Engine for BTreeEngine {
+    #[instrument(skip(self, value), fields(key_len = key.len()))]
     fn set(&self, key: String, value: String) -> Result<(), Status> {
         self.set_internal_with_ttl(key, value, 0, true)
     }
 
+    #[instrument(skip(self, value), fields(key_len = key.len()))]
     fn set_with_ttl(&self, key: String, value: String, ttl_secs: u64) -> Result<(), Status> {
         let expire_at = current_timestamp() + ttl_secs;
         self.set_internal_with_ttl(key, value, expire_at, true)
     }
 
+    #[instrument(skip(self), fields(key_len = key.len()))]
     fn delete(&self, key: String) -> Result<(), Status> {
         self.delete_internal(key, true)
     }
 
+    #[instrument(skip(self, items), fields(count = items.len()))]
     fn batch_set(&self, items: Vec<(String, String)>) -> Result<usize, Status> {
         if items.is_empty() {
             return Ok(0);
@@ -618,6 +622,7 @@ impl Engine for BTreeEngine {
         Ok(count)
     }
 
+    #[instrument(skip(self, keys), fields(count = keys.len()))]
     fn batch_delete(&self, keys: Vec<String>) -> Result<usize, Status> {
         if keys.is_empty() {
             return Ok(0);
@@ -647,6 +652,7 @@ impl Engine for BTreeEngine {
         Ok(count)
     }
 
+    #[instrument(skip(self), fields(key_len = key.len()))]
     fn get_with_expire_at(&self, key: String) -> Result<(String, u64), Status> {
         let meta = self.meta.read().unwrap();
 
@@ -666,6 +672,7 @@ impl Engine for BTreeEngine {
         }
     }
 
+    #[instrument(skip(self, expected_value, new_value), fields(key_len = key.len()))]
     fn compare_and_set(
         &self,
         key: String,
