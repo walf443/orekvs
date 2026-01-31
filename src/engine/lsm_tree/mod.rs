@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::Status;
+use tracing::{info_span, instrument};
 use wal::GroupCommitWalWriter;
 pub use wrapper::{LsmEngineHolder, LsmTreeEngineWrapper};
 
@@ -725,6 +726,7 @@ impl Engine for LsmTreeEngine {
         Ok((true, current_value))
     }
 
+    #[instrument(skip(self), fields(prefix_len = prefix.len()))]
     fn count(&self, prefix: &str) -> Result<u64, Status> {
         use std::collections::HashSet;
 
@@ -738,6 +740,7 @@ impl Engine for LsmTreeEngine {
 
         // 1. Check active memtable (SkipMap - use range scan from prefix)
         {
+            let _span = info_span!("count_active_memtable").entered();
             let active = self.mem_state.active_memtable.load();
             // Range scan starting from prefix - O(log n + k) instead of O(n)
             for entry in active.range(prefix.to_string()..) {
@@ -757,6 +760,7 @@ impl Engine for LsmTreeEngine {
 
         // 2. Check immutable memtables (BTreeMap - use range scan from prefix)
         {
+            let _span = info_span!("count_immutable_memtables").entered();
             let immutables = self.mem_state.immutable_memtables.lock().unwrap();
             for memtable in immutables.iter().rev() {
                 // Range scan starting from prefix - O(log n + k) instead of O(n)
@@ -778,6 +782,7 @@ impl Engine for LsmTreeEngine {
         // 3. Check SSTables (older data, don't overwrite newer)
         // Use count_prefix_keys_mmap which counts directly without allocating a Vec
         {
+            let _span = info_span!("count_sstables").entered();
             let leveled = self.leveled_sstables.lock().unwrap();
             let handles = leveled.to_flat_list();
 

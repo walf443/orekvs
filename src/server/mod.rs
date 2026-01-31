@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, transport::Server};
+use tracing::instrument;
 
 pub mod cli;
 
@@ -258,11 +259,13 @@ impl KeyValue for MyKeyValue {
         }))
     }
 
+    #[instrument(skip(self, request), fields(prefix_len))]
     async fn count(
         &self,
         request: Request<CountRequest>,
     ) -> Result<Response<CountResponse>, Status> {
         let req = request.into_inner();
+        tracing::Span::current().record("prefix_len", req.prefix.len());
         if req.prefix.is_empty() {
             return Err(Status::not_found("Prefix cannot be empty"));
         }

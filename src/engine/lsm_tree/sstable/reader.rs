@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use tonic::Status;
+use tracing::instrument;
 
 use crate::engine::lsm_tree::block_cache::{
     BlockCache, BlockCacheKey, CacheEntry, ParsedBlockEntry,
@@ -892,6 +893,7 @@ pub fn scan_prefix_keys_mmap(
 /// (MemTable or newer SSTables) to avoid double-counting.
 /// Uses `Arc<str>` for O(1) clone operations instead of String clones.
 #[allow(clippy::result_large_err)]
+#[instrument(skip(sst, cache, seen_keys), fields(sstable = %sst.canonical_path().display()))]
 pub fn count_prefix_keys_mmap(
     sst: &MappedSSTable,
     prefix: &str,

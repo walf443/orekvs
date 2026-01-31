@@ -903,3 +903,107 @@ async fn bench_sstable_count() {
     engine.shutdown().await;
     println!("=====================================\n");
 }
+
+/// Benchmark with tracing profile output
+/// Run with: cargo test --release --features chrome bench_sstable_count_profiled -- --nocapture --ignored
+/// Then open trace-count.json in Chrome DevTools (chrome://tracing)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+#[cfg(feature = "chrome")]
+async fn bench_sstable_count_profiled() {
+    use super::Engine;
+    use std::time::Instant;
+    use tracing_chrome::ChromeLayerBuilder;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    // Setup tracing with Chrome profiler output
+    let (chrome_layer, guard) = ChromeLayerBuilder::new()
+        .file("trace-count.json")
+        .include_args(true)
+        .build();
+
+    tracing_subscriber::registry().with(chrome_layer).init();
+
+    println!("\n=== SSTable Count Benchmark with Tracing Profile ===");
+    println!("Profile will be written to: trace-count.json");
+
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap().to_string();
+
+    // Small memtable to force frequent SSTable flushes (16KB)
+    let engine = LsmTreeEngine::new(data_dir, 16 * 1024, 100);
+
+    let num_keys = 50_000;
+    let iterations = 10;
+
+    println!(
+        "Writing {} keys with small memtable to force SSTable flushes...",
+        num_keys
+    );
+
+    // Write data
+    for i in 0..num_keys {
+        let prefix = match i % 5 {
+            0 => "log:",
+            1 => "order:",
+            2 => "product:",
+            3 => "session:",
+            _ => "user:",
+        };
+        engine
+            .set(format!("{}{:06}", prefix, i / 5), format!("value{:06}", i))
+            .unwrap();
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let sst_count = engine
+        .leveled_sstables
+        .lock()
+        .unwrap()
+        .total_sstable_count();
+    println!("Created {} SSTables", sst_count);
+
+    // Force flush
+    for i in 0..200 {
+        engine
+            .set(format!("flush:{:06}", i), "x".repeat(100))
+            .unwrap();
+    }
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    engine.reset_metrics();
+
+    println!("\n| Prefix       | Expected | Actual | Time (ms) | ops/sec   |");
+    println!("|--------------|----------|--------|-----------|-----------|");
+
+    let prefixes = [("log:", 10000), ("log:001", 100), ("nonexistent:", 0)];
+
+    for (prefix, expected) in &prefixes {
+        let start = Instant::now();
+        let mut actual = 0u64;
+        for _ in 0..iterations {
+            actual = engine.count(prefix).unwrap();
+        }
+        let duration = start.elapsed();
+        let ops_per_sec = iterations as f64 / duration.as_secs_f64();
+        println!(
+            "| {:12} | {:>8} | {:>6} | {:>9.3} | {:>9.0} |",
+            prefix,
+            expected,
+            actual,
+            duration.as_secs_f64() * 1000.0,
+            ops_per_sec
+        );
+    }
+
+    engine.shutdown().await;
+
+    // Flush the trace file
+    drop(guard);
+
+    println!("\nProfile saved to: trace-count.json");
+    println!("Open chrome://tracing in Chrome and load the file to analyze.");
+    println!("=====================================\n");
+}
