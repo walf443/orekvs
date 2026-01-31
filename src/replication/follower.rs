@@ -585,3 +585,147 @@ impl KeyValue for SwappableFollowerKeyValue {
         Ok(Response::new(CountResponse { count }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tempfile::TempDir;
+
+    fn create_test_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 50051)
+    }
+
+    #[test]
+    fn test_follower_state_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        assert!(!state.is_write_enabled());
+        assert_eq!(state.data_dir, temp_dir.path().to_path_buf());
+        assert_eq!(state.server_addr, addr);
+    }
+
+    #[test]
+    fn test_follower_state_enable_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        assert!(!state.is_write_enabled());
+        state.enable_writes();
+        assert!(state.is_write_enabled());
+    }
+
+    #[test]
+    fn test_follower_state_enable_writes_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        state.enable_writes();
+        assert!(state.is_write_enabled());
+
+        // Calling again should not change state
+        state.enable_writes();
+        assert!(state.is_write_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_follower_state_stop_replication_no_sender() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        // No sender set, should return false
+        let stopped = state.stop_replication().await;
+        assert!(!stopped);
+    }
+
+    #[tokio::test]
+    async fn test_follower_state_stop_replication_with_sender() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        // Set up a channel
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut guard = state.stop_replication_tx.lock().await;
+            *guard = Some(tx);
+        }
+
+        // Stop replication should succeed
+        let stopped = state.stop_replication().await;
+        assert!(stopped);
+
+        // Receiver should get the signal
+        assert!(rx.try_recv().is_ok());
+
+        // Calling again should return false (sender already taken)
+        let stopped_again = state.stop_replication().await;
+        assert!(!stopped_again);
+    }
+
+    #[test]
+    fn test_follower_state_write_enabled_atomic() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = Arc::new(FollowerState::new(temp_dir.path().to_path_buf(), addr));
+
+        // Spawn multiple threads to read write_enabled
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let state_clone = Arc::clone(&state);
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = state_clone.is_write_enabled();
+                }
+            }));
+        }
+
+        // Enable writes from main thread
+        state.enable_writes();
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // State should be write enabled
+        assert!(state.is_write_enabled());
+    }
+
+    #[test]
+    fn test_follower_state_data_dir_preserved() {
+        let temp_dir = TempDir::new().unwrap();
+        let expected_path = temp_dir.path().to_path_buf();
+        let addr = create_test_addr();
+        let state = FollowerState::new(expected_path.clone(), addr);
+
+        assert_eq!(state.data_dir, expected_path);
+    }
+
+    #[test]
+    fn test_follower_state_server_addr_preserved() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 8080);
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        assert_eq!(state.server_addr, addr);
+    }
+
+    #[tokio::test]
+    async fn test_follower_state_replication_handle_initially_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let addr = create_test_addr();
+        let state = FollowerState::new(temp_dir.path().to_path_buf(), addr);
+
+        let guard = state.replication_handle.lock().await;
+        assert!(guard.is_none());
+    }
+}

@@ -900,6 +900,7 @@ impl FollowerReplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_serialize_deserialize_entries() {
@@ -929,10 +930,487 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_deserialize_with_ttl() {
+        let entries = vec![
+            WalEntry {
+                timestamp: 12345,
+                key: "key_with_ttl".to_string(),
+                value: Some("value".to_string()),
+                expire_at: 1700000000, // Some future timestamp
+            },
+            WalEntry {
+                timestamp: 12346,
+                key: "key_no_ttl".to_string(),
+                value: Some("value2".to_string()),
+                expire_at: 0,
+            },
+        ];
+
+        let serialized = serialize_entries(&entries);
+        let deserialized = deserialize_entries(&serialized).unwrap();
+
+        assert_eq!(deserialized.len(), 2);
+        assert_eq!(deserialized[0].key, "key_with_ttl");
+        assert_eq!(deserialized[0].expire_at, 1700000000);
+        assert_eq!(deserialized[1].key, "key_no_ttl");
+        assert_eq!(deserialized[1].expire_at, 0);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_empty_entries() {
+        let entries: Vec<WalEntry> = vec![];
+        let serialized = serialize_entries(&entries);
+        let deserialized = deserialize_entries(&serialized).unwrap();
+        assert_eq!(deserialized.len(), 0);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_large_batch() {
+        let entries: Vec<WalEntry> = (0..1000)
+            .map(|i| WalEntry {
+                timestamp: 12345 + i,
+                key: format!("key_{}", i),
+                value: Some(format!("value_{}", i)),
+                expire_at: if i % 2 == 0 { 1700000000 + i } else { 0 },
+            })
+            .collect();
+
+        let serialized = serialize_entries(&entries);
+        let deserialized = deserialize_entries(&serialized).unwrap();
+
+        assert_eq!(deserialized.len(), 1000);
+        for i in 0..1000 {
+            assert_eq!(deserialized[i].key, format!("key_{}", i));
+            assert_eq!(deserialized[i].value, Some(format!("value_{}", i)));
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_mixed_tombstones() {
+        let entries: Vec<WalEntry> = (0..100)
+            .map(|i| WalEntry {
+                timestamp: 12345 + i,
+                key: format!("key_{}", i),
+                value: if i % 3 == 0 {
+                    None // Tombstone every 3rd entry
+                } else {
+                    Some(format!("value_{}", i))
+                },
+                expire_at: 0,
+            })
+            .collect();
+
+        let serialized = serialize_entries(&entries);
+        let deserialized = deserialize_entries(&serialized).unwrap();
+
+        assert_eq!(deserialized.len(), 100);
+        for i in 0..100 {
+            if i % 3 == 0 {
+                assert_eq!(deserialized[i as usize].value, None);
+            } else {
+                assert_eq!(deserialized[i as usize].value, Some(format!("value_{}", i)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_serialize_deserialize_unicode_keys() {
+        let entries = vec![
+            WalEntry {
+                timestamp: 12345,
+                key: "日本語キー".to_string(),
+                value: Some("値".to_string()),
+                expire_at: 0,
+            },
+            WalEntry {
+                timestamp: 12346,
+                key: "emoji_🎉_key".to_string(),
+                value: Some("🚀 value".to_string()),
+                expire_at: 0,
+            },
+        ];
+
+        let serialized = serialize_entries(&entries);
+        let deserialized = deserialize_entries(&serialized).unwrap();
+
+        assert_eq!(deserialized.len(), 2);
+        assert_eq!(deserialized[0].key, "日本語キー");
+        assert_eq!(deserialized[0].value, Some("値".to_string()));
+        assert_eq!(deserialized[1].key, "emoji_🎉_key");
+        assert_eq!(deserialized[1].value, Some("🚀 value".to_string()));
+    }
+
+    #[test]
+    fn test_serialize_deserialize_empty_value() {
+        let entries = vec![WalEntry {
+            timestamp: 12345,
+            key: "key".to_string(),
+            value: Some("".to_string()), // Empty string, not tombstone
+            expire_at: 0,
+        }];
+
+        let serialized = serialize_entries(&entries);
+        let deserialized = deserialize_entries(&serialized).unwrap();
+
+        assert_eq!(deserialized.len(), 1);
+        assert_eq!(deserialized[0].value, Some("".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_truncated_data() {
+        // Create valid data first
+        let entries = vec![WalEntry {
+            timestamp: 12345,
+            key: "key".to_string(),
+            value: Some("value".to_string()),
+            expire_at: 0,
+        }];
+        let serialized = serialize_entries(&entries);
+
+        // Truncate data - when timestamp can be read but expire_at cannot,
+        // deserialize_entries returns an error
+        let truncated = &serialized[..10];
+        let result = deserialize_entries(truncated);
+        // The function returns error when it can read timestamp but fails on subsequent fields
+        assert!(result.is_err());
+
+        // Empty data should return empty entries
+        let empty_result = deserialize_entries(&[]);
+        assert!(empty_result.is_ok());
+        assert!(empty_result.unwrap().is_empty());
+    }
+
+    #[test]
     fn test_parse_wal_filename() {
         assert_eq!(parse_wal_filename("wal_00001.log"), Some(1));
         assert_eq!(parse_wal_filename("wal_12345.log"), Some(12345));
         assert_eq!(parse_wal_filename("other.log"), None);
         assert_eq!(parse_wal_filename("wal_123.data"), None);
+    }
+
+    #[test]
+    fn test_parse_wal_filename_edge_cases() {
+        assert_eq!(parse_wal_filename("wal_00000.log"), Some(0));
+        assert_eq!(parse_wal_filename("wal_99999.log"), Some(99999));
+        assert_eq!(parse_wal_filename("wal_.log"), None);
+        assert_eq!(parse_wal_filename("wal_abc.log"), None);
+        assert_eq!(parse_wal_filename("WAL_00001.log"), None); // Case sensitive
+        assert_eq!(parse_wal_filename("wal_00001.LOG"), None); // Case sensitive
+        assert_eq!(parse_wal_filename(""), None);
+        assert_eq!(parse_wal_filename("wal_00001"), None); // Missing extension
+    }
+
+    // ReplicationService tests
+
+    #[test]
+    fn test_replication_service_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let snapshot_lock = Arc::new(RwLock::new(()));
+        let service = ReplicationService::new(temp_dir.path().to_path_buf(), snapshot_lock);
+
+        // Should not panic and data_dir should be set correctly
+        assert_eq!(service.data_dir, temp_dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_replication_service_new_without_lock() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        assert_eq!(service.data_dir, temp_dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_get_wal_files_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        let wal_files = service.get_wal_files();
+        assert!(wal_files.is_empty());
+    }
+
+    #[test]
+    fn test_get_wal_files_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create some WAL files
+        fs::write(temp_dir.path().join("wal_00001.log"), b"data1").unwrap();
+        fs::write(temp_dir.path().join("wal_00003.log"), b"data3").unwrap();
+        fs::write(temp_dir.path().join("wal_00002.log"), b"data2").unwrap();
+        // Create non-WAL files that should be ignored
+        fs::write(temp_dir.path().join("other.txt"), b"other").unwrap();
+        fs::write(temp_dir.path().join("sst_00001.data"), b"sstable").unwrap();
+
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+        let wal_files = service.get_wal_files();
+
+        assert_eq!(wal_files.len(), 3);
+        // Should be sorted by ID
+        assert_eq!(wal_files[0].0, 1);
+        assert_eq!(wal_files[1].0, 2);
+        assert_eq!(wal_files[2].0, 3);
+    }
+
+    #[test]
+    fn test_get_current_position_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        let (wal_id, offset) = service.get_current_position();
+        assert_eq!(wal_id, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_get_current_position_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create WAL files with different sizes
+        let content1 = b"small";
+        let content2 = b"this is a larger file content";
+        fs::write(temp_dir.path().join("wal_00001.log"), content1).unwrap();
+        fs::write(temp_dir.path().join("wal_00002.log"), content2).unwrap();
+
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+        let (wal_id, offset) = service.get_current_position();
+
+        assert_eq!(wal_id, 2); // Latest WAL ID
+        assert_eq!(offset, content2.len() as u64); // Size of the larger file
+    }
+
+    #[test]
+    fn test_get_sstable_files_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        let sstable_files = service.get_sstable_files();
+        assert!(sstable_files.is_empty());
+    }
+
+    #[test]
+    fn test_get_sstable_files_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create SSTable files
+        fs::write(temp_dir.path().join("sst_00001.data"), b"data1").unwrap();
+        fs::write(temp_dir.path().join("sst_00002.data"), b"data2").unwrap();
+        fs::write(temp_dir.path().join("sst_00001_00002.data"), b"data3").unwrap();
+        // Create non-SSTable files that should be ignored
+        fs::write(temp_dir.path().join("wal_00001.log"), b"wal").unwrap();
+        fs::write(temp_dir.path().join("sst_00001.index"), b"index").unwrap();
+
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+        let sstable_files = service.get_sstable_files();
+
+        assert_eq!(sstable_files.len(), 3);
+        // Should be sorted alphabetically
+        assert_eq!(sstable_files[0].0, "sst_00001.data");
+        assert_eq!(sstable_files[1].0, "sst_00001_00002.data");
+        assert_eq!(sstable_files[2].0, "sst_00002.data");
+    }
+
+    #[test]
+    fn test_is_wal_available_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        // No WAL files exist
+        assert!(!service.is_wal_available(0));
+        assert!(!service.is_wal_available(1));
+    }
+
+    #[test]
+    fn test_is_wal_available_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(temp_dir.path().join("wal_00002.log"), b"data").unwrap();
+        fs::write(temp_dir.path().join("wal_00003.log"), b"data").unwrap();
+
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        // WAL ID 0 means initial sync - should return true if any WAL exists
+        assert!(service.is_wal_available(0));
+        // WAL ID 1: we have WAL >= 1 (WAL 2 and 3 exist), so it returns true
+        // The implementation checks if any WAL with id >= requested exists
+        assert!(service.is_wal_available(1));
+        // WAL ID 2 and 3 are available
+        assert!(service.is_wal_available(2));
+        assert!(service.is_wal_available(3));
+        // WAL ID 4 is not available (no WAL >= 4 exists)
+        assert!(!service.is_wal_available(4));
+    }
+
+    #[test]
+    fn test_get_oldest_wal_id_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        assert_eq!(service.get_oldest_wal_id(), None);
+    }
+
+    #[test]
+    fn test_get_oldest_wal_id_with_files() {
+        let temp_dir = TempDir::new().unwrap();
+
+        fs::write(temp_dir.path().join("wal_00005.log"), b"data").unwrap();
+        fs::write(temp_dir.path().join("wal_00003.log"), b"data").unwrap();
+        fs::write(temp_dir.path().join("wal_00007.log"), b"data").unwrap();
+
+        let service = ReplicationService::new_without_lock(temp_dir.path().to_path_buf());
+
+        assert_eq!(service.get_oldest_wal_id(), Some(3));
+    }
+
+    // FollowerReplicator tests
+
+    #[test]
+    fn test_follower_replicator_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let replicator = FollowerReplicator::new(
+            "http://localhost:50051".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        assert_eq!(replicator.leader_addr, "http://localhost:50051");
+        assert_eq!(replicator.data_dir, temp_dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_load_replication_state_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let replicator = FollowerReplicator::new(
+            "http://localhost:50051".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        let (wal_id, offset) = replicator.load_replication_state();
+        assert_eq!(wal_id, 0);
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn test_save_and_load_replication_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let replicator = FollowerReplicator::new(
+            "http://localhost:50051".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Save state
+        replicator.save_replication_state(42, 1234).unwrap();
+
+        // Load state
+        let (wal_id, offset) = replicator.load_replication_state();
+        assert_eq!(wal_id, 42);
+        assert_eq!(offset, 1234);
+    }
+
+    #[test]
+    fn test_save_and_load_replication_state_large_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let replicator = FollowerReplicator::new(
+            "http://localhost:50051".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Test with large values
+        let large_wal_id = u64::MAX - 1;
+        let large_offset = u64::MAX / 2;
+
+        replicator
+            .save_replication_state(large_wal_id, large_offset)
+            .unwrap();
+
+        let (wal_id, offset) = replicator.load_replication_state();
+        assert_eq!(wal_id, large_wal_id);
+        assert_eq!(offset, large_offset);
+    }
+
+    #[test]
+    fn test_load_replication_state_corrupted() {
+        let temp_dir = TempDir::new().unwrap();
+        let replicator = FollowerReplicator::new(
+            "http://localhost:50051".to_string(),
+            temp_dir.path().to_path_buf(),
+        );
+
+        // Write corrupted/short data
+        fs::write(temp_dir.path().join("replication_state"), b"short").unwrap();
+
+        // Should return default values
+        let (wal_id, offset) = replicator.load_replication_state();
+        assert_eq!(wal_id, 0);
+        assert_eq!(offset, 0);
+    }
+
+    // WalEntry tests
+
+    #[test]
+    fn test_wal_entry_clone() {
+        let entry = WalEntry {
+            timestamp: 12345,
+            key: "key".to_string(),
+            value: Some("value".to_string()),
+            expire_at: 1700000000,
+        };
+
+        let cloned = entry.clone();
+        assert_eq!(cloned.timestamp, entry.timestamp);
+        assert_eq!(cloned.key, entry.key);
+        assert_eq!(cloned.value, entry.value);
+        assert_eq!(cloned.expire_at, entry.expire_at);
+    }
+
+    #[test]
+    fn test_wal_entry_debug() {
+        let entry = WalEntry {
+            timestamp: 12345,
+            key: "key".to_string(),
+            value: Some("value".to_string()),
+            expire_at: 0,
+        };
+
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("WalEntry"));
+        assert!(debug_str.contains("timestamp: 12345"));
+        assert!(debug_str.contains("key"));
+    }
+
+    // Constants tests
+
+    #[test]
+    fn test_constants_values() {
+        // Verify constants have reasonable values
+        assert!(CATCHUP_THRESHOLD > 0);
+        assert!(CATCHUP_BATCH_SIZE > CATCHUP_THRESHOLD);
+        assert!(CATCHUP_BATCH_BYTES > 0);
+        assert!(REALTIME_POLL_INTERVAL_MS > 0);
+        assert!(SNAPSHOT_CHUNK_SIZE > 0);
+        assert!(!WAL_GAP_ERROR_CODE.is_empty());
+    }
+
+    // ReplicationResult tests
+
+    #[test]
+    fn test_replication_result_variants() {
+        // Test Continue variant
+        let result = ReplicationResult::Continue;
+        matches!(result, ReplicationResult::Continue);
+
+        // Test SnapshotApplied variant
+        let result = ReplicationResult::SnapshotApplied {
+            resume_wal_id: 10,
+            resume_offset: 500,
+        };
+        if let ReplicationResult::SnapshotApplied {
+            resume_wal_id,
+            resume_offset,
+        } = result
+        {
+            assert_eq!(resume_wal_id, 10);
+            assert_eq!(resume_offset, 500);
+        } else {
+            panic!("Expected SnapshotApplied variant");
+        }
     }
 }
